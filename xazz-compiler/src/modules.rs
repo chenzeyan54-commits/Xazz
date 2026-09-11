@@ -58,13 +58,12 @@ pub fn resolve_imports(
     source_dir: &Path,
 ) -> Result<ResolvedProgram, Vec<String>> {
     let mut loader = ModuleLoader {
-        source_dir: source_dir.to_path_buf(),
         stack: Vec::new(),
         loaded: HashSet::new(),
         modules: Vec::new(),
         errors: Vec::new(),
     };
-    let merged = loader.load_program(program);
+    let merged = loader.load_program(program, source_dir);
     if loader.errors.is_empty() {
         Ok(ResolvedProgram {
             program: merged,
@@ -76,7 +75,6 @@ pub fn resolve_imports(
 }
 
 struct ModuleLoader {
-    source_dir: PathBuf,
     /// Canonical paths of the current import chain (for cycle detection).
     stack: Vec<PathBuf>,
     /// Canonical paths already resolved (avoid re-reading shared modules).
@@ -88,7 +86,11 @@ struct ModuleLoader {
 
 impl ModuleLoader {
     /// Recursively expands imports in a program, returning a merged Program.
-    fn load_program(&mut self, program: &Program) -> Program {
+    ///
+    /// `source_dir` is the directory of the file that owns `program`, so each
+    /// relative import resolves against its *importing* file — including nested
+    /// modules in subdirectories.
+    fn load_program(&mut self, program: &Program, source_dir: &Path) -> Program {
         let mut out = Program::new();
         for stmt in &program.stmts {
             match stmt {
@@ -104,7 +106,7 @@ impl ModuleLoader {
                         }
                         continue;
                     }
-                    let file = self.resolve_module_path(path);
+                    let file = self.resolve_module_path(path, source_dir);
                     match file {
                         Some(canonical) => self.load_module(&canonical, &mut out),
                         None => self
@@ -118,19 +120,19 @@ impl ModuleLoader {
         out
     }
 
-    /// Resolves an import path against the source directory, canonicalizes it,
-    /// and reports a helpful error if the file is missing.
-    fn resolve_module_path(&mut self, path: &str) -> Option<PathBuf> {
+    /// Resolves an import path against the importing file's directory,
+    /// canonicalizes it, and reports a helpful error if the file is missing.
+    fn resolve_module_path(&mut self, path: &str, source_dir: &Path) -> Option<PathBuf> {
         let candidate = if Path::new(path).is_absolute() {
             PathBuf::from(path)
         } else {
-            self.source_dir.join(path)
+            source_dir.join(path)
         };
         if !candidate.exists() {
             self.errors.push(format!(
                 "import module file not found: '{}' (resolved from '{}')",
                 path,
-                self.source_dir.display()
+                source_dir.display()
             ));
             return None;
         }
@@ -185,10 +187,16 @@ impl ModuleLoader {
 
         // ── push context, expand nested imports, inline ─────────────────────
         self.stack.push(canonical.clone());
+        // Nested imports resolve against *this* module's directory, not the
+        // root program's (fixes subdirectory-relative imports).
+        let module_dir = canonical
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."));
         // Load each module exactly once (dedupe shared modules), but inline
         // into this importer every time — duplicate names surface as checker
         // errors, which is the intended fail-closed behavior.
-        let nested = self.load_program(&parsed);
+        let nested = self.load_program(&parsed, &module_dir);
         self.stack.pop();
 
         if self.loaded.insert(canonical.clone()) {
@@ -228,7 +236,9 @@ impl ModuleLoader {
         };
 
         self.stack.push(key.clone());
-        let nested = self.load_program(&parsed);
+        // Embedded modules have no filesystem directory; they only import other
+        // `std/...` modules (handled before path resolution), so "." is inert.
+        let nested = self.load_program(&parsed, Path::new("."));
         self.stack.pop();
 
         if self.loaded.insert(key.clone()) {
@@ -296,6 +306,49 @@ mod tests {
             check.errors.is_empty(),
             "모듈 병합 체커 오류 없어야: {:?}",
             check.errors
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A nested module resolves its own relative imports against its own
+    /// directory, not the root program's (issue #69 follow-up).
+    #[test]
+    fn nested_import_resolves_against_importing_file_dir() {
+        let dir = temp_dir();
+        let sub = dir.join("sub");
+        fs::create_dir_all(&sub).unwrap();
+        fs::write(sub.join("b.xzz"), "type B = { b: int };\n").unwrap();
+        fs::write(
+            sub.join("a.xzz"),
+            "import \"b.xzz\";\ntype A = { a: int };\n",
+        )
+        .unwrap();
+        // A decoy `b.xzz` at the root proves resolution uses sub/, not the root.
+        fs::write(dir.join("b.xzz"), "type WRONG = { wrong: int };\n").unwrap();
+
+        let main = parse("import \"sub/a.xzz\";");
+        let resolved = resolve_imports(&main, &dir).expect("nested module resolve");
+
+        let names: Vec<&str> = resolved
+            .program
+            .stmts
+            .iter()
+            .filter_map(|s| match s {
+                Stmt::TypeDecl { name, .. } => Some(name.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            names.contains(&"A"),
+            "sub/a.xzz 가 해석되어야 함: {names:?}"
+        );
+        assert!(
+            names.contains(&"B"),
+            "sub/b.xzz 가 해석되어야 함: {names:?}"
+        );
+        assert!(
+            !names.contains(&"WRONG"),
+            "루트 b.xzz 를 잘못 선택하면 안 됨: {names:?}"
         );
         fs::remove_dir_all(&dir).ok();
     }
