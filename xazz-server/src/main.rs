@@ -82,6 +82,52 @@ fn record_run_in_store(
     }
 }
 
+// ── Per-tenant DP budget envelope (issue C2) ─────────────────────────────────
+
+/// Per-tenant total ε envelope (overridable via env).
+const TENANT_DP_BUDGET_ENV: &str = "XAZZ_TENANT_DP_BUDGET";
+/// Per-tenant total δ envelope (overridable via env).
+const TENANT_DP_DELTA_BUDGET_ENV: &str = "XAZZ_TENANT_DP_DELTA_BUDGET";
+const DEFAULT_TENANT_DP_BUDGET: f64 = 10.0;
+const DEFAULT_TENANT_DP_DELTA_BUDGET: f64 = 1e-4;
+
+/// Floor for the remaining budget handed to the runner. The runner's env parser
+/// ignores non-positive totals, so passing 0 would silently reset to its own
+/// default; this keeps "no budget left" enforceable while non-DP runs proceed.
+const MIN_REMAINING_BUDGET: f64 = 1e-12;
+
+/// Parses the configured per-tenant (ε, δ) envelope from raw env values.
+fn resolve_dp_envelope(eps_raw: Option<&str>, delta_raw: Option<&str>) -> (f64, f64) {
+    let epsilon = eps_raw
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .unwrap_or(DEFAULT_TENANT_DP_BUDGET);
+    let delta = delta_raw
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| v.is_finite() && (0.0..1.0).contains(v))
+        .unwrap_or(DEFAULT_TENANT_DP_DELTA_BUDGET);
+    (epsilon, delta)
+}
+
+/// Reads the per-tenant DP envelope from the environment.
+fn tenant_dp_envelope() -> (f64, f64) {
+    let eps = std::env::var(TENANT_DP_BUDGET_ENV).ok();
+    let delta = std::env::var(TENANT_DP_DELTA_BUDGET_ENV).ok();
+    resolve_dp_envelope(eps.as_deref(), delta.as_deref())
+}
+
+/// Extracts the (ε, δ) a run consumed from its `[xazz:dp]` marker.
+/// Returns `None` when the run used no `withDp` (nothing to bill).
+fn dp_spend_from_marker(dp: &Option<Value>) -> Option<(f64, f64)> {
+    let value = dp.as_ref()?;
+    let epsilon = value.get("budget_spent")?.as_f64()?;
+    let delta = value
+        .get("budget_spent_delta")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0);
+    Some((epsilon, delta))
+}
+
 // ── request / response types ─────────────────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -171,6 +217,7 @@ async fn main() {
         .route("/security/inference/check", post(handle_inference_check))
         .route("/runs", get(handle_runs_list))
         .route("/runs/{id}", get(handle_run_by_id))
+        .route("/dp/budget", get(handle_dp_budget))
         .route("/catalog", post(handle_catalog))
         .with_state(AppState {
             exec_permits: Arc::new(Semaphore::new(MAX_CONCURRENT_EXECUTIONS)),
@@ -437,11 +484,28 @@ async fn handle_execute(
     // 2. Locate the xazz.exe executable path
     let exe_path = find_xazz_exe().map_err(|e| internal_err(e))?;
 
+    // 2b. Per-tenant DP budget isolation (issue C2): a tenant may only consume up
+    //     to its own cumulative envelope. The runner receives the *remaining*
+    //     budget, so cross-run composition is enforced by the existing DP
+    //     accounting (the runner refuses a `withDp` that would exceed it).
+    let (total_eps, total_delta) = tenant_dp_envelope();
+    let (spent_eps, spent_delta) = state
+        .store
+        .dp_spent(tenant_str(tenant.as_str()))
+        .map_err(|e| internal_err(format!("DP 원장 조회 실패: {e}")))?;
+    let remaining_eps = (total_eps - spent_eps).max(MIN_REMAINING_BUDGET);
+    let remaining_delta = (total_delta - spent_delta).max(MIN_REMAINING_BUDGET);
+
     // 3. Run xazz run <tmp.xzz>
     //    Only requests that pass the gate reach this point — tests verify with the counter.
     guardrail::note_runner_invocation();
     let output = tokio::task::spawn_blocking(move || {
-        Command::new(&exe_path).arg("run").arg(&tmp_path).output()
+        Command::new(&exe_path)
+            .arg("run")
+            .arg(&tmp_path)
+            .env("XAZZ_DP_BUDGET", remaining_eps.to_string())
+            .env("XAZZ_DP_DELTA_BUDGET", remaining_delta.to_string())
+            .output()
     })
     .await
     .map_err(|e| internal_err(format!("spawn_blocking 실패: {}", e)))?
@@ -454,6 +518,17 @@ async fn handle_execute(
 
     // 4. Parse stdout: extract [xazz:result], [xazz:chart], [xazz:train], [xazz:dp] markers
     let (rows, schema, logs, training, dp, diagnostics) = parse_stdout_markers(&stdout, &stderr);
+
+    // 4b. Bill this run's DP consumption to the tenant's ledger (issue C2).
+    //     Only the marker's cumulative spend is billed; no withDp → nothing billed.
+    if let Some((eps, delta)) = dp_spend_from_marker(&dp) {
+        if let Err(e) = state
+            .store
+            .add_dp_spend(tenant_str(tenant.as_str()), eps, delta)
+        {
+            eprintln!("[xazz] ⚠️ DP 원장 갱신 실패: {e}");
+        }
+    }
 
     // 5. Auto-audit the execution history (trust infrastructure — persist all operation history)
     //    Even on failure, return the execution, logging only the audit-record failure as a warning.
@@ -1096,6 +1171,30 @@ async fn handle_run_by_id(
     }
 }
 
+// ── Per-tenant DP budget (issue C2) ──────────────────────────────────────────
+
+/// Reports the authenticated tenant's cumulative DP spend and remaining envelope.
+async fn handle_dp_budget(
+    State(state): State<AppState>,
+    Extension(tenant): Extension<String>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let tenant = tenant_str(tenant.as_str());
+    let (total_eps, total_delta) = tenant_dp_envelope();
+    let (spent_eps, spent_delta) = state
+        .store
+        .dp_spent(tenant)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    Ok(Json(json!({
+        "tenant": tenant,
+        "spent_epsilon": spent_eps,
+        "spent_delta": spent_delta,
+        "total_epsilon": total_eps,
+        "total_delta": total_delta,
+        "remaining_epsilon": (total_eps - spent_eps).max(0.0),
+        "remaining_delta": (total_delta - spent_delta).max(0.0),
+    })))
+}
+
 // ── Pipeline catalog / column lineage (issue C3) ─────────────────────────────
 
 /// Compiles the given code and returns the pipeline catalog + column lineage.
@@ -1463,5 +1562,55 @@ v x = load(\"examples/data/seoul_air_2024.csv\") :: AQ
                 .any(|r| r.model_fingerprint.as_deref() == Some(fp.as_str())),
             "모델 지문이 감사 체인에 기록되어야 함"
         );
+    }
+
+    // ── Per-tenant DP budget isolation (issue C2) ─────────────────────────────
+
+    #[test]
+    fn resolve_dp_envelope_defaults_and_overrides() {
+        assert_eq!(resolve_dp_envelope(None, None), (10.0, 1e-4));
+        assert_eq!(resolve_dp_envelope(Some("2.5"), Some("0.01")), (2.5, 0.01));
+        // Invalid values fall back to the defaults.
+        assert_eq!(resolve_dp_envelope(Some("0"), Some("7")), (10.0, 1e-4));
+        assert_eq!(resolve_dp_envelope(Some("-1"), Some("-1")), (10.0, 1e-4));
+        assert_eq!(resolve_dp_envelope(Some("abc"), Some("xyz")), (10.0, 1e-4));
+    }
+
+    #[test]
+    fn dp_marker_spend_is_extracted() {
+        assert!(dp_spend_from_marker(&None::<Value>).is_none());
+        assert!(dp_spend_from_marker(&Some(json!({}))).is_none());
+        let marker = Some(json!({ "budget_spent": 1.25, "budget_spent_delta": 2e-5 }));
+        assert_eq!(dp_spend_from_marker(&marker), Some((1.25, 2e-5)));
+        // A missing delta field is treated as 0 (Laplace is pure ε-DP).
+        let marker = Some(json!({ "budget_spent": 3.0 }));
+        assert_eq!(dp_spend_from_marker(&marker), Some((3.0, 0.0)));
+    }
+
+    #[tokio::test]
+    async fn dp_budget_endpoint_is_tenant_scoped() {
+        let state = test_state();
+        let tenant = format!("dp-endpoint-{}", std::process::id());
+        state
+            .store
+            .add_dp_spend(&tenant, 1.0, 5e-5)
+            .expect("seed spend");
+
+        let body = handle_dp_budget(State(state), Extension(tenant.clone()))
+            .await
+            .expect("budget endpoint")
+            .0;
+        assert_eq!(body["tenant"], json!(tenant));
+        assert!((body["spent_epsilon"].as_f64().unwrap() - 1.0).abs() < 1e-12);
+        assert!((body["spent_delta"].as_f64().unwrap() - 5e-5).abs() < 1e-15);
+        assert!((body["remaining_epsilon"].as_f64().unwrap() - 9.0).abs() < 1e-12);
+
+        // Another tenant is unaffected by this tenant's spend.
+        let other = handle_dp_budget(State(test_state()), Extension("dp-endpoint-other".into()))
+            .await
+            .expect("budget endpoint")
+            .0;
+        assert_eq!(other["spent_epsilon"], json!(0.0));
+        assert_eq!(other["remaining_epsilon"], json!(10.0));
     }
 }

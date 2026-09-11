@@ -9,6 +9,17 @@ Versioning: [Semantic Versioning](https://semver.org/)
 
 ## [Unreleased]
 
+### Added — per-tenant DP 예산 격리 (issue #59, Track C2)
+
+- **per-tenant DP 누적 원장** — SQLite `dp_budget` 테이블(tenant별 `spent_epsilon`/`spent_delta`).
+  한 tenant의 DP 소비가 다른 tenant에 영향을 주지 않음
+- **실행 전 남은 예산 주입** — `POST /execute`가 tenant의 누적 소비를 조회해 남은 ε/δ를
+  `XAZZ_DP_BUDGET`/`XAZZ_DP_DELTA_BUDGET`로 러너에 전달. 실행 후 `[xazz:dp]`의 `budget_spent`를
+  원자적 UPSERT로 누적 → 런 간 순차 합성(composition) 강제
+- **`GET /dp/budget`** — tenant의 spent/total/remaining ε·δ 조회 (tenant 스코프)
+- envelope는 `XAZZ_TENANT_DP_BUDGET`/`XAZZ_TENANT_DP_DELTA_BUDGET`로 설정(기본 ε=10, δ=1e-4)
+- 검증: 원장 누적·tenant 격리, envelope/마커 파싱, 엔드포인트 격리 테스트. xazz-server 39 tests pass
+
 ### Added — 모델 지문 감사 체인 연동 (issue #73, Track F4/F5)
 
 - **`AuditRecord.model_fingerprint`** — SHA-256 모델 가중치 지문을 코드·프롬프트·응답 해시와

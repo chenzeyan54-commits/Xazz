@@ -17,11 +17,45 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 
 /// SQLite database file (relative to the server's working directory).
 pub const DB_FILE: &str = "xazz.db";
+
+/// Current Unix epoch seconds.
+fn now_epoch() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Creates the run-history and per-tenant DP-budget tables if missing (idempotent).
+fn ensure_schema(conn: &Connection) -> Result<(), String> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            code_hash TEXT NOT NULL,
+            status TEXT NOT NULL,
+            rows INTEGER NOT NULL DEFAULT 0,
+            error TEXT,
+            created_at INTEGER NOT NULL,
+            tenant TEXT NOT NULL DEFAULT ''
+        );
+        CREATE TABLE IF NOT EXISTS dp_budget (
+            tenant TEXT PRIMARY KEY,
+            spent_epsilon REAL NOT NULL DEFAULT 0,
+            spent_delta REAL NOT NULL DEFAULT 0,
+            updated_at INTEGER NOT NULL DEFAULT 0
+        );",
+    )
+    .map_err(|e| format!("failed to create store schema: {e}"))?;
+    // Migration for DBs created before the tenant column (issue C2):
+    // adding an already-present column is a no-op error we swallow.
+    let _ = conn.execute_batch("ALTER TABLE runs ADD COLUMN tenant TEXT NOT NULL DEFAULT ''");
+    Ok(())
+}
 
 /// One persisted run record.
 #[derive(Debug, Clone, Serialize)]
@@ -56,18 +90,7 @@ impl Store {
     #[allow(dead_code)]
     pub fn open_at(path: &std::path::Path) -> Self {
         let conn = Connection::open(path).expect("open store db");
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS runs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                code_hash TEXT NOT NULL,
-                status TEXT NOT NULL,
-                rows INTEGER NOT NULL DEFAULT 0,
-                error TEXT,
-                created_at INTEGER NOT NULL,
-                tenant TEXT NOT NULL DEFAULT ''
-            );",
-        )
-        .expect("create runs table");
+        ensure_schema(&conn).expect("create store schema");
         Store {
             conn: Mutex::new(Some(conn)),
         }
@@ -82,22 +105,7 @@ impl Store {
         if guard.is_none() {
             let conn = Connection::open(PathBuf::from(DB_FILE))
                 .map_err(|e| format!("failed to open {}: {e}", DB_FILE))?;
-            conn.execute_batch(
-                "CREATE TABLE IF NOT EXISTS runs (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    code_hash TEXT NOT NULL,
-                    status TEXT NOT NULL,
-                    rows INTEGER NOT NULL DEFAULT 0,
-                    error TEXT,
-                    created_at INTEGER NOT NULL,
-                    tenant TEXT NOT NULL DEFAULT ''
-                );",
-            )
-            .map_err(|e| format!("failed to create runs table: {e}"))?;
-            // Migration for DBs created before the tenant column (issue C2):
-            // adding an already-present column is a no-op error we swallow.
-            let _ =
-                conn.execute_batch("ALTER TABLE runs ADD COLUMN tenant TEXT NOT NULL DEFAULT ''");
+            ensure_schema(&conn)?;
             *guard = Some(conn);
         }
         Ok(guard)
@@ -114,10 +122,7 @@ impl Store {
     ) -> Result<i64, String> {
         let guard = self.open()?;
         let conn = guard.as_ref().expect("open guarantees Some");
-        let created = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
+        let created = now_epoch();
         conn.execute(
             "INSERT INTO runs (code_hash, status, rows, error, created_at, tenant) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![code_hash, status, rows, error, created, tenant],
@@ -177,6 +182,52 @@ impl Store {
             Some(r) => r.map_err(|e| format!("failed to read run: {e}")).map(Some),
             None => Ok(None),
         }
+    }
+
+    /// Returns the tenant's cumulative DP spend as `(epsilon, delta)` — issue C2.
+    ///
+    /// Unknown tenants report `(0.0, 0.0)` (no budget consumed yet). The ledger is
+    /// keyed by tenant, so one tenant's spend never affects another's.
+    pub fn dp_spent(&self, tenant: &str) -> Result<(f64, f64), String> {
+        let guard = self.open()?;
+        let conn = guard.as_ref().expect("open guarantees Some");
+        conn.query_row(
+            "SELECT spent_epsilon, spent_delta FROM dp_budget WHERE tenant = ?1",
+            params![tenant],
+            |row| Ok((row.get::<_, f64>(0)?, row.get::<_, f64>(1)?)),
+        )
+        .optional()
+        .map(|opt| opt.unwrap_or((0.0, 0.0)))
+        .map_err(|e| format!("failed to read dp budget: {e}"))
+    }
+
+    /// Adds a run's DP spend to the tenant's cumulative ledger — issue C2.
+    ///
+    /// The increment is a single atomic UPSERT, so two concurrent runs of the same
+    /// tenant cannot lose a spend. Non-positive spends are a no-op. Non-finite
+    /// values are rejected so a malformed marker cannot poison the ledger.
+    pub fn add_dp_spend(&self, tenant: &str, epsilon: f64, delta: f64) -> Result<(), String> {
+        if !epsilon.is_finite() || !delta.is_finite() {
+            return Err("dp spend must be finite".to_string());
+        }
+        let epsilon = epsilon.max(0.0);
+        let delta = delta.max(0.0);
+        if epsilon == 0.0 && delta == 0.0 {
+            return Ok(());
+        }
+        let guard = self.open()?;
+        let conn = guard.as_ref().expect("open guarantees Some");
+        conn.execute(
+            "INSERT INTO dp_budget (tenant, spent_epsilon, spent_delta, updated_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(tenant) DO UPDATE SET
+                 spent_epsilon = spent_epsilon + excluded.spent_epsilon,
+                 spent_delta   = spent_delta   + excluded.spent_delta,
+                 updated_at    = excluded.updated_at",
+            params![tenant, epsilon, delta, now_epoch()],
+        )
+        .map_err(|e| format!("failed to update dp budget: {e}"))?;
+        Ok(())
     }
 }
 
@@ -263,6 +314,41 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let store = Store::open_at(&db);
         assert!(store.get_run(999_999, "").expect("no err").is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// DP budget accrues cumulatively and is isolated per tenant (issue C2).
+    #[test]
+    fn dp_budget_accrues_and_is_tenant_scoped() {
+        let dir = std::env::temp_dir().join(format!(
+            "xazz_store_dp_{}_{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let db = dir.join("xazz.db");
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Store::open_at(&db);
+
+        // Unknown tenant starts at zero.
+        assert_eq!(store.dp_spent("a").expect("read"), (0.0, 0.0));
+
+        store.add_dp_spend("a", 1.5, 0.0).expect("spend 1");
+        store.add_dp_spend("a", 0.5, 1e-5).expect("spend 2");
+        let (eps, delta) = store.dp_spent("a").expect("read");
+        assert!((eps - 2.0).abs() < 1e-12, "eps={eps}");
+        assert!((delta - 1e-5).abs() < 1e-15, "delta={delta}");
+
+        // Tenant isolation: b is untouched by a's spend.
+        assert_eq!(store.dp_spent("b").expect("read"), (0.0, 0.0));
+
+        // A zero-spend update is a no-op; non-finite values are rejected.
+        store.add_dp_spend("a", 0.0, 0.0).expect("no-op");
+        assert!((store.dp_spent("a").expect("read").0 - 2.0).abs() < 1e-12);
+        assert!(store.add_dp_spend("a", f64::NAN, 0.0).is_err());
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
