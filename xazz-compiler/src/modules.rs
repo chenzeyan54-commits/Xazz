@@ -63,7 +63,7 @@ pub fn resolve_imports(
         modules: Vec::new(),
         errors: Vec::new(),
     };
-    let merged = loader.load_program(program, source_dir);
+    let merged = loader.load_program(program, source_dir, false);
     if loader.errors.is_empty() {
         Ok(ResolvedProgram {
             program: merged,
@@ -90,7 +90,11 @@ impl ModuleLoader {
     /// `source_dir` is the directory of the file that owns `program`, so each
     /// relative import resolves against its *importing* file — including nested
     /// modules in subdirectories.
-    fn load_program(&mut self, program: &Program, source_dir: &Path) -> Program {
+    ///
+    /// When `embedded` is true the program belongs to an embedded stdlib
+    /// module: a relative import then names a sibling std module and resolves
+    /// in the embedded namespace, never against the process CWD.
+    fn load_program(&mut self, program: &Program, source_dir: &Path, embedded: bool) -> Program {
         let mut out = Program::new();
         for stmt in &program.stmts {
             match stmt {
@@ -98,6 +102,19 @@ impl ModuleLoader {
                     // Embedded stdlib: `import "std/<name>"` (issue #56, B2).
                     if let Some(rest) = path.strip_prefix("std/") {
                         let name = rest.trim_end_matches(".xzz");
+                        match stdlib_source(name) {
+                            Some(text) => self.load_embedded(name, text, &mut out),
+                            None => self.errors.push(format!(
+                                "unknown stdlib module: 'std/{name}' (available: common, math, models)"
+                            )),
+                        }
+                        continue;
+                    }
+                    // Inside an embedded module a relative import is a sibling
+                    // std module (`import "math"`), resolved in the embedded
+                    // namespace so `.`/CWD is never consulted.
+                    if embedded {
+                        let name = path.trim_end_matches(".xzz");
                         match stdlib_source(name) {
                             Some(text) => self.load_embedded(name, text, &mut out),
                             None => self.errors.push(format!(
@@ -196,7 +213,7 @@ impl ModuleLoader {
         // Load each module exactly once (dedupe shared modules), but inline
         // into this importer every time — duplicate names surface as checker
         // errors, which is the intended fail-closed behavior.
-        let nested = self.load_program(&parsed, &module_dir);
+        let nested = self.load_program(&parsed, &module_dir, false);
         self.stack.pop();
 
         if self.loaded.insert(canonical.clone()) {
@@ -236,9 +253,10 @@ impl ModuleLoader {
         };
 
         self.stack.push(key.clone());
-        // Embedded modules have no filesystem directory; they only import other
-        // `std/...` modules (handled before path resolution), so "." is inert.
-        let nested = self.load_program(&parsed, Path::new("."));
+        // Embedded modules have no filesystem directory: relative imports are
+        // resolved in the embedded stdlib namespace (`embedded = true`), so the
+        // `source_dir` value is inert.
+        let nested = self.load_program(&parsed, Path::new("."), true);
         self.stack.pop();
 
         if self.loaded.insert(key.clone()) {
@@ -434,6 +452,55 @@ mod tests {
             err.iter().any(|e| e.contains("unknown stdlib")),
             "미지원 stdlib 진단: {:?}",
             err
+        );
+    }
+
+    /// An embedded stdlib module resolves a sibling std module by relative name
+    /// inside the embedded namespace, never against the process CWD (issue #69
+    /// follow-up: inject a stdlib source base for embedded modules).
+    #[test]
+    fn embedded_module_relative_import_resolves_sibling() {
+        let mut loader = ModuleLoader {
+            stack: Vec::new(),
+            loaded: HashSet::new(),
+            modules: Vec::new(),
+            errors: Vec::new(),
+        };
+        let mut out = Program::new();
+        loader.load_embedded("common", "import \"math\";", &mut out);
+        assert!(
+            loader.errors.is_empty(),
+            "임베디드 상대 import 는 오류가 없어야: {:?}",
+            loader.errors
+        );
+        assert!(
+            out.stmts.iter().any(|s| matches!(
+                s,
+                Stmt::ModelDecl { name, .. } if name == "SmallMLP"
+            )),
+            "std/math 의 model 이 인라인되어야 함"
+        );
+    }
+
+    /// A relative import inside an embedded module that is not a known std
+    /// module errors instead of probing the filesystem.
+    #[test]
+    fn embedded_module_relative_import_unknown_errors() {
+        let mut loader = ModuleLoader {
+            stack: Vec::new(),
+            loaded: HashSet::new(),
+            modules: Vec::new(),
+            errors: Vec::new(),
+        };
+        let mut out = Program::new();
+        loader.load_embedded("common", "import \"nope\";", &mut out);
+        assert!(
+            loader
+                .errors
+                .iter()
+                .any(|e| e.contains("unknown stdlib") && e.contains("nope")),
+            "미지원 임베디드 상대 import 진단: {:?}",
+            loader.errors
         );
     }
 }
