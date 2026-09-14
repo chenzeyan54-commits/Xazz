@@ -9,6 +9,13 @@ Versioning: [Semantic Versioning](https://semver.org/)
 
 ## [Unreleased]
 
+### Fixed — 같은 tenant 동시 실행 DP 사전검사 원자성 (issue #59, Track C2)
+
+- **per-tenant 실행 락** — `AppState`에 tenant별 async Mutex를 두고 `POST /execute`의
+  precheck → run → accrue 구간을 직렬화. 같은 tenant의 동시 실행이 같은 `remaining`을
+  읽어 envelope를 초과하던 경합 제거. 다른 tenant는 서로 영향 없음(테넌트별 락)
+- 검증: 락 동일성/tenant 간 비공유/try_lock 직렬화 테스트. xazz-server 50 tests pass
+
 ### Added — DP 예산 리셋 / 윈도우 API (issue #59, Track C2)
 
 - **`POST /dp/budget/reset`** — 인증된 tenant의 누적 ε/δ spend를 0으로 초기화하고 window를

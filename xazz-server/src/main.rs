@@ -59,6 +59,20 @@ struct AppState {
     exec_permits: Arc<Semaphore>,
     /// Persistent run-history store (issue C1)
     store: Arc<store::Store>,
+    /// Per-tenant execution locks (issue C2) — serialize a tenant's
+    /// precheck → run → accrue so its DP budget check is atomic across runs.
+    tenant_locks:
+        Arc<std::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+}
+
+impl AppState {
+    /// Returns the (shared) execution lock for a tenant, creating it on first use.
+    fn tenant_lock(&self, tenant: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut map = self.tenant_locks.lock().expect("tenant lock map poisoned");
+        map.entry(tenant.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
 }
 
 /// Records a run in the store, returning the new id (0 on store failure).
@@ -245,6 +259,7 @@ async fn main() {
         .with_state(AppState {
             exec_permits: Arc::new(Semaphore::new(MAX_CONCURRENT_EXECUTIONS)),
             store: Arc::new(store::Store::new()),
+            tenant_locks: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         })
         .layer(cors);
 
@@ -431,7 +446,14 @@ async fn handle_execute(
     State(state): State<AppState>,
     Json(payload): Json<ExecuteRequest>,
 ) -> Result<Json<ExecuteResponse>, (StatusCode, Json<ExecuteResponse>)> {
-    // 0a. Concurrency semaphore — if no permit, deny execution (fail-closed, no queue).
+    // 0a. Per-tenant serialization (issue C2): a tenant's precheck → run → accrue
+    //     must be atomic. Otherwise two concurrent runs both read the same
+    //     remaining DP budget and can jointly exceed the envelope. Each tenant has
+    //     its own lock, so cross-tenant throughput is unaffected.
+    let tenant_mutex = state.tenant_lock(tenant_str(tenant.as_str()));
+    let _tenant_guard = tenant_mutex.lock().await;
+
+    // 0b. Concurrency semaphore — if no permit, deny execution (fail-closed, no queue).
     let _permit = match state.exec_permits.try_acquire() {
         Ok(p) => p,
         Err(_) => {
@@ -1454,6 +1476,7 @@ mod tests {
         AppState {
             exec_permits: Arc::new(Semaphore::new(64)),
             store: Arc::new(store::Store::open_at(&tmp_db)),
+            tenant_locks: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         }
     }
 
@@ -1612,6 +1635,7 @@ v out = load(\"data/p.csv\") :: Patient |> select([name, patient_id, age_band]);
         let state = AppState {
             exec_permits: Arc::new(Semaphore::new(0)),
             store: Arc::new(store::Store::new()),
+            tenant_locks: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         };
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -1631,6 +1655,32 @@ v out = load(\"data/p.csv\") :: Patient |> select([name, patient_id, age_band]);
             "no error message: {:?}",
             body.0.error
         );
+    }
+
+    /// Same-tenant executions share one lock; different tenants do not (issue C2).
+    #[tokio::test]
+    async fn tenant_execution_locks_are_per_tenant() {
+        let state = test_state();
+        let a1 = state.tenant_lock("a");
+        let a2 = state.tenant_lock("a");
+        let b = state.tenant_lock("b");
+        assert!(Arc::ptr_eq(&a1, &a2), "same tenant must share one lock");
+        assert!(
+            !Arc::ptr_eq(&a1, &b),
+            "different tenants must not share a lock"
+        );
+
+        // Holding the tenant lock serializes the same tenant but not others.
+        let guard = a1.lock().await;
+        assert!(
+            a2.try_lock().is_err(),
+            "same tenant's executions must be serialized"
+        );
+        assert!(
+            b.try_lock().is_ok(),
+            "a different tenant must not be blocked"
+        );
+        drop(guard);
     }
 
     /// Safe code passes the gate (false-positive regression prevention).
@@ -1828,6 +1878,7 @@ v x = load(\"examples/data/seoul_air_2024.csv\") :: AQ
         AppState {
             exec_permits: Arc::new(Semaphore::new(64)),
             store: Arc::new(store::Store::open_at(&tmp_db)),
+            tenant_locks: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         }
     }
 
