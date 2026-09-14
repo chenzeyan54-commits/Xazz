@@ -9,6 +9,19 @@ Versioning: [Semantic Versioning](https://semver.org/)
 
 ## [Unreleased]
 
+### Added — per-tenant 정책 팩 namespace 격리 (issue #59, Track C2)
+
+- **SQLite `tenant_policies` 테이블** — tenant별 정책 팩 JSON 저장. 쓰기 시
+  `Policy::from_json_str`로 검증하고, 한 tenant의 팩은 다른 tenant에 적용되지 않음
+- **`PUT /security/policy` / `DELETE /security/policy`** — 인증된 tenant가 자기 namespace의
+  정책 팩을 설정/삭제(self-service), `GET /security/policy`는 tenant의 유효 정책과 origin 반환
+- **`guardrail::load_policy_for` / `gate_for`** — tenant 팩 우선, 없으면 전역
+  (`XAZZ_POLICY_PATH` / `xazz.policy.json`) / builtin으로 폴백. tenant 팩 파싱 실패는
+  fail-closed(실행 거부)
+- `POST /execute` · `/security/policy/check` · `/security/remediate`가 tenant 정책을 적용
+- 검증: 저장소/가드레일/엔드포인트 tenant 격리, 잘못된 팩 4xx 거부, 손상 팩 fail-closed.
+  xazz-server 45 tests pass
+
 ### Added — per-tenant DP 예산 격리 (issue #59, Track C2)
 
 - **per-tenant DP 누적 원장** — SQLite `dp_budget` 테이블(tenant별 `spent_epsilon`/`spent_delta`).

@@ -48,6 +48,11 @@ fn ensure_schema(conn: &Connection) -> Result<(), String> {
             spent_epsilon REAL NOT NULL DEFAULT 0,
             spent_delta REAL NOT NULL DEFAULT 0,
             updated_at INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS tenant_policies (
+            tenant TEXT PRIMARY KEY,
+            policy_json TEXT NOT NULL,
+            updated_at INTEGER NOT NULL DEFAULT 0
         );",
     )
     .map_err(|e| format!("failed to create store schema: {e}"))?;
@@ -229,6 +234,54 @@ impl Store {
         .map_err(|e| format!("failed to update dp budget: {e}"))?;
         Ok(())
     }
+
+    /// Returns the tenant's stored policy pack JSON, if any — issue C2.
+    ///
+    /// The pack is keyed by tenant, so one tenant's policy pack is never applied to
+    /// another. The caller is responsible for parsing/validating it (fail-closed).
+    pub fn get_tenant_policy(&self, tenant: &str) -> Result<Option<String>, String> {
+        let guard = self.open()?;
+        let conn = guard.as_ref().expect("open guarantees Some");
+        conn.query_row(
+            "SELECT policy_json FROM tenant_policies WHERE tenant = ?1",
+            params![tenant],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|e| format!("failed to read tenant policy: {e}"))
+    }
+
+    /// Stores (or replaces) a tenant's policy pack JSON — issue C2.
+    ///
+    /// Validation happens before the write (the caller parses with
+    /// `Policy::from_json_str`), so a stored pack is always well-formed.
+    pub fn set_tenant_policy(&self, tenant: &str, policy_json: &str) -> Result<(), String> {
+        let guard = self.open()?;
+        let conn = guard.as_ref().expect("open guarantees Some");
+        conn.execute(
+            "INSERT INTO tenant_policies (tenant, policy_json, updated_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(tenant) DO UPDATE SET
+                 policy_json = excluded.policy_json,
+                 updated_at  = excluded.updated_at",
+            params![tenant, policy_json, now_epoch()],
+        )
+        .map_err(|e| format!("failed to store tenant policy: {e}"))?;
+        Ok(())
+    }
+
+    /// Deletes a tenant's stored policy pack. Returns `true` if one existed — issue C2.
+    pub fn delete_tenant_policy(&self, tenant: &str) -> Result<bool, String> {
+        let guard = self.open()?;
+        let conn = guard.as_ref().expect("open guarantees Some");
+        let deleted = conn
+            .execute(
+                "DELETE FROM tenant_policies WHERE tenant = ?1",
+                params![tenant],
+            )
+            .map_err(|e| format!("failed to delete tenant policy: {e}"))?;
+        Ok(deleted > 0)
+    }
 }
 
 impl Default for Store {
@@ -348,6 +401,63 @@ mod tests {
         store.add_dp_spend("a", 0.0, 0.0).expect("no-op");
         assert!((store.dp_spent("a").expect("read").0 - 2.0).abs() < 1e-12);
         assert!(store.add_dp_spend("a", f64::NAN, 0.0).is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Tenant policy packs are stored and isolated per tenant (issue C2).
+    #[test]
+    fn tenant_policies_are_namespaced_per_tenant() {
+        let dir = std::env::temp_dir().join(format!(
+            "xazz_store_pol_{}_{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let db = dir.join("xazz.db");
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Store::open_at(&db);
+
+        // Unknown tenants have no stored pack.
+        assert!(store.get_tenant_policy("a").expect("read").is_none());
+
+        store
+            .set_tenant_policy("a", r#"{"id":"a-pack"}"#)
+            .expect("write a");
+        store
+            .set_tenant_policy("b", r#"{"id":"b-pack"}"#)
+            .expect("write b");
+
+        // Each tenant reads only its own pack.
+        assert_eq!(
+            store.get_tenant_policy("a").expect("read a").as_deref(),
+            Some(r#"{"id":"a-pack"}"#)
+        );
+        assert_eq!(
+            store.get_tenant_policy("b").expect("read b").as_deref(),
+            Some(r#"{"id":"b-pack"}"#)
+        );
+
+        // Replacing a pack only affects that tenant.
+        store
+            .set_tenant_policy("a", r#"{"id":"a-v2"}"#)
+            .expect("rewrite a");
+        assert_eq!(
+            store.get_tenant_policy("a").expect("reread a").as_deref(),
+            Some(r#"{"id":"a-v2"}"#)
+        );
+        assert_eq!(
+            store.get_tenant_policy("b").expect("reread b").as_deref(),
+            Some(r#"{"id":"b-pack"}"#)
+        );
+
+        // Deleting a pack is tenant-scoped.
+        assert!(store.delete_tenant_policy("a").expect("delete a"));
+        assert!(store.get_tenant_policy("a").expect("read a").is_none());
+        assert!(store.get_tenant_policy("b").expect("read b").is_some());
+        assert!(!store.delete_tenant_policy("a").expect("delete again"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

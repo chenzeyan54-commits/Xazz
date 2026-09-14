@@ -111,7 +111,9 @@ datasets. This track makes Xazz handle real workloads.
       (`tenant1=token1,tenant2=token2`) with `X-Xazz-Tenant` header; 401 on missing/invalid
 - [x] Per-tenant run isolation — `runs.tenant` column; `/runs` + `/runs/:id` scoped to the
       authenticated tenant (cross-tenant read → 404)
-- [ ] Per-tenant policy packs isolated by namespace (extends the tenant scoping to policy state)
+- [x] Per-tenant policy packs isolated by namespace — `tenant_policies` table keyed by tenant;
+      `PUT`/`DELETE /security/policy` (self-service) store/remove the tenant's pack; execution
+      and policy endpoints resolve the tenant's pack first (global/builtin fallback, fail-closed)
 - [x] Per-tenant DP budgets isolated by namespace — server-side cumulative ε/δ ledger
       (`dp_budget` table); each run receives the tenant's *remaining* budget via
       `XAZZ_DP_BUDGET`/`XAZZ_DP_DELTA_BUDGET`, and `GET /dp/budget` reports spent/remaining.
@@ -120,7 +122,9 @@ datasets. This track makes Xazz handle real workloads.
   ✅ **Run isolation done 2026-09-09**: verified end-to-end — tenant-a and tenant-b each see only
   their own runs; cross-tenant GET /runs/:id → 404.
   ✅ **DP budget isolation done 2026-09-11** (issue #59/C2): the `dp_budget` ledger accrues each
-  run's `[xazz:dp]` spend per tenant; remaining budget is injected per run. Per-tenant policy packs remain.
+  run's `[xazz:dp]` spend per tenant; remaining budget is injected per run.
+  ✅ **Policy pack isolation done 2026-09-14** (issue #59/C2): `tenant_policies` stores each
+  tenant's pack by namespace; policy endpoints and `/execute` resolve it first (global/builtin fallback).
 
 ### C3. Pipeline catalog + lineage — issue #60
 - [x] Column-level lineage derived from the IR's flowing `Schema` — `xazz-compiler::catalog`
@@ -279,7 +283,7 @@ Efficiency rule: **value-per-effort first, then dependency chain.** Do not start
 | 7 | ~~C1 — server persistence~~ | ✅ Done — SQLite run history + /runs API |
 | 8 | ~~B2 — stdlib (#56)~~ | ✅ Done — `xazz-stdlib/` embedded modules (`std/common`, `std/math`, `std/models`) |
 | 9 | ~~C4 — Python bindings (#61, subprocess adapter)~~ | ✅ Done — `xazz.check/run/policy` from Python; PyO3 deferred |
-| 10 | ~~C2 — auth + multi-tenant (#59)~~ | ✅ Done — tenant token auth + scoped /runs + per-tenant DP budget ledger; per-tenant policy packs remain |
+| 10 | ~~C2 — auth + multi-tenant (#59)~~ | ✅ Done — tenant token auth + scoped /runs + per-tenant DP budget ledger + per-tenant policy packs |
 | 11 | D1/D2/D3 — ML | Phase 6; backend trait + `XAZZ_BACKEND` landed (#62/#63); D3 early stopping done (#64). GPU/ONNX providers hardware-gated |
 | 12 | ~~F1 — prompt input gate~~ | ✅ Issue #70 open — pure policy-engine extension; biggest GenAI governance win per effort |
 | 13 | F2 — output gate (#71) | Depends on F1; completes the request/response audit story |

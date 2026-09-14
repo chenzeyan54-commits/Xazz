@@ -20,6 +20,7 @@ use xazz_compiler::policy;
 use xazz_compiler::{Policy, PolicyReport, Remediation};
 
 use crate::slm::{self, SlmConfig};
+use crate::store::Store;
 
 // ── runner invocation counter ─────────────────────────────────────────────────
 //
@@ -61,16 +62,68 @@ pub fn load_policy() -> Result<(Policy, String), Box<PolicyReport>> {
     }
 }
 
+/// Origin label for a tenant-scoped policy pack — issue C2.
+///
+/// The empty tenant is the default/single-tenant namespace; it is labeled
+/// explicitly so a tenant pack is never confused with the global policy file.
+pub fn tenant_origin(tenant: &str) -> String {
+    if tenant.is_empty() {
+        "tenant:<default>".to_string()
+    } else {
+        format!("tenant:{tenant}")
+    }
+}
+
+/// Loads the policy for a tenant namespace — issue C2 (per-tenant policy packs).
+///
+/// Resolution order (fail-closed at every step):
+///   1. The tenant's stored policy pack (`tenant_policies`), keyed by tenant so
+///      one tenant's pack is never applied to another.
+///   2. The global policy (`XAZZ_POLICY_PATH` / `xazz.policy.json` / builtin).
+///
+/// A stored pack that fails to parse is a load failure (execution denied) — a tenant
+/// cannot silently fall back to a weaker policy after a bad write.
+pub fn load_policy_for(store: &Store, tenant: &str) -> Result<(Policy, String), Box<PolicyReport>> {
+    match store.get_tenant_policy(tenant) {
+        Ok(Some(json)) => match Policy::from_json_str(&json) {
+            Ok(policy) => Ok((policy, tenant_origin(tenant))),
+            Err(e) => Err(Box::new(policy::policy_load_failure_report(&e))),
+        },
+        Ok(None) => load_policy(),
+        Err(e) => Err(Box::new(policy::policy_load_failure_report(
+            &policy::PolicyError { message: e },
+        ))),
+    }
+}
+
 /// Judges the code against the policy.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn gate(code: &str) -> Decision {
-    let (policy, origin) = match load_policy() {
-        Ok(v) => v,
+    match load_policy() {
+        Ok((policy, origin)) => judge(code, policy, origin),
         Err(report) => {
             eprintln!("[xazz] ⛔ policy load failed — refusing all executions.");
-            return Decision::Reject { report: *report };
+            Decision::Reject { report: *report }
         }
-    };
+    }
+}
 
+/// Judges the code against the tenant-namespaced policy — issue C2.
+pub fn gate_for(store: &Store, tenant: &str, code: &str) -> Decision {
+    match load_policy_for(store, tenant) {
+        Ok((policy, origin)) => judge(code, policy, origin),
+        Err(report) => {
+            eprintln!(
+                "[xazz] ⛔ tenant '{}' policy load failed — refusing all executions.",
+                tenant
+            );
+            Decision::Reject { report: *report }
+        }
+    }
+}
+
+/// Applies an already-loaded policy and prints the decision trace.
+fn judge(code: &str, policy: Policy, origin: String) -> Decision {
     let report = policy::analyze(code, &policy);
     if report.safe_to_execute {
         if !report.warnings.is_empty() {
@@ -266,6 +319,57 @@ v out = load(\"data/p.csv\") :: Patient |> groupBy(\"age_band\") |> count(\"pati
         let before = runner_invocations();
         note_runner_invocation();
         assert_eq!(runner_invocations(), before + 1);
+    }
+
+    /// Per-tenant policy packs are isolated: a pack stored for one tenant never
+    /// applies to another (issue C2).
+    #[test]
+    fn tenant_policy_packs_are_isolated() {
+        let db = std::env::temp_dir().join(format!("xazz_guard_pol_a_{}.db", std::process::id()));
+        let store = Store::open_at(&db);
+
+        // tenant-a's pack classifies `region` as a direct identifier.
+        let mut p = Policy::builtin();
+        p.id = "tenant-a-pack".to_string();
+        p.direct_identifiers.push("region".to_string());
+        store
+            .set_tenant_policy("tenant-a", &p.to_json_string())
+            .expect("store tenant-a pack");
+
+        let code = "type P = { region: string };\n\
+                    v x = load(\"d.csv\") :: P |> select([region]);";
+
+        assert!(
+            matches!(gate_for(&store, "tenant-a", code), Decision::Reject { .. }),
+            "tenant-a's own pack must block `region`"
+        );
+        // tenant-b has no stored pack, so the builtin policy applies (`region` is unclassified).
+        assert!(
+            matches!(gate_for(&store, "tenant-b", code), Decision::Allow { .. }),
+            "tenant-a's pack must not leak into tenant-b"
+        );
+
+        let _ = std::fs::remove_file(&db);
+    }
+
+    /// A corrupted stored pack denies execution rather than falling back to a
+    /// weaker global policy (fail-closed).
+    #[test]
+    fn corrupt_tenant_policy_is_fail_closed() {
+        let db = std::env::temp_dir().join(format!("xazz_guard_pol_b_{}.db", std::process::id()));
+        let store = Store::open_at(&db);
+        store
+            .set_tenant_policy("t", "{ not json")
+            .expect("store raw pack");
+
+        let safe = "type P = { region: string };\n\
+                    v x = load(\"d.csv\") :: P |> select([region]);";
+        assert!(
+            matches!(gate_for(&store, "t", safe), Decision::Reject { .. }),
+            "a corrupt pack must deny execution"
+        );
+
+        let _ = std::fs::remove_file(&db);
     }
 
     /// When the sLM is active and its proposal passes re-verification, the adopted code's

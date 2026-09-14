@@ -10,6 +10,8 @@
 //!   GET  /security/audit/log/:hash                         → look up an audit record by code hash
 //!   GET  /security/audit/chain                             → verify hash-chain integrity
 //!   GET  /security/policy                                  → the current Policy-as-Code policy
+//!   PUT  /security/policy                                  → store the tenant's policy pack (C2)
+//!   DELETE /security/policy                                → remove the tenant's policy pack (C2)
 //!   POST /security/policy/check { "code": "<xzz DSL>" }    → static guardrail inspection report
 //!   POST /security/remediate    { "code": "<xzz DSL>" }    → safe code auto-remediation (deterministic + sLM)
 //!   GET  /runs                                → run history (SQLite, issue C1)
@@ -211,7 +213,12 @@ async fn main() {
         .route("/security/audit/log", get(handle_audit_log))
         .route("/security/audit/log/{hash}", get(handle_audit_lookup))
         .route("/security/audit/chain", get(handle_audit_chain))
-        .route("/security/policy", get(handle_policy_info))
+        .route(
+            "/security/policy",
+            get(handle_policy_info)
+                .put(handle_policy_set)
+                .delete(handle_policy_delete),
+        )
         .route("/security/policy/check", post(handle_policy_check))
         .route("/security/remediate", post(handle_remediate))
         .route("/security/inference/check", post(handle_inference_check))
@@ -436,36 +443,37 @@ async fn handle_execute(
     //    On violation this is where it ends — no temp file is created and the xazz
     //    runner is not spawned. It also denies when the policy cannot be loaded
     //    (fail-closed).
-    let policy_report = match guardrail::gate(&payload.code) {
-        guardrail::Decision::Reject { report } => {
-            // Blocks are audit-worthy too — record what was blocked and why.
-            if let Err(e) = audit_log::append_with_outcome(&payload.code, Some("blocked")) {
-                eprintln!("[xazz] ⚠️ failed to record block in audit log: {}", e);
+    let policy_report =
+        match guardrail::gate_for(&state.store, tenant_str(tenant.as_str()), &payload.code) {
+            guardrail::Decision::Reject { report } => {
+                // Blocks are audit-worthy too — record what was blocked and why.
+                if let Err(e) = audit_log::append_with_outcome(&payload.code, Some("blocked")) {
+                    eprintln!("[xazz] ⚠️ failed to record block in audit log: {}", e);
+                }
+                let logs = report
+                    .violations
+                    .iter()
+                    .map(|v| format!("{} {}: {}", v.rule_id, v.rule_name, v.message))
+                    .collect::<Vec<_>>();
+                return Err((
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    Json(ExecuteResponse {
+                        success: false,
+                        rows: json!([]),
+                        schema: json!([]),
+                        logs,
+                        stdout: String::new(),
+                        training: None,
+                        dp: None,
+                        diagnostics: None,
+                        policy: serde_json::to_value(&report).ok(),
+                        error: Some(report.summary()),
+                        run_id: None,
+                    }),
+                ));
             }
-            let logs = report
-                .violations
-                .iter()
-                .map(|v| format!("{} {}: {}", v.rule_id, v.rule_name, v.message))
-                .collect::<Vec<_>>();
-            return Err((
-                StatusCode::UNPROCESSABLE_ENTITY,
-                Json(ExecuteResponse {
-                    success: false,
-                    rows: json!([]),
-                    schema: json!([]),
-                    logs,
-                    stdout: String::new(),
-                    training: None,
-                    dp: None,
-                    diagnostics: None,
-                    policy: serde_json::to_value(&report).ok(),
-                    error: Some(report.summary()),
-                    run_id: None,
-                }),
-            ));
-        }
-        guardrail::Decision::Allow { report, .. } => report,
-    };
+            guardrail::Decision::Allow { report, .. } => report,
+        };
 
     // 1. Save the DSL code to a temp .xzz file
     let tmp = tempfile::Builder::new()
@@ -952,13 +960,17 @@ async fn handle_audit_chain() -> Result<Json<Value>, (StatusCode, String)> {
 
 // ── GET /security/policy ─────────────────────────────────────────────────────
 
-/// Returns the currently active Policy-as-Code policy as-is.
+/// Returns the currently active Policy-as-Code policy for the authenticated tenant.
 ///
 /// The frontend can use this response to show the user "which column is blocked
 /// and why" in advance. If policy loading fails, it returns 500 with the reason.
-async fn handle_policy_info() -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    match guardrail::load_policy() {
+async fn handle_policy_info(
+    Extension(tenant): Extension<String>,
+    State(state): State<AppState>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    match guardrail::load_policy_for(&state.store, tenant_str(tenant.as_str())) {
         Ok((policy, origin)) => Ok(Json(json!({
+            "tenant": tenant_str(tenant.as_str()),
             "origin": origin,
             "policy": policy,
             "slm": guardrail::SlmStatus::from_config(&slm::SlmConfig::from_env()),
@@ -970,6 +982,56 @@ async fn handle_policy_info() -> Result<Json<Value>, (StatusCode, Json<Value>)> 
     }
 }
 
+// ── PUT /security/policy ─────────────────────────────────────────────────────
+
+/// Stores (or replaces) the authenticated tenant's policy pack — issue C2.
+///
+/// `self-service`: the tenant writes only its own namespace. The body is validated
+/// with the same parser used at load time, so an unparseable pack is rejected here
+/// instead of becoming a later fail-closed denial.
+async fn handle_policy_set(
+    Extension(tenant): Extension<String>,
+    State(state): State<AppState>,
+    Json(payload): Json<Value>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let tenant = tenant_str(tenant.as_str());
+    let text = payload.to_string();
+    let policy = xazz_compiler::Policy::from_json_str(&text)
+        .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({ "error": e.message }))))?;
+
+    state.store.set_tenant_policy(tenant, &text).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e })),
+        )
+    })?;
+
+    Ok(Json(json!({
+        "tenant": tenant,
+        "origin": guardrail::tenant_origin(tenant),
+        "policy": policy,
+    })))
+}
+
+// ── DELETE /security/policy ──────────────────────────────────────────────────
+
+/// Removes the authenticated tenant's stored policy pack — issue C2.
+///
+/// After deletion the tenant falls back to the global policy / builtin baseline.
+async fn handle_policy_delete(
+    Extension(tenant): Extension<String>,
+    State(state): State<AppState>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let tenant = tenant_str(tenant.as_str());
+    let deleted = state.store.delete_tenant_policy(tenant).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e })),
+        )
+    })?;
+    Ok(Json(json!({ "tenant": tenant, "deleted": deleted })))
+}
+
 // ── POST /security/policy/check ──────────────────────────────────────────────
 
 /// Performs only a static guardrail check without executing the code.
@@ -978,14 +1040,17 @@ async fn handle_policy_info() -> Result<Json<Value>, (StatusCode, Json<Value>)> 
 /// run button is pressed. Even with violations it returns HTTP 200 — the check
 /// itself succeeded; the verdict is in the body's `safe_to_execute`.
 async fn handle_policy_check(
+    Extension(tenant): Extension<String>,
+    State(state): State<AppState>,
     Json(payload): Json<guardrail::CodeRequest>,
 ) -> Result<Json<guardrail::PolicyCheckResponse>, (StatusCode, Json<Value>)> {
-    let (policy, origin) = guardrail::load_policy().map_err(|report| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": report.summary(), "policy": report })),
-        )
-    })?;
+    let (policy, origin) = guardrail::load_policy_for(&state.store, tenant_str(tenant.as_str()))
+        .map_err(|report| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": report.summary(), "policy": report })),
+            )
+        })?;
 
     let report = xazz_compiler::check_policy(&payload.code, &policy);
     Ok(Json(guardrail::PolicyCheckResponse {
@@ -1008,14 +1073,17 @@ async fn handle_policy_check(
 /// If the response's `remediation.verified` is false, human-handled violations remain.
 /// In that case, the remediated code must not be marked "safe".
 async fn handle_remediate(
+    Extension(tenant): Extension<String>,
+    State(state): State<AppState>,
     Json(payload): Json<guardrail::CodeRequest>,
 ) -> Result<Json<guardrail::RemediateResponse>, (StatusCode, Json<Value>)> {
-    let (policy, origin) = guardrail::load_policy().map_err(|report| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": report.summary(), "policy": report })),
-        )
-    })?;
+    let (policy, origin) = guardrail::load_policy_for(&state.store, tenant_str(tenant.as_str()))
+        .map_err(|report| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": report.summary(), "policy": report })),
+            )
+        })?;
 
     let cfg = slm::SlmConfig::from_env();
     let report = xazz_compiler::check_policy(&payload.code, &policy);
@@ -1405,9 +1473,13 @@ v out = load(\"data/p.csv\") :: Patient |> select([name, patient_id, age_band]);
     async fn policy_check_returns_report_without_executing() {
         let before = guardrail::runner_invocations();
 
-        let response = handle_policy_check(Json(guardrail::CodeRequest {
-            code: UNSAFE_CODE.to_string(),
-        }))
+        let response = handle_policy_check(
+            Extension(String::new()),
+            State(test_state()),
+            Json(guardrail::CodeRequest {
+                code: UNSAFE_CODE.to_string(),
+            }),
+        )
         .await
         .expect("policy check failed");
 
@@ -1419,9 +1491,13 @@ v out = load(\"data/p.csv\") :: Patient |> select([name, patient_id, age_band]);
     /// /security/remediate returns verified safe code and the report together.
     #[tokio::test]
     async fn remediate_returns_verified_safe_code() {
-        let response = handle_remediate(Json(guardrail::CodeRequest {
-            code: UNSAFE_CODE.to_string(),
-        }))
+        let response = handle_remediate(
+            Extension(String::new()),
+            State(test_state()),
+            Json(guardrail::CodeRequest {
+                code: UNSAFE_CODE.to_string(),
+            }),
+        )
         .await
         .expect("remediation failed");
 
@@ -1611,5 +1687,136 @@ v x = load(\"examples/data/seoul_air_2024.csv\") :: AQ
             .0;
         assert_eq!(other["spent_epsilon"], json!(0.0));
         assert_eq!(other["remaining_epsilon"], json!(10.0));
+    }
+
+    // ── Per-tenant policy packs (issue C2) ────────────────────────────────────
+
+    /// Isolated AppState for policy tests (each tenant-policy write gets its own DB).
+    fn unique_state(tag: &str) -> AppState {
+        let tmp_db =
+            std::env::temp_dir().join(format!("xazz_server_pol_{}_{}.db", std::process::id(), tag));
+        AppState {
+            exec_permits: Arc::new(Semaphore::new(64)),
+            store: Arc::new(store::Store::open_at(&tmp_db)),
+        }
+    }
+
+    /// A stored pack is namespaced by tenant: only its owner reads/applies it.
+    #[tokio::test]
+    async fn tenant_policy_endpoints_are_namespaced() {
+        let state = unique_state("ns");
+        let code = "type P = { region: string };\n\
+                    v x = load(\"d.csv\") :: P |> select([region]);";
+
+        // tenant-a writes a pack that classifies `region` as a direct identifier.
+        let mut pack = xazz_compiler::Policy::builtin();
+        pack.id = "tenant-a-pack".to_string();
+        pack.direct_identifiers.push("region".to_string());
+        let set = handle_policy_set(
+            Extension("tenant-a".to_string()),
+            State(state.clone()),
+            Json(serde_json::to_value(&pack).unwrap()),
+        )
+        .await
+        .expect("set policy")
+        .0;
+        assert_eq!(set["origin"], json!("tenant:tenant-a"));
+        assert_eq!(set["policy"]["id"], json!("tenant-a-pack"));
+
+        // tenant-a reads its own pack.
+        let info_a = handle_policy_info(Extension("tenant-a".to_string()), State(state.clone()))
+            .await
+            .expect("info a")
+            .0;
+        assert_eq!(info_a["origin"], json!("tenant:tenant-a"));
+        assert_eq!(info_a["policy"]["id"], json!("tenant-a-pack"));
+
+        // tenant-b is unaffected — it gets the builtin baseline.
+        let info_b = handle_policy_info(Extension("tenant-b".to_string()), State(state.clone()))
+            .await
+            .expect("info b")
+            .0;
+        assert_eq!(info_b["policy"]["id"], json!("xazz-builtin-pii"));
+
+        // The verdict differs by tenant for identical code.
+        let check_a = handle_policy_check(
+            Extension("tenant-a".to_string()),
+            State(state.clone()),
+            Json(guardrail::CodeRequest {
+                code: code.to_string(),
+            }),
+        )
+        .await
+        .expect("policy check a")
+        .0;
+        assert!(!check_a.safe_to_execute);
+        let check_b = handle_policy_check(
+            Extension("tenant-b".to_string()),
+            State(state.clone()),
+            Json(guardrail::CodeRequest {
+                code: code.to_string(),
+            }),
+        )
+        .await
+        .expect("policy check b")
+        .0;
+        assert!(check_b.safe_to_execute);
+
+        // Deleting tenant-a's pack reverts it to the builtin baseline.
+        let del = handle_policy_delete(Extension("tenant-a".to_string()), State(state.clone()))
+            .await
+            .expect("delete")
+            .0;
+        assert_eq!(del["deleted"], json!(true));
+        let info_a2 = handle_policy_info(Extension("tenant-a".to_string()), State(state))
+            .await
+            .expect("info a2")
+            .0;
+        assert_eq!(info_a2["policy"]["id"], json!("xazz-builtin-pii"));
+    }
+
+    /// An invalid pack is rejected at write time (never stored).
+    #[tokio::test]
+    async fn tenant_policy_set_rejects_invalid_pack() {
+        let state = unique_state("bad");
+        let result = handle_policy_set(
+            Extension("t".to_string()),
+            State(state),
+            Json(json!({ "not": "a policy" })),
+        )
+        .await;
+        let (status, body) = result.expect_err("invalid pack was accepted");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.0["error"].as_str().is_some());
+    }
+
+    /// /execute applies the authenticated tenant's pack and never invokes the runner on block.
+    #[tokio::test]
+    async fn execute_applies_tenant_policy() {
+        let state = unique_state("exec");
+        let mut pack = xazz_compiler::Policy::builtin();
+        pack.direct_identifiers.push("region".to_string());
+        let _ = handle_policy_set(
+            Extension("tenant-a".to_string()),
+            State(state.clone()),
+            Json(serde_json::to_value(&pack).unwrap()),
+        )
+        .await
+        .expect("set policy");
+
+        let code = "type P = { region: string };\n\
+                    v x = load(\"d.csv\") :: P |> select([region]);";
+        let before = guardrail::runner_invocations();
+        let result = handle_execute(
+            Extension("tenant-a".to_string()),
+            State(state),
+            Json(ExecuteRequest {
+                code: code.to_string(),
+            }),
+        )
+        .await;
+        let (status, _) = result.err().expect("tenant policy was not applied");
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(guardrail::runner_invocations(), before);
     }
 }
