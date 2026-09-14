@@ -1,0 +1,19 @@
+name: Question / support
+description: Ask a usage question or request help.
+title: "[question] "
+labels: ["question"]
+body:
+  - type: textarea
+    id: question
+    attributes:
+      label: Question
+      description: What are you trying to do, and where are you stuck?
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Context
+      description: Xazz version, OS, relevant `.xzz` source, and what you already tried.
+    validations:
+      required: false

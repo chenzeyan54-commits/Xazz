@@ -10,7 +10,7 @@
 
 Xazz is already a **correct, secure, documented** compiler+runtime: Typed IR (single-pass,
 backend-independent), 3-gate policy guardrails, (ε,δ) DP accounting, SHA-256 audit chain,
-and a 2.6×-vs-pandas benchmark. What it is not yet is **scalable** — in four distinct senses:
+and a 1.95×-vs-pandas benchmark (at 912K rows; 1.39× at 228K and 4.09M rows). What it is not yet is **scalable** — in four distinct senses:
 
 | Sense of scale | Current ceiling | To grow past it |
 | :--- | :--- | :--- |

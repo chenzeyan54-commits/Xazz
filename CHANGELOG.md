@@ -9,6 +9,26 @@ Versioning: [Semantic Versioning](https://semver.org/)
 
 ## [Unreleased]
 
+### Added — 오픈소스 거버넌스·라이선스 정책 (커뮤니티 확장)
+
+- **`deny.toml`** — `cargo deny` 기반 의존성 정책: permissive 라이선스 allow 목록,
+  MPL-2.0은 크레이트별 exception으로 한정(전역 미허용), GPL/AGPL은 라이선스 단계에서
+  자동 차단, registry/git 출처 고정, RustSec advisories 검사
+- **CI `licenses` 잡** — `EmbarkStudios/cargo-deny-action`으로 licenses · bans ·
+  sources · advisories를 매 PR/push마다 검증
+- **거버넌스 문서** — `SECURITY.md`(취약점 신고·지원 범위), `CODE_OF_CONDUCT.md`
+  (Contributor Covenant 2.1), `GOVERNANCE.md`(역할·의사결정·릴리스·품질관리)
+- **GitHub 메타데이터** — 이슈 템플릿(bug/feature/question + config), PR 템플릿,
+  `dependabot.yml`(cargo·npm×2·actions 주간 업데이트)
+- `xazz-server/Cargo.toml`에 `license.workspace` 누락 수정 (SBOM 라이선스 식별)
+
+### Fixed — 보안 권고 및 문서 수치 정합성
+
+- `anyhow` 1.0.102 → 1.0.104 (RUSTSEC-2026-0190 unsound 패치).
+  `cargo deny check advisories` 통과
+- 벤치마크 수치를 최신 측정으로 통일: README / README_kr / ROADMAP / 결과보고서 모두
+  228K 1.39× · 912K 1.95× · 4.09M 1.39× (기존 2.62×/1.93× 혼재 제거)
+
 ### Fixed — 같은 tenant 동시 실행 DP 사전검사 원자성 (issue #59, Track C2)
 
 - **per-tenant 실행 락** — `AppState`에 tenant별 async Mutex를 두고 `POST /execute`의

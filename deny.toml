@@ -1,0 +1,72 @@
+# cargo-deny configuration — Xazz
+#
+# 목적: 의존성 라이선스 충돌·금지 크레이트·출처(registry/git)·보안 권고를
+# CI에서 기계적으로 검증한다. `cargo deny check` 로 실행.
+#   https://embarkstudios.github.io/cargo-deny/
+#
+# 프로젝트 라이선스는 Apache-2.0 (LICENSE). 아래 allow 목록은
+# Apache-2.0과 양립하는 permissive 라이선스만 포함한다.
+# weak-copyleft (MPL-2.0)는 전역 허용하지 않고 크레이트별 exceptions로만
+# 한정한다 — 나머지 트리 전체로 전파되지 않음을 명시적으로 보장.
+
+[graph]
+all-features = true
+
+[output]
+feature-depth = 1
+
+# ── 라이선스 ────────────────────────────────────────────────────────────────
+[licenses]
+# 허용: permissive/OSI-approved, 모두 Apache-2.0과 양립
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "Unlicense",
+    "CC0-1.0",
+    "BSL-1.0",
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.9
+
+# MPL-2.0은 파일 단위 weak-copyleft — 전역 허용 대신 특정 크레이트로만 한정.
+# (수정 없이 의존성으로만 사용, Apache-2.0 프로젝트와 양립)
+exceptions = [
+    { allow = ["MPL-2.0"], crate = "colored" },
+    { allow = ["MPL-2.0"], crate = "option-ext" },
+]
+
+# ── 금지/중복 크레이트 ──────────────────────────────────────────────────────
+[bans]
+multiple-versions = "warn"
+# 워크스페이스 내부 path 의존성은 경로로 고정되므로 wildcard 경고만 남긴다.
+wildcards = "warn"
+highlight = "all"
+allow-workspace = true
+# GPL/AGPL 등 copyleft는 [licenses].allow 에 없으므로 라이선스 검사 단계에서
+# 자동 차단된다. 금지 크레이트가 별도로 확인되면 여기에 추가한다.
+deny = []
+
+# ── 출처 ────────────────────────────────────────────────────────────────────
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
+
+# ── 보안 권고(RustSec) ──────────────────────────────────────────────────────
+[advisories]
+# 취약점은 기본 deny. 유지보수 중단(unmaintained)/unsound 범위는 all로 검사.
+yanked = "deny"
+unmaintained = "all"
+unsound = "all"
+ignore = [
+    # indicatif 0.17의 전이 의존. 취약점 아님(미유지보수)이며 CLI 진행률 표시에만
+    # 사용된다. indicatif 상위 버전으로 올릴 때 제거 예정.
+    { id = "RUSTSEC-2025-0119", reason = "number_prefix: unmaintained transitively via indicatif 0.17; no vulnerability, CLI progress only" },
+]

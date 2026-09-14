@@ -89,3 +89,19 @@ jobs:
         run: |
           npx playwright install --with-deps chromium
           npm run test:contrast
+
+  # ── 라이선스 · 의존성 정책 (deny.toml) ──────────────────────────────────────
+  licenses:
+    name: License & dependency policy
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: cargo-deny (licenses · bans · sources · advisories)
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+          arguments: --all-features
+          manifest-path: ./Cargo.toml

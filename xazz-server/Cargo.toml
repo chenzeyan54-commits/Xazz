@@ -2,6 +2,7 @@
 name = "xazz-server"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 
 [dependencies]
 # 정적 보안 가드레일 (Policy-as-Code) — Polars/Tokio 를 링크하지 않는 경량 크레이트

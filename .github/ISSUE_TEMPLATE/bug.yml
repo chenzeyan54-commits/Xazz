@@ -1,0 +1,76 @@
+name: Bug report
+description: Report a defect in the compiler, runtime, server, IDE, or tooling.
+title: "[bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a bug. Please fill in as much as you
+        can — a minimal reproduction speeds up the fix enormously.
+  - type: input
+    id: version
+    attributes:
+      label: Xazz version
+      description: Output of `xazz --version`.
+      placeholder: "xazz 0.3.1"
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - Linux
+        - macOS
+        - Windows
+        - Other
+    validations:
+      required: true
+  - type: dropdown
+    id: component
+    attributes:
+      label: Affected component
+      multiple: true
+      options:
+        - CLI (xazz)
+        - Compiler / type checker (xazz-compiler)
+        - Runtime / engine (xazz-exec)
+        - Runner (xazz-runner)
+        - Server / API (xazz-server)
+        - Visual IDE
+        - VS Code extension
+        - LSP (xazz-lsp)
+        - Policy guardrail
+        - Documentation
+    validations:
+      required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: Describe the actual behavior, including any error output.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect to happen?
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Minimal reproduction
+      description: A minimal `.xzz` source, command, or request that reproduces the issue.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Full output / logs
+      description: Paste the complete command output. This is auto-formatted.
+      render: shell
+    validations:
+      required: false
