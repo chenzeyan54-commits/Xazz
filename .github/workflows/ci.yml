@@ -51,9 +51,8 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: cargo clippy
-        # clippy를 실행하되, 기존 크레이트의 레거시 린트로 인해
-        # 빌드를 차단하지 않도록 경고는 허용한다 (실패는 컴파일 오류만).
-        run: cargo clippy --workspace --all-targets
+        # 워크스페이스가 clippy clean이므로 경고도 실패로 처리한다.
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: cargo test
         run: cargo test --workspace
