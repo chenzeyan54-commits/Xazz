@@ -235,11 +235,11 @@ pub fn edit_distance(a: &str, b: &str) -> usize {
     let b: Vec<char> = b.chars().collect();
     let (m, n) = (a.len(), b.len());
     let mut dp = vec![vec![0usize; n + 1]; m + 1];
-    for i in 0..=m {
-        dp[i][0] = i;
+    for (i, row) in dp.iter_mut().enumerate() {
+        row[0] = i;
     }
-    for j in 0..=n {
-        dp[0][j] = j;
+    for (j, cell) in dp[0].iter_mut().enumerate() {
+        *cell = j;
     }
     for i in 1..=m {
         for j in 1..=n {
@@ -288,7 +288,6 @@ pub type CompileResult<T> = Result<T, CompileError>;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::i18n::{is_korean, tr};
     use crate::token::Span;
 
     #[test]

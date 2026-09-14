@@ -406,7 +406,7 @@ impl Parser {
                 }
                 "mechanism" => {
                     let m = self.expect_ident_or_str()?;
-                    args.mechanism = DpMechanism::from_str(&m).ok_or_else(|| {
+                    args.mechanism = DpMechanism::parse(&m).ok_or_else(|| {
                         CompileError::new(
                             ErrorKind::UnexpectedToken(m.clone()),
                             self.current_span(),
@@ -958,7 +958,7 @@ impl Parser {
                             self.advance();
                             self.expect(&TokenKind::Colon)?;
                             let how_str = self.expect_string_lit()?;
-                            how = JoinHow::from_str(&how_str).ok_or_else(|| {
+                            how = JoinHow::parse(&how_str).ok_or_else(|| {
                                 CompileError::new(
                                     ErrorKind::ExpectedToken("inner|left|outer|cross".into()),
                                     self.current_span(),
@@ -1258,7 +1258,7 @@ impl Parser {
                     self.advance();
                     self.expect(&TokenKind::Colon)?;
                     let type_str = self.expect_ident_or_str()?;
-                    chart_type = Some(ChartType::from_str(&type_str).ok_or_else(|| {
+                    chart_type = Some(ChartType::parse(&type_str).ok_or_else(|| {
                         CompileError::new(
                             ErrorKind::Other(format!(
                                 "VIZ001: 알 수 없는 차트 타입 '{}'",

@@ -387,7 +387,7 @@ mod tests {
 
     #[test]
     fn step_preserves_domain_and_order() {
-        let steps = vec![
+        let steps = [
             Step::Data(DataOp::Select(vec!["a".into()])),
             Step::Side(SideOp::WithDp(DpArgs::default())),
             Step::Data(DataOp::Filter(TypedExpr::new(

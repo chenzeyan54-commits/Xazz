@@ -1,7 +1,7 @@
-/// Xazz - AST node definitions (v0.3)
-///
-/// Uses only plain Rust types, with no heavy dependencies such as Polars / Tokio.
-/// v0.3: Added Burn deep-learning model declaration (ModelDecl) and training (TrainStmt) AST
+//! Xazz - AST node definitions (v0.3)
+//!
+//! Uses only plain Rust types, with no heavy dependencies such as Polars / Tokio.
+//! v0.3: Added Burn deep-learning model declaration (ModelDecl) and training (TrainStmt) AST
 
 /// Expression node
 #[derive(Debug, Clone, PartialEq)]
@@ -59,23 +59,18 @@ pub enum FillNullValue {
 }
 
 /// join methods
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub enum JoinHow {
+    #[default]
     Inner,
     Left,
     Outer,
     Cross,
 }
 
-impl Default for JoinHow {
-    fn default() -> Self {
-        JoinHow::Inner
-    }
-}
-
 impl JoinHow {
     /// Parse from a lowercase string
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn parse(s: &str) -> Option<Self> {
         match s {
             "inner" => Some(JoinHow::Inner),
             "left" => Some(JoinHow::Left),
@@ -108,7 +103,7 @@ pub enum ChartType {
 
 impl ChartType {
     /// Parse from an identifier string
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn parse(s: &str) -> Option<Self> {
         match s {
             "bar" => Some(ChartType::Bar),
             "line" => Some(ChartType::Line),
@@ -262,7 +257,7 @@ pub enum DpMechanism {
 
 impl DpMechanism {
     /// Parse from an identifier/string
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn parse(s: &str) -> Option<Self> {
         match s {
             "laplace" => Some(DpMechanism::Laplace),
             "gaussian" => Some(DpMechanism::Gaussian),
@@ -451,22 +446,22 @@ mod tests {
 
     // ── JoinHow tests ────────────────────────────────────────────────────────
 
-    /// JoinHow::from_str — four valid strings
+    /// JoinHow::parse — four valid strings
     #[test]
-    fn test_join_how_from_str_valid() {
-        assert_eq!(JoinHow::from_str("inner"), Some(JoinHow::Inner));
-        assert_eq!(JoinHow::from_str("left"), Some(JoinHow::Left));
-        assert_eq!(JoinHow::from_str("outer"), Some(JoinHow::Outer));
-        assert_eq!(JoinHow::from_str("cross"), Some(JoinHow::Cross));
+    fn test_join_how_parse_valid() {
+        assert_eq!(JoinHow::parse("inner"), Some(JoinHow::Inner));
+        assert_eq!(JoinHow::parse("left"), Some(JoinHow::Left));
+        assert_eq!(JoinHow::parse("outer"), Some(JoinHow::Outer));
+        assert_eq!(JoinHow::parse("cross"), Some(JoinHow::Cross));
     }
 
-    /// JoinHow::from_str — invalid strings → None
+    /// JoinHow::parse — invalid strings → None
     #[test]
-    fn test_join_how_from_str_invalid() {
-        assert_eq!(JoinHow::from_str("hash"), None);
-        assert_eq!(JoinHow::from_str("INNER"), None); // case-sensitive
-        assert_eq!(JoinHow::from_str(""), None);
-        assert_eq!(JoinHow::from_str("full"), None);
+    fn test_join_how_parse_invalid() {
+        assert_eq!(JoinHow::parse("hash"), None);
+        assert_eq!(JoinHow::parse("INNER"), None); // case-sensitive
+        assert_eq!(JoinHow::parse(""), None);
+        assert_eq!(JoinHow::parse("full"), None);
     }
 
     /// JoinHow::default() → Inner
@@ -486,22 +481,22 @@ mod tests {
 
     // ── ChartType tests ──────────────────────────────────────────────────────
 
-    /// ChartType::from_str — four valid strings
+    /// ChartType::parse — four valid strings
     #[test]
-    fn test_chart_type_from_str_valid() {
-        assert_eq!(ChartType::from_str("bar"), Some(ChartType::Bar));
-        assert_eq!(ChartType::from_str("line"), Some(ChartType::Line));
-        assert_eq!(ChartType::from_str("pie"), Some(ChartType::Pie));
-        assert_eq!(ChartType::from_str("scatter"), Some(ChartType::Scatter));
+    fn test_chart_type_parse_valid() {
+        assert_eq!(ChartType::parse("bar"), Some(ChartType::Bar));
+        assert_eq!(ChartType::parse("line"), Some(ChartType::Line));
+        assert_eq!(ChartType::parse("pie"), Some(ChartType::Pie));
+        assert_eq!(ChartType::parse("scatter"), Some(ChartType::Scatter));
     }
 
-    /// ChartType::from_str — invalid strings → None
+    /// ChartType::parse — invalid strings → None
     #[test]
-    fn test_chart_type_from_str_invalid() {
-        assert_eq!(ChartType::from_str("heatmap"), None);
-        assert_eq!(ChartType::from_str("Bar"), None); // case-sensitive
-        assert_eq!(ChartType::from_str(""), None);
-        assert_eq!(ChartType::from_str("radar"), None);
+    fn test_chart_type_parse_invalid() {
+        assert_eq!(ChartType::parse("heatmap"), None);
+        assert_eq!(ChartType::parse("Bar"), None); // case-sensitive
+        assert_eq!(ChartType::parse(""), None);
+        assert_eq!(ChartType::parse("radar"), None);
     }
 
     /// ChartType::as_str — verify it returns a lowercase string
@@ -513,11 +508,11 @@ mod tests {
         assert_eq!(ChartType::Scatter.as_str(), "scatter");
     }
 
-    /// ChartType from_str / as_str round-trip verification
+    /// ChartType parse / as_str round-trip verification
     #[test]
     fn test_chart_type_roundtrip() {
         for s in &["bar", "line", "pie", "scatter"] {
-            let ct = ChartType::from_str(s).unwrap();
+            let ct = ChartType::parse(s).unwrap();
             assert_eq!(ct.as_str(), *s);
         }
     }
