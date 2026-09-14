@@ -69,7 +69,7 @@ datasets. This track makes Xazz handle real workloads.
 - [x] Module-level `type` declarations shared across files
 - [x] Cyclic-import detection (fail-closed)
 - Acceptance: a 2-file project where `main.xzz` imports a data-prep module and type-checks against it. ✅
-- Semantics: module = plain `.xzz`; imports resolve relative to importing file; checker runs on the merged AST so duplicate/missing-reference validation spans modules; policy gate scans module sources' literals too.
+- Semantics: module = plain `.xzz`; imports resolve relative to importing file; each module is inlined exactly once (repeated/diamond imports do not duplicate declarations); checker runs on the merged AST so duplicate/missing-reference validation spans modules; policy gate scans module sources' literals too.
 
 ### B2. Standard library (`xazz-stdlib`) — issue #56
 - [x] `xazz-stdlib/` with reusable `.xzz` modules (`common`, `math`, `models`),

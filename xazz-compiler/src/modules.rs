@@ -5,8 +5,10 @@
 //
 //   - Relative paths resolve against the importing file's directory.
 //   - Cycles are detected via the canonical-path import stack (fail-closed error).
-//   - Imported declarations are inlined in order, so the existing checker's
-//     duplicate-detection and reference resolution run unchanged on the merged AST.
+//   - Each module is inlined exactly once (import-once): repeated or diamond
+//     imports of the same module do not duplicate declarations, while the
+//     existing checker still validates user-written duplicates across the
+//     merged AST.
 //   - Module source texts are returned alongside the merged program so the
 //     policy guardrail can scan each imported file's literals too.
 //
@@ -157,6 +159,13 @@ impl ModuleLoader {
     }
 
     fn load_module(&mut self, canonical: &PathBuf, out: &mut Program) {
+        // Import-once: a module already inlined elsewhere in the merged AST is
+        // not inlined again. Cycles are still caught below via the import stack
+        // (a module is marked loaded only after its body is expanded).
+        if self.loaded.contains(canonical) {
+            return;
+        }
+
         // ── cycle detection ────────────────────────────────────────────────
         if self.stack.contains(canonical) {
             let mut chain: Vec<String> =
@@ -210,15 +219,14 @@ impl ModuleLoader {
             .parent()
             .map(Path::to_path_buf)
             .unwrap_or_else(|| PathBuf::from("."));
-        // Load each module exactly once (dedupe shared modules), but inline
-        // into this importer every time — duplicate names surface as checker
-        // errors, which is the intended fail-closed behavior.
+        // Import-once: expand nested imports, then mark this module loaded and
+        // inline its declarations. A later import of the same module returns
+        // early, so shared (diamond) modules are inlined exactly once.
         let nested = self.load_program(&parsed, &module_dir, false);
         self.stack.pop();
 
-        if self.loaded.insert(canonical.clone()) {
-            self.modules.push((canonical.clone(), text));
-        }
+        self.loaded.insert(canonical.clone());
+        self.modules.push((canonical.clone(), text));
         for stmt in nested.stmts {
             out.stmts.push(stmt);
         }
@@ -228,6 +236,12 @@ impl ModuleLoader {
     /// `std/<name>` key for cycle detection and dedup, mirroring `load_module`.
     fn load_embedded(&mut self, name: &str, text: &'static str, out: &mut Program) {
         let key = PathBuf::from(format!("std/{name}"));
+
+        // Import-once, mirroring `load_module`: a std module already inlined is
+        // skipped. Cycles are still caught via the stack below.
+        if self.loaded.contains(&key) {
+            return;
+        }
 
         if self.stack.contains(&key) {
             self.errors
@@ -259,9 +273,8 @@ impl ModuleLoader {
         let nested = self.load_program(&parsed, Path::new("."), true);
         self.stack.pop();
 
-        if self.loaded.insert(key.clone()) {
-            self.modules.push((key, text.to_string()));
-        }
+        self.loaded.insert(key.clone());
+        self.modules.push((key, text.to_string()));
         for stmt in nested.stmts {
             out.stmts.push(stmt);
         }
@@ -368,6 +381,72 @@ mod tests {
             !names.contains(&"WRONG"),
             "루트 b.xzz 를 잘못 선택하면 안 됨: {names:?}"
         );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A shared module imported via a diamond (b→d, c→d) is inlined exactly
+    /// once, so the merged program has no duplicate declarations and the
+    /// checker passes (import-once semantics).
+    #[test]
+    fn diamond_import_inlines_shared_module_once() {
+        let dir = temp_dir();
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("d.xzz"), "type D = { d: int };\n").unwrap();
+        fs::write(
+            dir.join("b.xzz"),
+            "import \"d.xzz\";\ntype B = { b: int };\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("c.xzz"),
+            "import \"d.xzz\";\ntype C = { c: int };\n",
+        )
+        .unwrap();
+
+        let main = parse("import \"b.xzz\";\nimport \"c.xzz\";");
+        let resolved = resolve_imports(&main, &dir).expect("diamond resolve");
+
+        let d_count = resolved
+            .program
+            .stmts
+            .iter()
+            .filter(|s| matches!(s, Stmt::TypeDecl { name, .. } if name == "D"))
+            .count();
+        assert_eq!(d_count, 1, "공유 모듈 D 는 정확히 1회만 인라인되어야 함");
+        assert_eq!(
+            resolved
+                .modules
+                .iter()
+                .filter(|(p, _)| p.ends_with("d.xzz"))
+                .count(),
+            1,
+            "공유 모듈 소스도 1회만 기록"
+        );
+        let (check, _ir) = crate::analyze_program(&resolved.program);
+        assert!(
+            check.errors.is_empty(),
+            "import-once 병합은 체커 오류가 없어야: {:?}",
+            check.errors
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Importing the same file twice inlines it once.
+    #[test]
+    fn repeated_import_is_deduplicated() {
+        let dir = temp_dir();
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("d.xzz"), "type D = { d: int };\n").unwrap();
+
+        let main = parse("import \"d.xzz\";\nimport \"d.xzz\";");
+        let resolved = resolve_imports(&main, &dir).expect("repeat resolve");
+        let d_count = resolved
+            .program
+            .stmts
+            .iter()
+            .filter(|s| matches!(s, Stmt::TypeDecl { name, .. } if name == "D"))
+            .count();
+        assert_eq!(d_count, 1, "동일 파일 반복 import 는 1회 인라인");
         fs::remove_dir_all(&dir).ok();
     }
 
@@ -480,6 +559,30 @@ mod tests {
             )),
             "std/math 의 model 이 인라인되어야 함"
         );
+    }
+
+    /// A std module imported twice (directly or via a sibling) is inlined once.
+    #[test]
+    fn embedded_repeated_import_is_deduplicated() {
+        let mut loader = ModuleLoader {
+            stack: Vec::new(),
+            loaded: HashSet::new(),
+            modules: Vec::new(),
+            errors: Vec::new(),
+        };
+        let mut out = Program::new();
+        loader.load_embedded("common", "import \"math\";\nimport \"math\";", &mut out);
+        assert!(
+            loader.errors.is_empty(),
+            "임베디드 반복 import 는 오류가 없어야: {:?}",
+            loader.errors
+        );
+        let count = out
+            .stmts
+            .iter()
+            .filter(|s| matches!(s, Stmt::ModelDecl { name, .. } if name == "SmallMLP"))
+            .count();
+        assert_eq!(count, 1, "std/math 는 정확히 1회만 인라인되어야 함");
     }
 
     /// A relative import inside an embedded module that is not a known std
