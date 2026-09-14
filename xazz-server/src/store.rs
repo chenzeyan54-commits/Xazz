@@ -47,6 +47,7 @@ fn ensure_schema(conn: &Connection) -> Result<(), String> {
             tenant TEXT PRIMARY KEY,
             spent_epsilon REAL NOT NULL DEFAULT 0,
             spent_delta REAL NOT NULL DEFAULT 0,
+            window_started_at INTEGER NOT NULL DEFAULT 0,
             updated_at INTEGER NOT NULL DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS tenant_policies (
@@ -59,6 +60,10 @@ fn ensure_schema(conn: &Connection) -> Result<(), String> {
     // Migration for DBs created before the tenant column (issue C2):
     // adding an already-present column is a no-op error we swallow.
     let _ = conn.execute_batch("ALTER TABLE runs ADD COLUMN tenant TEXT NOT NULL DEFAULT ''");
+    // Migration for DBs created before budget windows (issue C2):
+    let _ = conn.execute_batch(
+        "ALTER TABLE dp_budget ADD COLUMN window_started_at INTEGER NOT NULL DEFAULT 0",
+    );
     Ok(())
 }
 
@@ -193,9 +198,15 @@ impl Store {
     ///
     /// Unknown tenants report `(0.0, 0.0)` (no budget consumed yet). The ledger is
     /// keyed by tenant, so one tenant's spend never affects another's.
-    pub fn dp_spent(&self, tenant: &str) -> Result<(f64, f64), String> {
+    ///
+    /// When `window_secs > 0` the budget is a *sliding window*: once the window
+    /// anchored at `window_started_at` has elapsed, the spend is reset to zero
+    /// (the roll is persisted so later accruals start a fresh window).
+    /// `window_secs == 0` keeps the legacy cumulative behavior.
+    pub fn dp_spent(&self, tenant: &str, window_secs: u64) -> Result<(f64, f64), String> {
         let guard = self.open()?;
         let conn = guard.as_ref().expect("open guarantees Some");
+        roll_dp_window(conn, tenant, window_secs, now_epoch())?;
         conn.query_row(
             "SELECT spent_epsilon, spent_delta FROM dp_budget WHERE tenant = ?1",
             params![tenant],
@@ -206,12 +217,34 @@ impl Store {
         .map_err(|e| format!("failed to read dp budget: {e}"))
     }
 
+    /// Returns the tenant's current window anchor (Unix epoch seconds), if a row exists.
+    pub fn dp_window_started_at(&self, tenant: &str) -> Result<Option<i64>, String> {
+        let guard = self.open()?;
+        let conn = guard.as_ref().expect("open guarantees Some");
+        conn.query_row(
+            "SELECT window_started_at FROM dp_budget WHERE tenant = ?1",
+            params![tenant],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .map_err(|e| format!("failed to read dp window: {e}"))
+    }
+
     /// Adds a run's DP spend to the tenant's cumulative ledger — issue C2.
     ///
     /// The increment is a single atomic UPSERT, so two concurrent runs of the same
     /// tenant cannot lose a spend. Non-positive spends are a no-op. Non-finite
     /// values are rejected so a malformed marker cannot poison the ledger.
-    pub fn add_dp_spend(&self, tenant: &str, epsilon: f64, delta: f64) -> Result<(), String> {
+    ///
+    /// `window_secs` behaves exactly as in [`Store::dp_spent`]: an elapsed window is
+    /// rolled (zeroed) before the increment is applied.
+    pub fn add_dp_spend(
+        &self,
+        tenant: &str,
+        epsilon: f64,
+        delta: f64,
+        window_secs: u64,
+    ) -> Result<(), String> {
         if !epsilon.is_finite() || !delta.is_finite() {
             return Err("dp spend must be finite".to_string());
         }
@@ -222,16 +255,40 @@ impl Store {
         }
         let guard = self.open()?;
         let conn = guard.as_ref().expect("open guarantees Some");
+        let now = now_epoch();
+        roll_dp_window(conn, tenant, window_secs, now)?;
         conn.execute(
-            "INSERT INTO dp_budget (tenant, spent_epsilon, spent_delta, updated_at)
-             VALUES (?1, ?2, ?3, ?4)
+            "INSERT INTO dp_budget (tenant, spent_epsilon, spent_delta, window_started_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?4)
              ON CONFLICT(tenant) DO UPDATE SET
                  spent_epsilon = spent_epsilon + excluded.spent_epsilon,
                  spent_delta   = spent_delta   + excluded.spent_delta,
                  updated_at    = excluded.updated_at",
-            params![tenant, epsilon, delta, now_epoch()],
+            params![tenant, epsilon, delta, now],
         )
         .map_err(|e| format!("failed to update dp budget: {e}"))?;
+        Ok(())
+    }
+
+    /// Resets a tenant's accumulated DP spend to zero and restarts its window — issue C2.
+    ///
+    /// Tenant-scoped: other tenants' ledgers are untouched. A zeroed row is kept
+    /// (rather than deleted) and re-anchored to now so a fresh window starts immediately.
+    pub fn reset_dp_budget(&self, tenant: &str) -> Result<(), String> {
+        let guard = self.open()?;
+        let conn = guard.as_ref().expect("open guarantees Some");
+        let now = now_epoch();
+        conn.execute(
+            "INSERT INTO dp_budget (tenant, spent_epsilon, spent_delta, window_started_at, updated_at)
+             VALUES (?1, 0, 0, ?2, ?2)
+             ON CONFLICT(tenant) DO UPDATE SET
+                 spent_epsilon     = 0,
+                 spent_delta       = 0,
+                 window_started_at = ?2,
+                 updated_at        = ?2",
+            params![tenant, now],
+        )
+        .map_err(|e| format!("failed to reset dp budget: {e}"))?;
         Ok(())
     }
 
@@ -288,6 +345,33 @@ impl Default for Store {
     fn default() -> Self {
         Store::new()
     }
+}
+
+/// Rolls a tenant's budget window when it has elapsed (no-op when disabled).
+///
+/// A row with `window_started_at = 0` is treated as "window not yet anchored" and
+/// is re-anchored to `now`. The roll zeroes both ε and δ.
+fn roll_dp_window(
+    conn: &Connection,
+    tenant: &str,
+    window_secs: u64,
+    now: i64,
+) -> Result<(), String> {
+    if window_secs == 0 {
+        return Ok(());
+    }
+    conn.execute(
+        "UPDATE dp_budget
+         SET spent_epsilon = 0,
+             spent_delta = 0,
+             window_started_at = ?1,
+             updated_at = ?1
+         WHERE tenant = ?2
+           AND (window_started_at = 0 OR ?1 - window_started_at >= ?3)",
+        params![now, tenant, window_secs as i64],
+    )
+    .map_err(|e| format!("failed to roll dp window: {e}"))?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -386,21 +470,95 @@ mod tests {
         let store = Store::open_at(&db);
 
         // Unknown tenant starts at zero.
-        assert_eq!(store.dp_spent("a").expect("read"), (0.0, 0.0));
+        assert_eq!(store.dp_spent("a", 0).expect("read"), (0.0, 0.0));
 
-        store.add_dp_spend("a", 1.5, 0.0).expect("spend 1");
-        store.add_dp_spend("a", 0.5, 1e-5).expect("spend 2");
-        let (eps, delta) = store.dp_spent("a").expect("read");
+        store.add_dp_spend("a", 1.5, 0.0, 0).expect("spend 1");
+        store.add_dp_spend("a", 0.5, 1e-5, 0).expect("spend 2");
+        let (eps, delta) = store.dp_spent("a", 0).expect("read");
         assert!((eps - 2.0).abs() < 1e-12, "eps={eps}");
         assert!((delta - 1e-5).abs() < 1e-15, "delta={delta}");
 
         // Tenant isolation: b is untouched by a's spend.
-        assert_eq!(store.dp_spent("b").expect("read"), (0.0, 0.0));
+        assert_eq!(store.dp_spent("b", 0).expect("read"), (0.0, 0.0));
 
         // A zero-spend update is a no-op; non-finite values are rejected.
-        store.add_dp_spend("a", 0.0, 0.0).expect("no-op");
-        assert!((store.dp_spent("a").expect("read").0 - 2.0).abs() < 1e-12);
-        assert!(store.add_dp_spend("a", f64::NAN, 0.0).is_err());
+        store.add_dp_spend("a", 0.0, 0.0, 0).expect("no-op");
+        assert!((store.dp_spent("a", 0).expect("read").0 - 2.0).abs() < 1e-12);
+        assert!(store.add_dp_spend("a", f64::NAN, 0.0, 0).is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A tenant can reset its accumulated spend; the reset is tenant-scoped (issue C2).
+    #[test]
+    fn dp_budget_reset_is_tenant_scoped() {
+        let dir = std::env::temp_dir().join(format!(
+            "xazz_store_reset_{}_{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let db = dir.join("xazz.db");
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Store::open_at(&db);
+
+        store.add_dp_spend("a", 3.0, 1e-5, 0).expect("spend a");
+        store.add_dp_spend("b", 1.0, 0.0, 0).expect("spend b");
+
+        store.reset_dp_budget("a").expect("reset a");
+        assert_eq!(store.dp_spent("a", 0).expect("read a"), (0.0, 0.0));
+        // b is unaffected.
+        assert!((store.dp_spent("b", 0).expect("read b").0 - 1.0).abs() < 1e-12);
+
+        // Reset also re-anchors the window.
+        assert!(
+            store
+                .dp_window_started_at("a")
+                .expect("anchor")
+                .unwrap_or(0)
+                > 0
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An elapsed budget window rolls the spend to zero; window 0 keeps cumulative (issue C2).
+    #[test]
+    fn dp_budget_window_rolls_over_when_elapsed() {
+        let dir = std::env::temp_dir().join(format!(
+            "xazz_store_window_{}_{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let db = dir.join("xazz.db");
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Store::open_at(&db);
+
+        store.add_dp_spend("a", 2.0, 0.0, 3600).expect("spend");
+        assert!((store.dp_spent("a", 3600).expect("read").0 - 2.0).abs() < 1e-12);
+
+        // Age the window anchor by two hours so the one-hour window has elapsed.
+        {
+            let conn = Connection::open(&db).expect("open raw");
+            conn.execute(
+                "UPDATE dp_budget SET window_started_at = window_started_at - 7200 WHERE tenant = 'a'",
+                [],
+            )
+            .expect("age window");
+        }
+        assert_eq!(
+            store.dp_spent("a", 3600).expect("read after roll"),
+            (0.0, 0.0)
+        );
+
+        // Window disabled (0) is cumulative across calls.
+        store.add_dp_spend("a", 1.0, 0.0, 0).expect("spend again");
+        assert!((store.dp_spent("a", 0).expect("read cumulative").0 - 1.0).abs() < 1e-12);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

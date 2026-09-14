@@ -9,6 +9,17 @@ Versioning: [Semantic Versioning](https://semver.org/)
 
 ## [Unreleased]
 
+### Added — DP 예산 리셋 / 윈도우 API (issue #59, Track C2)
+
+- **`POST /dp/budget/reset`** — 인증된 tenant의 누적 ε/δ spend를 0으로 초기화하고 window를
+  재시작. tenant 스코프(self-service)로 다른 tenant 원장은 불변
+- **`XAZZ_TENANT_DP_WINDOW_SECS`** — 0(기본)은 기존 누적 한도, 양수면 슬라이딩 window.
+  window 경과 시 `dp_spent`/`add_dp_spend`가 원장을 0으로 롤하고 새 window를 anchor
+- **`GET /dp/budget`** — `window_secs` / `window_started_at` / `resets_at`(자동 리셋 시각) 추가
+- `dp_budget` 스키마에 `window_started_at` 컬럼(기존 DB 마이그레이션 포함)
+- 검증: 리셋 tenant 격리, window 롤오버, window 비활성 시 누적 유지, env 파싱.
+  xazz-server 49 tests pass
+
 ### Added — per-tenant 정책 팩 namespace 격리 (issue #59, Track C2)
 
 - **SQLite `tenant_policies` 테이블** — tenant별 정책 팩 JSON 저장. 쓰기 시

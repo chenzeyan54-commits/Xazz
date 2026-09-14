@@ -16,6 +16,8 @@
 //!   POST /security/remediate    { "code": "<xzz DSL>" }    → safe code auto-remediation (deterministic + sLM)
 //!   GET  /runs                                → run history (SQLite, issue C1)
 //!   GET  /runs/:id                            → a single run record
+//!   GET  /dp/budget                           → per-tenant DP spend/remaining + window
+//!   POST /dp/budget/reset                     → reset the tenant's DP spend/window (C2)
 //!
 //! Port: 8005 (frontend/.env: VITE_API_BASE_URL=http://127.0.0.1:8005)
 
@@ -90,6 +92,8 @@ fn record_run_in_store(
 const TENANT_DP_BUDGET_ENV: &str = "XAZZ_TENANT_DP_BUDGET";
 /// Per-tenant total δ envelope (overridable via env).
 const TENANT_DP_DELTA_BUDGET_ENV: &str = "XAZZ_TENANT_DP_DELTA_BUDGET";
+/// Per-tenant DP budget window length in seconds (0 = cumulative, no window).
+const TENANT_DP_WINDOW_ENV: &str = "XAZZ_TENANT_DP_WINDOW_SECS";
 const DEFAULT_TENANT_DP_BUDGET: f64 = 10.0;
 const DEFAULT_TENANT_DP_DELTA_BUDGET: f64 = 1e-4;
 
@@ -116,6 +120,17 @@ fn tenant_dp_envelope() -> (f64, f64) {
     let eps = std::env::var(TENANT_DP_BUDGET_ENV).ok();
     let delta = std::env::var(TENANT_DP_DELTA_BUDGET_ENV).ok();
     resolve_dp_envelope(eps.as_deref(), delta.as_deref())
+}
+
+/// Parses the DP budget window length. Invalid or `0` means "cumulative, no window".
+fn resolve_dp_window(raw: Option<&str>) -> u64 {
+    raw.and_then(|v| v.parse::<u64>().ok()).unwrap_or(0)
+}
+
+/// Reads the per-tenant DP budget window from the environment (0 = disabled).
+fn tenant_dp_window_secs() -> u64 {
+    let raw = std::env::var(TENANT_DP_WINDOW_ENV).ok();
+    resolve_dp_window(raw.as_deref())
 }
 
 /// Extracts the (ε, δ) a run consumed from its `[xazz:dp]` marker.
@@ -225,6 +240,7 @@ async fn main() {
         .route("/runs", get(handle_runs_list))
         .route("/runs/{id}", get(handle_run_by_id))
         .route("/dp/budget", get(handle_dp_budget))
+        .route("/dp/budget/reset", post(handle_dp_budget_reset))
         .route("/catalog", post(handle_catalog))
         .with_state(AppState {
             exec_permits: Arc::new(Semaphore::new(MAX_CONCURRENT_EXECUTIONS)),
@@ -497,9 +513,10 @@ async fn handle_execute(
     //     budget, so cross-run composition is enforced by the existing DP
     //     accounting (the runner refuses a `withDp` that would exceed it).
     let (total_eps, total_delta) = tenant_dp_envelope();
+    let window_secs = tenant_dp_window_secs();
     let (spent_eps, spent_delta) = state
         .store
-        .dp_spent(tenant_str(tenant.as_str()))
+        .dp_spent(tenant_str(tenant.as_str()), window_secs)
         .map_err(|e| internal_err(format!("DP 원장 조회 실패: {e}")))?;
     let remaining_eps = (total_eps - spent_eps).max(MIN_REMAINING_BUDGET);
     let remaining_delta = (total_delta - spent_delta).max(MIN_REMAINING_BUDGET);
@@ -530,9 +547,10 @@ async fn handle_execute(
     // 4b. Bill this run's DP consumption to the tenant's ledger (issue C2).
     //     Only the marker's cumulative spend is billed; no withDp → nothing billed.
     if let Some((eps, delta)) = dp_spend_from_marker(&dp)
-        && let Err(e) = state
-            .store
-            .add_dp_spend(tenant_str(tenant.as_str()), eps, delta)
+        && let Err(e) =
+            state
+                .store
+                .add_dp_spend(tenant_str(tenant.as_str()), eps, delta, window_secs)
     {
         eprintln!("[xazz] ⚠️ DP 원장 갱신 실패: {e}");
     }
@@ -1241,17 +1259,80 @@ async fn handle_run_by_id(
 // ── Per-tenant DP budget (issue C2) ──────────────────────────────────────────
 
 /// Reports the authenticated tenant's cumulative DP spend and remaining envelope.
+///
+/// When a budget window is configured (`XAZZ_TENANT_DP_WINDOW_SECS > 0`) the spend
+/// reflects the current window only, and `resets_at` gives the epoch second at which
+/// the next automatic roll happens (`0` when no window is configured).
 async fn handle_dp_budget(
     State(state): State<AppState>,
     Extension(tenant): Extension<String>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let tenant = tenant_str(tenant.as_str());
     let (total_eps, total_delta) = tenant_dp_envelope();
+    let window_secs = tenant_dp_window_secs();
     let (spent_eps, spent_delta) = state
         .store
-        .dp_spent(tenant)
+        .dp_spent(tenant, window_secs)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
-    Ok(Json(json!({
+    Ok(Json(dp_budget_view(
+        &state,
+        tenant,
+        total_eps,
+        total_delta,
+        window_secs,
+        spent_eps,
+        spent_delta,
+    )?))
+}
+
+/// Resets the authenticated tenant's accumulated DP spend and window — issue C2.
+///
+/// Tenant-scoped (self-service): only the caller's ledger is cleared. Other tenants'
+/// spends are untouched.
+async fn handle_dp_budget_reset(
+    State(state): State<AppState>,
+    Extension(tenant): Extension<String>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let tenant = tenant_str(tenant.as_str());
+    state
+        .store
+        .reset_dp_budget(tenant)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    let (total_eps, total_delta) = tenant_dp_envelope();
+    let window_secs = tenant_dp_window_secs();
+    Ok(Json(dp_budget_view(
+        &state,
+        tenant,
+        total_eps,
+        total_delta,
+        window_secs,
+        0.0,
+        0.0,
+    )?))
+}
+
+/// Builds the `GET /dp/budget` response body from the tenant's ledger state.
+fn dp_budget_view(
+    state: &AppState,
+    tenant: &str,
+    total_eps: f64,
+    total_delta: f64,
+    window_secs: u64,
+    spent_eps: f64,
+    spent_delta: f64,
+) -> Result<Value, (StatusCode, String)> {
+    let anchor = state
+        .store
+        .dp_window_started_at(tenant)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
+        .unwrap_or(0);
+    let resets_at = if window_secs > 0 && anchor > 0 {
+        anchor + window_secs as i64
+    } else {
+        0
+    };
+    Ok(json!({
         "tenant": tenant,
         "spent_epsilon": spent_eps,
         "spent_delta": spent_delta,
@@ -1259,7 +1340,10 @@ async fn handle_dp_budget(
         "total_delta": total_delta,
         "remaining_epsilon": (total_eps - spent_eps).max(0.0),
         "remaining_delta": (total_delta - spent_delta).max(0.0),
-    })))
+        "window_secs": window_secs,
+        "window_started_at": anchor,
+        "resets_at": resets_at,
+    }))
 }
 
 // ── Pipeline catalog / column lineage (issue C3) ─────────────────────────────
@@ -1652,6 +1736,15 @@ v x = load(\"examples/data/seoul_air_2024.csv\") :: AQ
     }
 
     #[test]
+    fn resolve_dp_window_parses_and_defaults_to_disabled() {
+        assert_eq!(resolve_dp_window(None), 0);
+        assert_eq!(resolve_dp_window(Some("3600")), 3600);
+        assert_eq!(resolve_dp_window(Some("0")), 0);
+        assert_eq!(resolve_dp_window(Some("abc")), 0);
+        assert_eq!(resolve_dp_window(Some("-5")), 0);
+    }
+
+    #[test]
     fn dp_marker_spend_is_extracted() {
         assert!(dp_spend_from_marker(&None::<Value>).is_none());
         assert!(dp_spend_from_marker(&Some(json!({}))).is_none());
@@ -1668,7 +1761,7 @@ v x = load(\"examples/data/seoul_air_2024.csv\") :: AQ
         let tenant = format!("dp-endpoint-{}", std::process::id());
         state
             .store
-            .add_dp_spend(&tenant, 1.0, 5e-5)
+            .add_dp_spend(&tenant, 1.0, 5e-5, 0)
             .expect("seed spend");
 
         let body = handle_dp_budget(State(state), Extension(tenant.clone()))
@@ -1679,6 +1772,9 @@ v x = load(\"examples/data/seoul_air_2024.csv\") :: AQ
         assert!((body["spent_epsilon"].as_f64().unwrap() - 1.0).abs() < 1e-12);
         assert!((body["spent_delta"].as_f64().unwrap() - 5e-5).abs() < 1e-15);
         assert!((body["remaining_epsilon"].as_f64().unwrap() - 9.0).abs() < 1e-12);
+        // No window configured in tests → cumulative, never auto-resets.
+        assert_eq!(body["window_secs"], json!(0));
+        assert_eq!(body["resets_at"], json!(0));
 
         // Another tenant is unaffected by this tenant's spend.
         let other = handle_dp_budget(State(test_state()), Extension("dp-endpoint-other".into()))
@@ -1687,6 +1783,40 @@ v x = load(\"examples/data/seoul_air_2024.csv\") :: AQ
             .0;
         assert_eq!(other["spent_epsilon"], json!(0.0));
         assert_eq!(other["remaining_epsilon"], json!(10.0));
+    }
+
+    /// POST /dp/budget/reset clears only the authenticated tenant's ledger.
+    #[tokio::test]
+    async fn dp_budget_reset_is_tenant_scoped() {
+        let state = test_state();
+        let tenant = format!("dp-reset-{}", std::process::id());
+        let other = format!("dp-reset-other-{}", std::process::id());
+        state
+            .store
+            .add_dp_spend(&tenant, 2.0, 1e-5, 0)
+            .expect("seed tenant");
+        state
+            .store
+            .add_dp_spend(&other, 1.0, 0.0, 0)
+            .expect("seed other");
+
+        let body = handle_dp_budget_reset(State(state.clone()), Extension(tenant.clone()))
+            .await
+            .expect("reset endpoint")
+            .0;
+        assert_eq!(body["tenant"], json!(tenant));
+        assert_eq!(body["spent_epsilon"], json!(0.0));
+        assert_eq!(body["spent_delta"], json!(0.0));
+        assert!((body["remaining_epsilon"].as_f64().unwrap() - 10.0).abs() < 1e-12);
+        // The reset re-anchors the window.
+        assert!(body["window_started_at"].as_i64().unwrap() > 0);
+
+        // The other tenant keeps its spend.
+        let other_body = handle_dp_budget(State(state), Extension(other))
+            .await
+            .expect("budget endpoint")
+            .0;
+        assert!((other_body["spent_epsilon"].as_f64().unwrap() - 1.0).abs() < 1e-12);
     }
 
     // ── Per-tenant policy packs (issue C2) ────────────────────────────────────

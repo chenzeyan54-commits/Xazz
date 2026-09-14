@@ -118,6 +118,9 @@ datasets. This track makes Xazz handle real workloads.
       (`dp_budget` table); each run receives the tenant's *remaining* budget via
       `XAZZ_DP_BUDGET`/`XAZZ_DP_DELTA_BUDGET`, and `GET /dp/budget` reports spent/remaining.
       One tenant's spend never affects another's.
+- [x] DP budget reset / window API — `POST /dp/budget/reset` zeroes a tenant's spend and
+      re-anchors its window (self-service, tenant-scoped); `XAZZ_TENANT_DP_WINDOW_SECS`
+      enables an automatic sliding window (`GET /dp/budget` reports `window_secs`/`resets_at`).
 - Depends on: C1. Acceptance: two tenants cannot see each other's runs.
   ✅ **Run isolation done 2026-09-09**: verified end-to-end — tenant-a and tenant-b each see only
   their own runs; cross-tenant GET /runs/:id → 404.
@@ -125,6 +128,8 @@ datasets. This track makes Xazz handle real workloads.
   run's `[xazz:dp]` spend per tenant; remaining budget is injected per run.
   ✅ **Policy pack isolation done 2026-09-14** (issue #59/C2): `tenant_policies` stores each
   tenant's pack by namespace; policy endpoints and `/execute` resolve it first (global/builtin fallback).
+  ✅ **DP reset/window done 2026-09-14** (issue #59/C2): `POST /dp/budget/reset` + optional
+  `XAZZ_TENANT_DP_WINDOW_SECS` sliding window (rolls the ledger when elapsed).
 
 ### C3. Pipeline catalog + lineage — issue #60
 - [x] Column-level lineage derived from the IR's flowing `Schema` — `xazz-compiler::catalog`
