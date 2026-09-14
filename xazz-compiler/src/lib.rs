@@ -1,3 +1,8 @@
+// `CompileError` is intentionally kept unboxed (see xazz-core/src/error.rs):
+// it is matched by value across the compiler/CLI/LSP, so boxing every `Err`
+// variant would churn all call sites for no runtime benefit.
+#![allow(clippy::result_large_err)]
+
 /// Xazz Compiler Library
 ///
 /// Included modules:

@@ -213,7 +213,7 @@ fn expr_columns(e: &TypedExpr, out: &mut HashSet<String>) {
     }
 }
 
-fn pushdown_filters(steps: &mut Vec<Step>) {
+fn pushdown_filters(steps: &mut [Step]) {
     let mut i = 1;
     while i < steps.len() {
         let can_move = match &steps[i - 1] {

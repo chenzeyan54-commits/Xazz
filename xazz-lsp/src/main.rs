@@ -1,3 +1,6 @@
+// `CompileError` is intentionally kept unboxed (see xazz-core/src/error.rs).
+#![allow(clippy::result_large_err)]
+
 // xazz-lsp/src/main.rs — Xazz Language Server (issue B3)
 //
 // Reuses the xazz-compiler checker to surface the **exact same** line:col
@@ -168,7 +171,7 @@ impl LanguageServer for Backend {
         // before the await below.
         let source = {
             let mut docs = self.docs.lock().unwrap();
-            let current = docs.entry(uri.clone()).or_insert_with(String::new);
+            let current = docs.entry(uri.clone()).or_default();
             let changes = params.content_changes;
             // With incremental sync, each change is a range replacement. In practice
             // editors may send full text; handle both.

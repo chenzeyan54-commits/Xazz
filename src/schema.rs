@@ -71,7 +71,7 @@ fn filename_to_type_name(path: &str) -> std::string::String {
         .and_then(|s| s.to_str())
         .unwrap_or("Unknown");
 
-    stem.split(|c: char| c == '_' || c == '-')
+    stem.split(['_', '-'])
         .filter(|s| !s.is_empty())
         .map(|seg| {
             let mut chars = seg.chars();
@@ -237,9 +237,9 @@ fn find_project_root(csv_path: &str) -> Option<std::path::PathBuf> {
         if dir.join("xazz.toml").exists() {
             return Some(dir.to_path_buf());
         }
-        match dir.parent() {
-            Some(parent) => dir = parent,
-            None => return None,
+        {
+            let parent = dir.parent()?;
+            dir = parent
         }
     }
 }

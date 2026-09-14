@@ -378,12 +378,12 @@ fn resolve_web_dir() -> Option<PathBuf> {
     }
 
     let mut candidates: Vec<PathBuf> = Vec::new();
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(parent) = exe.parent() {
-            candidates.push(parent.join("web"));
-            if let Some(grand) = parent.parent() {
-                candidates.push(grand.join("web"));
-            }
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(parent) = exe.parent()
+    {
+        candidates.push(parent.join("web"));
+        if let Some(grand) = parent.parent() {
+            candidates.push(grand.join("web"));
         }
     }
     candidates.push(PathBuf::from("web"));
@@ -482,7 +482,7 @@ async fn handle_execute(
     }
 
     // 2. Locate the xazz.exe executable path
-    let exe_path = find_xazz_exe().map_err(|e| internal_err(e))?;
+    let exe_path = find_xazz_exe().map_err(internal_err)?;
 
     // 2b. Per-tenant DP budget isolation (issue C2): a tenant may only consume up
     //     to its own cumulative envelope. The runner receives the *remaining*
@@ -521,13 +521,12 @@ async fn handle_execute(
 
     // 4b. Bill this run's DP consumption to the tenant's ledger (issue C2).
     //     Only the marker's cumulative spend is billed; no withDp → nothing billed.
-    if let Some((eps, delta)) = dp_spend_from_marker(&dp) {
-        if let Err(e) = state
+    if let Some((eps, delta)) = dp_spend_from_marker(&dp)
+        && let Err(e) = state
             .store
             .add_dp_spend(tenant_str(tenant.as_str()), eps, delta)
-        {
-            eprintln!("[xazz] ⚠️ DP 원장 갱신 실패: {e}");
-        }
+    {
+        eprintln!("[xazz] ⚠️ DP 원장 갱신 실패: {e}");
     }
 
     // 5. Auto-audit the execution history (trust infrastructure — persist all operation history)
@@ -615,21 +614,21 @@ fn parse_stdout_markers(
     let mut i = 0;
     while i < lines.len() {
         let trimmed = lines[i].trim();
-        if let Some(json_part) = trimmed.strip_prefix("[xazz:result] ") {
-            if let Ok(parsed) = serde_json::from_str::<Value>(json_part) {
-                if let Some(r) = parsed.get("rows") {
-                    rows = r.clone();
-                }
-                if let Some(s) = parsed.get("schema") {
-                    schema = s.clone();
-                }
+        if let Some(json_part) = trimmed.strip_prefix("[xazz:result] ")
+            && let Ok(parsed) = serde_json::from_str::<Value>(json_part)
+        {
+            if let Some(r) = parsed.get("rows") {
+                rows = r.clone();
+            }
+            if let Some(s) = parsed.get("schema") {
+                schema = s.clone();
             }
         }
         // Burn deep-learning training result marker (JSON on the same line)
-        if let Some(json_part) = trimmed.strip_prefix("[xazz:train] ") {
-            if let Ok(parsed) = serde_json::from_str::<Value>(json_part) {
-                training = Some(parsed);
-            }
+        if let Some(json_part) = trimmed.strip_prefix("[xazz:train] ")
+            && let Ok(parsed) = serde_json::from_str::<Value>(json_part)
+        {
+            training = Some(parsed);
         }
         // Differential-privacy audit marker — single-line self-contained:
         //   [xazz:dp] <JSON>            (new form — safe even if broken by newlines/emojis)
@@ -648,16 +647,16 @@ fn parse_stdout_markers(
         // Policy-as-Code guardrail marker — policy report emitted by the execution engine.
         // The server already ran the same check upstream, but logs the marker as-is so
         // the execution engine's verdict can be trusted.
-        if let Some(json_part) = trimmed.strip_prefix("[xazz:policy] ") {
-            if serde_json::from_str::<Value>(json_part).is_err() {
-                eprintln!("[xazz] ⚠️ [xazz:policy] 마커 파싱 실패");
-            }
+        if let Some(json_part) = trimmed.strip_prefix("[xazz:policy] ")
+            && serde_json::from_str::<Value>(json_part).is_err()
+        {
+            eprintln!("[xazz] ⚠️ [xazz:policy] 마커 파싱 실패");
         }
         // Static semantic analysis (Type Checker) diagnostics marker
-        if let Some(json_part) = trimmed.strip_prefix("[xazz:diagnostics] ") {
-            if let Ok(parsed) = serde_json::from_str::<Value>(json_part) {
-                diagnostics = Some(parsed);
-            }
+        if let Some(json_part) = trimmed.strip_prefix("[xazz:diagnostics] ")
+            && let Ok(parsed) = serde_json::from_str::<Value>(json_part)
+        {
+            diagnostics = Some(parsed);
         }
         i += 1;
     }
@@ -1224,10 +1223,10 @@ async fn handle_catalog(
 
 fn find_xazz_exe() -> Result<PathBuf, String> {
     // 1. Pin the path via env var (deployment hardening)
-    if let Ok(pinned) = std::env::var("XAZZ_EXEC_PATH") {
-        if !pinned.trim().is_empty() {
-            return Ok(PathBuf::from(pinned));
-        }
+    if let Ok(pinned) = std::env::var("XAZZ_EXEC_PATH")
+        && !pinned.trim().is_empty()
+    {
+        return Ok(PathBuf::from(pinned));
     }
 
     // platform-specific executable name

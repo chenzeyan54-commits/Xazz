@@ -1,3 +1,6 @@
+// `CompileError` is intentionally kept unboxed (see xazz-core/src/error.rs).
+#![allow(clippy::result_large_err)]
+
 mod cli;
 mod policy_cli;
 mod project;
@@ -69,10 +72,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if verbose {
                 cmd.arg("--verbose");
             }
-            if let Some(ref out) = output {
-                if let Some(out_str) = out.to_str() {
-                    cmd.arg("--output").arg(out_str);
-                }
+            if let Some(ref out) = output
+                && let Some(out_str) = out.to_str()
+            {
+                cmd.arg("--output").arg(out_str);
             }
             if opt {
                 cmd.arg("--opt");
@@ -99,20 +102,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 for line in stdout.lines() {
                     let trimmed = line.trim();
-                    if let Some(json_part) = trimmed.strip_prefix("[xazz:result] ") {
-                        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(json_part) {
-                            if let Some(r) = parsed.get("rows") {
-                                rows = r.clone();
-                            }
-                            if let Some(s) = parsed.get("schema") {
-                                schema = s.clone();
-                            }
+                    if let Some(json_part) = trimmed.strip_prefix("[xazz:result] ")
+                        && let Ok(parsed) = serde_json::from_str::<serde_json::Value>(json_part)
+                    {
+                        if let Some(r) = parsed.get("rows") {
+                            rows = r.clone();
+                        }
+                        if let Some(s) = parsed.get("schema") {
+                            schema = s.clone();
                         }
                     }
-                    if let Some(json_part) = trimmed.strip_prefix("[xazz:diagnostics] ") {
-                        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(json_part) {
-                            diagnostics = Some(parsed);
-                        }
+                    if let Some(json_part) = trimmed.strip_prefix("[xazz:diagnostics] ")
+                        && let Ok(parsed) = serde_json::from_str::<serde_json::Value>(json_part)
+                    {
+                        diagnostics = Some(parsed);
                     }
                 }
 
@@ -446,23 +449,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 // No PATH fallback (prevents arbitrary code execution via PATH shadowing, fail-closed)
 pub(crate) fn find_runner() -> Result<std::path::PathBuf, String> {
     // 1. Pin the path via environment variable (deployment hardening)
-    if let Ok(pinned) = std::env::var("XAZZ_RUNNER_PATH") {
-        if !pinned.trim().is_empty() {
-            return Ok(std::path::PathBuf::from(pinned));
-        }
+    if let Ok(pinned) = std::env::var("XAZZ_RUNNER_PATH")
+        && !pinned.trim().is_empty()
+    {
+        return Ok(std::path::PathBuf::from(pinned));
     }
 
     // 2. Search next to the current executable
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            #[cfg(windows)]
-            let candidate = dir.join("xazz-runner.exe");
-            #[cfg(not(windows))]
-            let candidate = dir.join("xazz-runner");
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent()
+    {
+        #[cfg(windows)]
+        let candidate = dir.join("xazz-runner.exe");
+        #[cfg(not(windows))]
+        let candidate = dir.join("xazz-runner");
 
-            if candidate.exists() {
-                return Ok(candidate);
-            }
+        if candidate.exists() {
+            return Ok(candidate);
         }
     }
 

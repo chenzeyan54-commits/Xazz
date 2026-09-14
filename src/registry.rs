@@ -146,13 +146,12 @@ pub fn install(name: &str, out: Option<&Path>, force: bool) -> i32 {
         );
         return 1;
     }
-    if let Some(parent) = dest.parent() {
-        if !parent.as_os_str().is_empty() {
-            if let Err(e) = std::fs::create_dir_all(parent) {
-                eprintln!("[xazz] registry: cannot create '{}': {e}", parent.display());
-                return 1;
-            }
-        }
+    if let Some(parent) = dest.parent()
+        && !parent.as_os_str().is_empty()
+        && let Err(e) = std::fs::create_dir_all(parent)
+    {
+        eprintln!("[xazz] registry: cannot create '{}': {e}", parent.display());
+        return 1;
     }
     if let Err(e) = std::fs::write(&dest, entry.source) {
         eprintln!("[xazz] registry: cannot write '{}': {e}", dest.display());

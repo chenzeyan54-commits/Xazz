@@ -211,24 +211,22 @@ fn resolve_exec_binary() -> Result<PathBuf, String> {
     let exec_name = "xazz-exec";
 
     // 1. Pin the path via env var (deployment hardening)
-    if let Ok(pinned) = std::env::var("XAZZ_EXEC_PATH") {
-        if !pinned.trim().is_empty() {
-            return Ok(PathBuf::from(pinned));
-        }
+    if let Ok(pinned) = std::env::var("XAZZ_EXEC_PATH")
+        && !pinned.trim().is_empty()
+    {
+        return Ok(PathBuf::from(pinned));
     }
 
     // 2. Look next to the current executable
-    if let Ok(current_exe) = std::env::current_exe() {
-        if let Some(dir) = current_exe.parent() {
-            let candidate = dir.join(exec_name);
-            if candidate.exists() {
-                return Ok(candidate);
-            }
+    if let Ok(current_exe) = std::env::current_exe()
+        && let Some(dir) = current_exe.parent()
+    {
+        let candidate = dir.join(exec_name);
+        if candidate.exists() {
+            return Ok(candidate);
         }
     }
 
-    Err(format!(
-        "xazz-exec 실행 엔진을 찾을 수 없습니다 (PATH 폴백은 보안상 비활성화됨). \
-         XAZZ_EXEC_PATH 로 절대 경로를 지정하거나 xazz-exec 를 xazz-runner 와 같은 디렉터리에 배치하세요."
-    ))
+    Err("xazz-exec 실행 엔진을 찾을 수 없습니다 (PATH 폴백은 보안상 비활성화됨). \
+         XAZZ_EXEC_PATH 로 절대 경로를 지정하거나 xazz-exec 를 xazz-runner 와 같은 디렉터리에 배치하세요.".to_string())
 }

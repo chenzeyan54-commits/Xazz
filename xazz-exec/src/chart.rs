@@ -160,13 +160,7 @@ pub fn write_chart_html(
     let title_json = js(title);
     let title_html = html_esc(title);
 
-    let chartjs_type = match chart_type_str.as_str() {
-        "bar" => "bar",
-        "line" => "line",
-        "pie" => "pie",
-        "scatter" => "scatter",
-        other => other,
-    };
+    let chartjs_type = chart_type_str.as_str();
     let chartjs_type_json = js(chartjs_type);
 
     let dataset_js = match chart_type_str.as_str() {
@@ -358,7 +352,6 @@ pub fn write_chart_html(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use xazz_compiler::ast::{ChartConfig, ChartType};
 
     fn spec_with_cell(cell: &str) -> ChartSpec {
         let data = serde_json::json!([{"label": cell, "value": 1}]);

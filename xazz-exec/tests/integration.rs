@@ -171,7 +171,7 @@ fn save_arrow_then_load_back() {
 
 #[test]
 fn infer_columnar_schema_generates_type_block() {
-    use polars::prelude::{ParquetWriter, SerWriter, df};
+    use polars::prelude::{ParquetWriter, df};
     use xazz_exec::schema_infer::infer_columnar_schema;
 
     let dir = temp_dir();

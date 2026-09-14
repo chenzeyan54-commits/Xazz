@@ -771,21 +771,21 @@ impl Analyzer {
         false
     }
 
-    fn check_groupby_op(&mut self, group_col: &String, st: &mut PipelineCheckState) -> bool {
+    fn check_groupby_op(&mut self, group_col: &str, st: &mut PipelineCheckState) -> bool {
         self.check_column(group_col, "groupBy", &st.cols);
-        st.pending_group = Some(group_col.clone());
+        st.pending_group = Some(group_col.to_owned());
         st.steps
-            .push(ir::Step::Data(ir::DataOp::GroupBy(group_col.clone())));
+            .push(ir::Step::Data(ir::DataOp::GroupBy(group_col.to_owned())));
         false
     }
 
     // count(col) counts rows and is unrelated to column type — only check existence
-    fn check_count_op(&mut self, c: &String, st: &mut PipelineCheckState) -> bool {
+    fn check_count_op(&mut self, c: &str, st: &mut PipelineCheckState) -> bool {
         self.check_column(c, "count", &st.cols);
         st.pending_group = None;
         st.steps.push(ir::Step::Data(ir::DataOp::Aggregate {
             kind: ir::AggKind::Count,
-            col: c.clone(),
+            col: c.to_owned(),
         }));
         false
     }
@@ -808,10 +808,10 @@ impl Analyzer {
         false
     }
 
-    fn check_orderby_op(&mut self, col: &String, desc: bool, st: &mut PipelineCheckState) -> bool {
+    fn check_orderby_op(&mut self, col: &str, desc: bool, st: &mut PipelineCheckState) -> bool {
         self.check_column(col, "orderBy", &st.cols);
         st.steps.push(ir::Step::Data(ir::DataOp::Sort {
-            col: col.clone(),
+            col: col.to_owned(),
             desc,
         }));
         false
@@ -828,10 +828,10 @@ impl Analyzer {
         false
     }
 
-    fn check_dropnull_op(&mut self, drop_col: &String, st: &mut PipelineCheckState) -> bool {
+    fn check_dropnull_op(&mut self, drop_col: &str, st: &mut PipelineCheckState) -> bool {
         self.check_column(drop_col, "dropNull", &st.cols);
         st.steps
-            .push(ir::Step::Data(ir::DataOp::DropNull(drop_col.clone())));
+            .push(ir::Step::Data(ir::DataOp::DropNull(drop_col.to_owned())));
         false
     }
 
@@ -842,9 +842,11 @@ impl Analyzer {
         st: &mut PipelineCheckState,
     ) -> bool {
         self.check_column(col, "fillNull", &st.cols);
-        if let Some(t) = st.cols.get(col) {
-            if !t.option && t.name != "unknown" {
-                self.error(
+        if let Some(t) = st.cols.get(col)
+            && !t.option
+            && t.name != "unknown"
+        {
+            self.error(
                     ErrorKind::Other("fillNull on non-nullable column".to_string()),
                     Some(col),
                     if is_korean() {
@@ -859,7 +861,6 @@ impl Analyzer {
                         )
                     },
                 );
-            }
         }
         self.check_fill_value(col, value, &st.cols);
         st.steps.push(ir::Step::Data(ir::DataOp::FillNull {
@@ -917,7 +918,7 @@ impl Analyzer {
 
     fn check_withcolumn_op(
         &mut self,
-        name: &String,
+        name: &str,
         expr: &Expr,
         st: &mut PipelineCheckState,
     ) -> bool {
@@ -925,9 +926,9 @@ impl Analyzer {
         self.check_division_by_zero(expr);
         let typed = type_expr(expr, &st.cols);
         st.cols
-            .insert(name.clone(), ir_col_type_to_checker(&typed.ty));
+            .insert(name.to_owned(), ir_col_type_to_checker(&typed.ty));
         st.steps.push(ir::Step::Data(ir::DataOp::WithColumn {
-            name: name.clone(),
+            name: name.to_owned(),
             expr: typed,
         }));
         false
@@ -940,13 +941,8 @@ impl Analyzer {
         false
     }
 
-    fn check_cast_op(
-        &mut self,
-        col: &String,
-        to_type: &String,
-        st: &mut PipelineCheckState,
-    ) -> bool {
-        if !matches!(to_type.as_str(), "float" | "int" | "str" | "bool") {
+    fn check_cast_op(&mut self, col: &str, to_type: &str, st: &mut PipelineCheckState) -> bool {
+        if !matches!(to_type, "float" | "int" | "str" | "bool") {
             self.error(
                 ErrorKind::Other("알 수 없는 cast 타입".to_string()),
                 Some(to_type),
@@ -967,44 +963,44 @@ impl Analyzer {
         if let Some(t) = st.cols.get(col).cloned() {
             let nt = normalize_type(to_type);
             st.cols
-                .insert(col.clone(), CheckerColType::new(nt, t.option));
+                .insert(col.to_owned(), CheckerColType::new(nt, t.option));
         }
         st.steps.push(ir::Step::Data(ir::DataOp::Cast {
-            col: col.clone(),
-            to: to_type.clone(),
+            col: col.to_owned(),
+            to: to_type.to_owned(),
         }));
         false
     }
 
     fn check_rename_op(
         &mut self,
-        old_name: &String,
-        new_name: &String,
+        old_name: &str,
+        new_name: &str,
         st: &mut PipelineCheckState,
     ) -> bool {
         self.check_column(old_name, "rename", &st.cols);
         if let Some(t) = st.cols.remove(old_name) {
-            st.cols.insert(new_name.clone(), t);
+            st.cols.insert(new_name.to_owned(), t);
         }
         st.steps.push(ir::Step::Data(ir::DataOp::Rename {
-            old: old_name.clone(),
-            new: new_name.clone(),
+            old: old_name.to_owned(),
+            new: new_name.to_owned(),
         }));
         false
     }
 
     fn check_replace_op(
         &mut self,
-        col: &String,
-        from: &String,
-        to: &String,
+        col: &str,
+        from: &str,
+        to: &str,
         st: &mut PipelineCheckState,
     ) -> bool {
         self.check_column(col, "replace", &st.cols);
         st.steps.push(ir::Step::Data(ir::DataOp::Replace {
-            col: col.clone(),
-            from: from.clone(),
-            to: to.clone(),
+            col: col.to_owned(),
+            from: from.to_owned(),
+            to: to.to_owned(),
         }));
         false
     }
@@ -1012,7 +1008,7 @@ impl Analyzer {
     // ── v0.6 withDp — argument ranges validated by the parser, numeric column existence by runtime ──
     fn check_withdp_op(&mut self, args: &DpArgs, st: &mut PipelineCheckState) -> bool {
         // after noise injection, numeric columns are promoted to float
-        for (_, t) in st.cols.iter_mut() {
+        for t in st.cols.values_mut() {
             if t.is_numeric() {
                 *t = CheckerColType::new("float", t.option);
             }
@@ -1040,12 +1036,12 @@ impl Analyzer {
     // materializes the current DataFrame to a file. Schema flows unchanged.
     fn check_save_op(
         &mut self,
-        path: &String,
+        path: &str,
         format: &crate::ast::SaveFormat,
         st: &mut PipelineCheckState,
     ) -> bool {
         st.steps.push(ir::Step::Side(ir::SideOp::Save {
-            path: path.clone(),
+            path: path.to_owned(),
             format: *format,
         }));
         false
@@ -1148,29 +1144,26 @@ impl Analyzer {
     /// (Data-dependent "0 exists in column" can only be determined at runtime, so
     ///  only literal-0 denominators determinable at compile time are handled here.)
     fn check_division_by_zero(&mut self, expr: &Expr) {
-        match expr {
-            Expr::BinOp { lhs, op, rhs } => {
-                if *op == BinOpKind::Div && is_zero_literal(rhs.as_ref()) {
-                    let message = if is_korean() {
-                        "리터럴 0 으로 나누기 감지 (컴파일 타임) — DivisionByZero. 분모가 데이터에 따라 0 이 될 수 있는 경우 filter/치환으로 처리하세요."
-                    } else {
-                        "Division by a literal zero detected (compile-time) — DivisionByZero. If the denominator can become 0 in data, handle it with a filter or replacement."
-                    };
-                    let span = self.resolve_span(None);
-                    self.warnings.push(CompileError::new(
-                        ErrorKind::DivisionByZero {
-                            col: "(literal)".to_string(),
-                            row_count: 0,
-                            expr_context: format_expr_display(expr),
-                        },
-                        span,
-                        message,
-                    ));
-                }
-                self.check_division_by_zero(lhs);
-                self.check_division_by_zero(rhs);
+        if let Expr::BinOp { lhs, op, rhs } = expr {
+            if *op == BinOpKind::Div && is_zero_literal(rhs.as_ref()) {
+                let message = if is_korean() {
+                    "리터럴 0 으로 나누기 감지 (컴파일 타임) — DivisionByZero. 분모가 데이터에 따라 0 이 될 수 있는 경우 filter/치환으로 처리하세요."
+                } else {
+                    "Division by a literal zero detected (compile-time) — DivisionByZero. If the denominator can become 0 in data, handle it with a filter or replacement."
+                };
+                let span = self.resolve_span(None);
+                self.warnings.push(CompileError::new(
+                    ErrorKind::DivisionByZero {
+                        col: "(literal)".to_string(),
+                        row_count: 0,
+                        expr_context: format_expr_display(expr),
+                    },
+                    span,
+                    message,
+                ));
             }
-            _ => {}
+            self.check_division_by_zero(lhs);
+            self.check_division_by_zero(rhs);
         }
     }
 
@@ -1178,10 +1171,6 @@ impl Analyzer {
         if !cols.contains_key(col) {
             self.column_missing_with_available(col, ctx, cols);
         }
-    }
-
-    fn column_missing(&mut self, col: &str, ctx: &str) {
-        self.column_missing_with_available(col, ctx, &HashMap::new())
     }
 
     /// Emits an error with a did-you-mean hint when a column existence check fails.

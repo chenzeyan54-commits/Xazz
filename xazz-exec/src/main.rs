@@ -190,8 +190,7 @@ v filled = raw
     }
     let _guard = TempFileGuard(tmp_xzz_path.clone());
 
-    let result =
-        xazz_exec::run_pipeline(&tmp_xzz_path.to_str().unwrap_or(""), verbose, None, false);
+    let result = xazz_exec::run_pipeline(tmp_xzz_path.to_str().unwrap_or(""), verbose, None, false);
     // The guard drops and removes the temp file here.
 
     if let Err(e) = result {

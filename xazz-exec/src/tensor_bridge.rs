@@ -84,15 +84,16 @@ pub fn series_to_f32(col: &Column) -> Vec<f32> {
 // feature/target extraction (training path)
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Extracted feature/target payload: (feature column-name order, per-row feature
+/// values, target values).
+pub type ExtractedData = (Vec<String>, Vec<Vec<f32>>, Vec<f32>);
+
 /// Extracts numeric columns (excluding the target) as features and the target column as the label.
 ///
 /// Returns: (feature column-name order, per-row feature values, target values)
 /// The column-name order must be preserved, as it maps 1:1 to later normalization
 /// statistics and prediction inputs.
-pub fn extract_data(
-    df: &DataFrame,
-    target: &str,
-) -> Result<(Vec<String>, Vec<Vec<f32>>, Vec<f32>), String> {
+pub fn extract_data(df: &DataFrame, target: &str) -> Result<ExtractedData, String> {
     let names = df.get_column_names();
     let mut feature_names: Vec<String> = Vec::new();
     let mut target_col: Option<Column> = None;

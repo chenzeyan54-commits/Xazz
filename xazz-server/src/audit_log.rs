@@ -65,28 +65,28 @@ impl AuditRecord {
 fn compute_record_hash(r: &AuditRecord) -> String {
     let mut hasher = Sha256::new();
     hasher.update(r.index.to_string().as_bytes());
-    hasher.update(&[0u8]);
+    hasher.update([0u8]);
     hasher.update(r.timestamp.as_bytes());
-    hasher.update(&[0u8]);
+    hasher.update([0u8]);
     hasher.update(r.hash.as_bytes());
-    hasher.update(&[0u8]);
+    hasher.update([0u8]);
     hasher.update(r.code_length.to_string().as_bytes());
-    hasher.update(&[0u8]);
+    hasher.update([0u8]);
     if let Some(outcome) = &r.outcome {
         hasher.update(outcome.as_bytes());
-        hasher.update(&[0u8]);
+        hasher.update([0u8]);
     }
     if let Some(prompt_hash) = &r.prompt_hash {
         hasher.update(prompt_hash.as_bytes());
-        hasher.update(&[0u8]);
+        hasher.update([0u8]);
     }
     if let Some(response_hash) = &r.response_hash {
         hasher.update(response_hash.as_bytes());
-        hasher.update(&[0u8]);
+        hasher.update([0u8]);
     }
     if let Some(model_fingerprint) = &r.model_fingerprint {
         hasher.update(model_fingerprint.as_bytes());
-        hasher.update(&[0u8]);
+        hasher.update([0u8]);
     }
     hasher.update(r.prev_hash.as_bytes());
     format!("{:x}", hasher.finalize())

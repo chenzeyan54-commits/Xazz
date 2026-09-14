@@ -57,10 +57,10 @@ pub fn generate(rows: usize, output: &Path) -> Result<(), Box<dyn std::error::Er
         return Err("rows must be greater than 0.".into());
     }
 
-    if let Some(parent) = output.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)?;
-        }
+    if let Some(parent) = output.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
     }
 
     let mut rng = SplitMix64::new(0x5EED_5EED_5EED_5EED);

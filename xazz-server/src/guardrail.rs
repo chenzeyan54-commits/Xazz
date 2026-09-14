@@ -75,9 +75,8 @@ pub fn gate(code: &str) -> Decision {
     if report.safe_to_execute {
         if !report.warnings.is_empty() {
             eprintln!(
-                "[xazz] ⚠️ {} {} (policy {} / {})",
+                "[xazz] ⚠️ {} policy warning(s) (policy {} / {})",
                 report.warnings.len(),
-                "policy warning(s)",
                 policy.id,
                 origin
             );
@@ -85,8 +84,7 @@ pub fn gate(code: &str) -> Decision {
         Decision::Allow { report }
     } else {
         eprintln!(
-            "[xazz] ⛔ {} (policy {} / {}): {}",
-            "execution rejected due to policy violation",
+            "[xazz] ⛔ execution rejected due to policy violation (policy {} / {}): {}",
             policy.id,
             origin,
             report.summary()

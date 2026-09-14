@@ -150,7 +150,7 @@ fn build_mlp<B: Backend>(
 }
 
 /// Records the activation after the last Dense (consecutive activations keep only the last one).
-fn set_activation(acts: &mut Vec<Activation>, act: Activation) {
+fn set_activation(acts: &mut [Activation], act: Activation) {
     if let Some(last) = acts.last_mut() {
         *last = act;
     }
@@ -229,7 +229,7 @@ pub fn train(
     // ── Feature standardization statistics (NaN → mean imputation) ────────────────
     let mut fmean = vec![0f64; input_dim];
     let mut fstd = vec![1f64; input_dim];
-    for j in 0..input_dim {
+    for (j, mean) in fmean.iter_mut().enumerate().take(input_dim) {
         let (mut s, mut c) = (0f64, 0usize);
         for i in 0..n {
             if let Some(v) = features.get(i).and_then(|row| row.get(j)) {
@@ -240,7 +240,7 @@ pub fn train(
                 }
             }
         }
-        fmean[j] = if c > 0 { s / c as f64 } else { 0.0 };
+        *mean = if c > 0 { s / c as f64 } else { 0.0 };
     }
     for j in 0..input_dim {
         let (mut s, mut c) = (0f64, 0usize);
@@ -261,9 +261,9 @@ pub fn train(
     }
 
     let mut xs = Vec::with_capacity(n * input_dim);
-    for i in 0..n {
+    for row in features.iter().take(n) {
         for j in 0..input_dim {
-            let mut v = features[i][j] as f64;
+            let mut v = row[j] as f64;
             if !v.is_finite() {
                 v = fmean[j];
             }
@@ -283,13 +283,7 @@ pub fn train(
     };
     let ys: Vec<f32> = targets
         .iter()
-        .map(|&t| {
-            if t.is_finite() {
-                t as f32
-            } else {
-                tmean as f32
-            }
-        })
+        .map(|&t| if t.is_finite() { t } else { tmean as f32 })
         .collect();
 
     // ── train / validation split ────────────────────────────────────────────
@@ -305,7 +299,7 @@ pub fn train(
     let mut model = build_mlp::<AD>(layers, input_dim, &device)?;
 
     let batch_size = config.batch_size.unwrap_or(train_n.max(1));
-    let lr = config.learning_rate as f64;
+    let lr = config.learning_rate;
     let mut optim = AdamConfig::new().init::<AD, _>();
 
     let make_batch = |idx: &[usize]| -> Option<(Tensor<AD, 2>, Tensor<AD, 2>)> {
@@ -377,12 +371,12 @@ pub fn train(
             f64::NAN
         };
 
-        if !val_idx.is_empty() {
-            if let Some((xv, yv)) = make_batch(&val_idx) {
-                let vout = model.forward(xv);
-                let vloss = ((vout - yv).powf_scalar(2.0)).mean();
-                final_val_loss = vloss.into_data().to_vec::<f32>().map(|v| v[0] as f64).ok();
-            }
+        if !val_idx.is_empty()
+            && let Some((xv, yv)) = make_batch(&val_idx)
+        {
+            let vout = model.forward(xv);
+            let vloss = ((vout - yv).powf_scalar(2.0)).mean();
+            final_val_loss = vloss.into_data().to_vec::<f32>().map(|v| v[0] as f64).ok();
         }
 
         // Early stopping: track the best validation loss and count epochs
@@ -406,15 +400,16 @@ pub fn train(
             config.epochs
         );
 
-        if let Some(p) = patience {
-            if !val_idx.is_empty() && epochs_no_improve >= p {
-                println!(
-                    "  [Early stop] no val_loss improvement for {p} epoch(s); \
+        if let Some(p) = patience
+            && !val_idx.is_empty()
+            && epochs_no_improve >= p
+        {
+            println!(
+                "  [Early stop] no val_loss improvement for {p} epoch(s); \
                      best epoch {best_epoch} (val_loss = {best_val_loss:.6})"
-                );
-                stopped_early = true;
-                break;
-            }
+            );
+            stopped_early = true;
+            break;
         }
     }
 
@@ -529,8 +524,8 @@ pub fn predict(
 
     let mut xs = Vec::with_capacity(n * feature_count);
     for i in 0..n {
-        for j in 0..feature_count {
-            let mut v = col_vecs[j][i] as f64;
+        for (j, col) in col_vecs.iter().enumerate().take(feature_count) {
+            let mut v = col[i] as f64;
             if !v.is_finite() {
                 v = trained.fmean[j];
             }

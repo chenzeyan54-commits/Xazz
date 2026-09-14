@@ -109,10 +109,7 @@ impl<'src> Lexer<'src> {
         buf.push(first);
 
         // integer part (ignore underscores)
-        while self
-            .peek()
-            .map_or(false, |c| c.is_ascii_digit() || c == '_')
-        {
+        while self.peek().is_some_and(|c| c.is_ascii_digit() || c == '_') {
             let c = self.advance().unwrap();
             if c != '_' {
                 buf.push(c);
@@ -123,10 +120,7 @@ impl<'src> Lexer<'src> {
         if self.peek() == Some('.') {
             self.advance(); // consume '.'
             buf.push('.');
-            while self
-                .peek()
-                .map_or(false, |c| c.is_ascii_digit() || c == '_')
-            {
+            while self.peek().is_some_and(|c| c.is_ascii_digit() || c == '_') {
                 let c = self.advance().unwrap();
                 if c != '_' {
                     buf.push(c);
@@ -157,10 +151,7 @@ impl<'src> Lexer<'src> {
     fn read_ident(&mut self, first: char) -> TokenKind {
         let mut buf = String::new();
         buf.push(first);
-        while self
-            .peek()
-            .map_or(false, |c| c.is_alphanumeric() || c == '_')
-        {
+        while self.peek().is_some_and(|c| c.is_alphanumeric() || c == '_') {
             buf.push(self.advance().unwrap());
         }
         Self::keyword_or_ident(buf)
@@ -233,7 +224,7 @@ impl<'src> Lexer<'src> {
     /// Returns the next Token (core of the state machine)
     pub fn next_token(&mut self) -> CompileResult<Token> {
         // skip whitespace
-        while self.peek().map_or(false, |c| c.is_whitespace()) {
+        while self.peek().is_some_and(|c| c.is_whitespace()) {
             self.advance();
         }
 
@@ -252,7 +243,7 @@ impl<'src> Lexer<'src> {
             // ── comments ──────────────────────────────────────────────────
             '/' if self.peek() == Some('/') => {
                 // consume to end of line, then recurse
-                while self.peek().map_or(false, |c| c != '\n') {
+                while self.peek().is_some_and(|c| c != '\n') {
                     self.advance();
                 }
                 return self.next_token();
@@ -303,7 +294,7 @@ impl<'src> Lexer<'src> {
             ':' => TokenKind::Colon,
 
             // ── negative number or Minus ────────────────────────────────────────
-            '-' if self.peek().map_or(false, |c| c.is_ascii_digit()) => {
+            '-' if self.peek().is_some_and(|c| c.is_ascii_digit()) => {
                 let digit = self.advance().unwrap();
                 match self.read_number(digit, &span)? {
                     TokenKind::IntLit(n) => {

@@ -191,7 +191,7 @@ impl Codegen {
     fn emit_model_decl(name: &str, layers: &[LayerKind]) -> String {
         let mut lines: Vec<String> = Vec::new();
         lines.push(format!("// [ModelDecl] model {}", name));
-        lines.push(format!("// Burn MLP model (auto-generated nn module)"));
+        lines.push("// Burn MLP model (auto-generated nn module)".to_string());
         for (i, layer) in layers.iter().enumerate() {
             lines.push(format!("//   [{}] {}", i, layer.to_burn_str()));
         }
@@ -235,9 +235,7 @@ impl Codegen {
             "// let mut model = {}::new(&device, input_dim);",
             model_name
         ));
-        lines.push(format!(
-            "// let mut optim = AdamConfig::new().init();  // Burn Adam",
-        ));
+        lines.push("// let mut optim = AdamConfig::new().init();  // Burn Adam".to_string());
         lines.push(format!(
             "// for _ in 0..{} {{ grads = loss.backward(); model = optim.step(lr, model, grads); }}",
             config.epochs

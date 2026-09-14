@@ -10,7 +10,6 @@
 // name + a role, not a type. Correctness of *types* stays with the checker.
 
 use crate::token::{Token, TokenKind};
-use xazz_core::i18n::{is_korean, tr};
 use xazz_core::token::Span;
 
 /// What a symbol is.
@@ -110,8 +109,8 @@ pub fn index_tokens(tokens: &[Token]) -> SymbolTable {
         match &tok.kind {
             TokenKind::Type => {
                 // type Name = { ... }
-                if let Some(next) = tokens.get(i + 1) {
-                    if let TokenKind::Ident(name) = &next.kind {
+                if let Some(next) = tokens.get(i + 1)
+                    && let TokenKind::Ident(name) = &next.kind {
                         // report the declaration span
                         table.symbols.push(Symbol {
                             name: name.clone(),
@@ -125,11 +124,10 @@ pub fn index_tokens(tokens: &[Token]) -> SymbolTable {
                         i += 2;
                         continue;
                     }
-                }
             }
             TokenKind::Model => {
-                if let Some(next) = tokens.get(i + 1) {
-                    if let TokenKind::Ident(name) = &next.kind {
+                if let Some(next) = tokens.get(i + 1)
+                    && let TokenKind::Ident(name) = &next.kind {
                         table.symbols.push(Symbol {
                             name: name.clone(),
                             kind: SymbolKind::Model,
@@ -142,12 +140,11 @@ pub fn index_tokens(tokens: &[Token]) -> SymbolTable {
                         i += 2;
                         continue;
                     }
-                }
             }
             TokenKind::V => {
                 // v Name = ...
-                if let Some(next) = tokens.get(i + 1) {
-                    if let TokenKind::Ident(name) = &next.kind {
+                if let Some(next) = tokens.get(i + 1)
+                    && let TokenKind::Ident(name) = &next.kind {
                         table.symbols.push(Symbol {
                             name: name.clone(),
                             kind: SymbolKind::Variable,
@@ -164,7 +161,6 @@ pub fn index_tokens(tokens: &[Token]) -> SymbolTable {
                         i += 2;
                         continue;
                     }
-                }
             }
             TokenKind::Mut => {
                 // mut v Name = ...  — the name follows `mut v`.
@@ -173,8 +169,8 @@ pub fn index_tokens(tokens: &[Token]) -> SymbolTable {
                 if matches!(tokens.get(j).map(|t| &t.kind), Some(TokenKind::V)) {
                     j += 1;
                 }
-                if let Some(next) = tokens.get(j) {
-                    if let TokenKind::Ident(name) = &next.kind {
+                if let Some(next) = tokens.get(j)
+                    && let TokenKind::Ident(name) = &next.kind {
                         table.symbols.push(Symbol {
                             name: name.clone(),
                             kind: SymbolKind::Variable,
@@ -191,11 +187,10 @@ pub fn index_tokens(tokens: &[Token]) -> SymbolTable {
                         i = j + 1;
                         continue;
                     }
-                }
             }
-            TokenKind::Ident(name) => {
+            TokenKind::Ident(name)
                 // A reference to a previously declared symbol.
-                if declared.iter().any(|(d, _)| d == name) {
+                if declared.iter().any(|(d, _)| d == name) => {
                     // Avoid re-flagging the declaration span itself.
                     let is_def_span = declared_spans.iter().any(|(d, _, sp)| {
                         d == name && sp.line == tok.span.line && sp.col == tok.span.col
@@ -210,7 +205,6 @@ pub fn index_tokens(tokens: &[Token]) -> SymbolTable {
                         });
                     }
                 }
-            }
             _ => {}
         }
         i += 1;
@@ -218,10 +212,10 @@ pub fn index_tokens(tokens: &[Token]) -> SymbolTable {
 
     // Kind for references: match a previously declared kind where unambiguous.
     for sym in table.symbols.iter_mut() {
-        if !sym.is_definition {
-            if let Some((_, kind)) = declared.iter().rev().find(|(d, _)| d == &sym.name) {
-                sym.kind = *kind;
-            }
+        if !sym.is_definition
+            && let Some((_, kind)) = declared.iter().rev().find(|(d, _)| d == &sym.name)
+        {
+            sym.kind = *kind;
         }
     }
 

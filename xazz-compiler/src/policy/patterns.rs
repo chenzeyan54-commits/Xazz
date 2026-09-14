@@ -337,9 +337,9 @@ fn scan_email(source: &str, bytes: &[u8], out: &mut Vec<LiteralFinding>) {
 /// conditions are added.
 ///
 /// 1. A digit run without separators must have a plausible **issuer identification number (IIN)** first digit.
-///  Timestamps and serial numbers commonly start with 0·1·7·8, which are not cards.
+///    Timestamps and serial numbers commonly start with 0·1·7·8, which are not cards.
 /// 2. A digit run in an identifier context (attached to `_` or letters) is not a card number.
-///  Paths and variable names like `xazz_test_4150_1787805001967327111` are excluded.
+///    Paths and variable names like `xazz_test_4150_1787805001967327111` are excluded.
 ///
 /// The separated form (`4111-1111-1111-1111`) is a strong signal by itself, so
 /// the IIN check is not required for it.

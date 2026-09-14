@@ -114,7 +114,7 @@ fn type_name_from_path(path: &str) -> String {
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("Unknown");
-    stem.split(|c: char| c == '_' || c == '-')
+    stem.split(['_', '-'])
         .filter(|s| !s.is_empty())
         .map(|seg| {
             let mut chars = seg.chars();

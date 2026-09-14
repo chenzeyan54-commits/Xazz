@@ -6,11 +6,11 @@
 ///   - BoolLit support (to_typed_polars_expr)
 ///   - Count(None) / Count(Some(col)) distinction
 ///   - code generation for new operators:
-///       GroupBy + aggregation operator → .group_by([...]).agg([...]) pairing
-///       OrderBy → .sort([...], SortMultipleOptions)
-///       Take → .limit(n)
-///       DropNull → .drop_nulls(Some(vec![...]))
-///       FillNull → .with_columns([...fill_null(...)])
+///     GroupBy + aggregation operator → .group_by([...]).agg([...]) pairing
+///     OrderBy → .sort([...], SortMultipleOptions)
+///     Take → .limit(n)
+///     DropNull → .drop_nulls(Some(vec![...]))
+///     FillNull → .with_columns([...fill_null(...)])
 ///   - validate_op_columns: schema validation added for the new column-argument operators
 ///   - Join operator code generation: .join(..., JoinArgs::new(JoinType::...))
 ///   - WithColumn operator code generation: .with_columns([expr.alias("name")])
@@ -1095,11 +1095,11 @@ fn edit_distance(a: &str, b: &str) -> usize {
     let b: Vec<char> = b.chars().collect();
     let (m, n) = (a.len(), b.len());
     let mut dp = vec![vec![0usize; n + 1]; m + 1];
-    for i in 0..=m {
-        dp[i][0] = i;
+    for (i, row) in dp.iter_mut().enumerate().take(m + 1) {
+        row[0] = i;
     }
-    for j in 0..=n {
-        dp[0][j] = j;
+    for (j, cell) in dp[0].iter_mut().enumerate().take(n + 1) {
+        *cell = j;
     }
     for i in 1..=m {
         for j in 1..=n {

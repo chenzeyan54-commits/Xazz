@@ -349,53 +349,53 @@ pub fn run_pipeline(
     let pipeline_ms = timing_start.elapsed().as_secs_f64() * 1000.0;
     println!(
         "[xazz:timing] {}",
-        serde_json::json!({ "pipeline_ms": pipeline_ms }).to_string()
+        serde_json::json!({ "pipeline_ms": pipeline_ms })
     );
 
     // ── STEP 6: Automatic final DataFrame output (Top 5) ───────────────────
-    if let Some(ref name) = last_var_name {
-        if let Some(df) = symbol_table.get(name) {
-            let row_count = df.height().min(5);
-            let top5 = df.head(Some(row_count));
-            println!();
-            println!(
-                "📊 [xazz Execution Result: '{}' (Top {} Rows)]",
-                name, row_count
-            );
-            println!("{}", "─".repeat(60));
-            println!("{}", top5);
+    if let Some(ref name) = last_var_name
+        && let Some(df) = symbol_table.get(name)
+    {
+        let row_count = df.height().min(5);
+        let top5 = df.head(Some(row_count));
+        println!();
+        println!(
+            "📊 [xazz Execution Result: '{}' (Top {} Rows)]",
+            name, row_count
+        );
+        println!("{}", "─".repeat(60));
+        println!("{}", top5);
 
-            // ── [xazz:result] JSON marker ──────────────────────────────────────
-            let api_limit = df.height().min(500);
-            let api_df = df.head(Some(api_limit));
-            let api_rows = df_to_json_array(&api_df).unwrap_or(serde_json::Value::Array(vec![]));
-            let api_schema: Vec<serde_json::Value> = df
-                .get_column_names()
-                .iter()
-                .map(|n| {
-                    let dtype_str = df
-                        .column(n)
-                        .map(|s| format!("{}", s.dtype()))
-                        .unwrap_or_default();
-                    serde_json::json!({ "name": n.to_string(), "type": dtype_str })
-                })
-                .collect();
-            let result_json = serde_json::json!({ "rows": api_rows, "schema": api_schema });
-            println!(
-                "[xazz:result] {}",
-                serde_json::to_string(&result_json).unwrap_or_default()
-            );
+        // ── [xazz:result] JSON marker ──────────────────────────────────────
+        let api_limit = df.height().min(500);
+        let api_df = df.head(Some(api_limit));
+        let api_rows = df_to_json_array(&api_df).unwrap_or(serde_json::Value::Array(vec![]));
+        let api_schema: Vec<serde_json::Value> = df
+            .get_column_names()
+            .iter()
+            .map(|n| {
+                let dtype_str = df
+                    .column(n)
+                    .map(|s| format!("{}", s.dtype()))
+                    .unwrap_or_default();
+                serde_json::json!({ "name": n.to_string(), "type": dtype_str })
+            })
+            .collect();
+        let result_json = serde_json::json!({ "rows": api_rows, "schema": api_schema });
+        println!(
+            "[xazz:result] {}",
+            serde_json::to_string(&result_json).unwrap_or_default()
+        );
 
-            // ── STEP 7: CSV Export (--output flag) ──────────────────────────
-            if let Some(csv_path) = output_csv {
-                match save_df_as_csv(df, csv_path) {
-                    Ok(_) => {
-                        println!();
-                        println!("💾 [xazz] CSV {}: {}", tr("saved", "저장 완료"), csv_path);
-                    }
-                    Err(e) => {
-                        eprintln!("[xazz] ⚠️  CSV {}: {}", tr("save failed", "저장 실패"), e);
-                    }
+        // ── STEP 7: CSV Export (--output flag) ──────────────────────────
+        if let Some(csv_path) = output_csv {
+            match save_df_as_csv(df, csv_path) {
+                Ok(_) => {
+                    println!();
+                    println!("💾 [xazz] CSV {}: {}", tr("saved", "저장 완료"), csv_path);
+                }
+                Err(e) => {
+                    eprintln!("[xazz] ⚠️  CSV {}: {}", tr("save failed", "저장 실패"), e);
                 }
             }
         }
@@ -726,9 +726,7 @@ fn parse_duckdb_uri(path: &str) -> Option<(String, String)> {
     }
     let rest: &str = &path[9..]; // len("duckdb://") == 9
     // Split on the first `?sql=`.
-    let Some(q) = rest.find('?') else {
-        return None;
-    };
+    let q = rest.find('?')?;
     let db: &str = &rest[..q];
     let query: &str = &rest[q + 1..];
     if !query.starts_with("sql=") {
@@ -752,7 +750,7 @@ fn load_duckdb_as_df(uri: &str) -> Result<polars::frame::DataFrame, Box<dyn std:
     // In-memory (`:memory:`) combined with `COPY (...)` segfaulted in duckdb
     // 1.10505, so an ephemeral on-disk DB file is used for the in-memory case.
     let ephemeral_db = db == ":memory:" || db.is_empty();
-    let tmp_db = std::path::PathBuf::from(std::env::temp_dir()).join(format!(
+    let tmp_db = std::env::temp_dir().join(format!(
         "xazz_duckdb_{}_{}.db",
         std::process::id(),
         std::time::SystemTime::now()
@@ -820,7 +818,7 @@ fn load_duckdb_as_df(uri: &str) -> Result<polars::frame::DataFrame, Box<dyn std:
             format!("failed to read DuckDB row: {}", e)
         }
     })? {
-        for i in 0..n_cols {
+        for (i, col) in cells.iter_mut().enumerate() {
             use duckdb::types::ValueRef;
             let v = row.get_ref(i).map_err(|e| {
                 if is_korean() {
@@ -855,7 +853,7 @@ fn load_duckdb_as_df(uri: &str) -> Result<polars::frame::DataFrame, Box<dyn std:
                 }
                 _ => Some(DCell::Str("value".to_string())),
             };
-            cells[i].push(cell);
+            col.push(cell);
         }
     }
 
@@ -984,7 +982,7 @@ fn load_postgres_as_df(uri: &str) -> Result<polars::frame::DataFrame, Box<dyn st
     let mut cells: Vec<Vec<Option<PCell>>> = vec![Vec::new(); n_cols];
 
     for row in &rows {
-        for i in 0..n_cols {
+        for (i, col) in cells.iter_mut().enumerate() {
             // postgres crate Row::try_get — returns Result; match instead of
             // .ok() (this std has no Result::ok()).
             let cell = match row.try_get::<usize, Option<i64>>(i) {
@@ -1005,7 +1003,7 @@ fn load_postgres_as_df(uri: &str) -> Result<polars::frame::DataFrame, Box<dyn st
                     },
                 },
             };
-            cells[i].push(cell);
+            col.push(cell);
         }
     }
 

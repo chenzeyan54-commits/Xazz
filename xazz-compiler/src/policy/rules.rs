@@ -250,14 +250,14 @@ fn check_source_path(
 fn check_model_references(program: &Program, policy: &Policy, report: &mut PolicyReport) {
     for (index, stmt) in program.stmts.iter().enumerate() {
         let file_path = match stmt {
-            Stmt::VarDecl { source, .. } => match source {
-                PipelineSource::Load { file_path, .. } => file_path,
-                _ => continue,
-            },
-            Stmt::ExprStmt { source, .. } => match source {
-                PipelineSource::Load { file_path, .. } => file_path,
-                _ => continue,
-            },
+            Stmt::VarDecl {
+                source: PipelineSource::Load { file_path, .. },
+                ..
+            } => file_path,
+            Stmt::ExprStmt {
+                source: PipelineSource::Load { file_path, .. },
+                ..
+            } => file_path,
             _ => continue,
         };
 
