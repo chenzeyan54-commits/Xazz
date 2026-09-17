@@ -76,6 +76,25 @@ pub fn resolve_imports(
     }
 }
 
+/// Normalizes a canonicalized path for cross-platform-stable comparison.
+///
+/// On Windows `Path::canonicalize` returns verbatim paths (`\\?\C:\...` or
+/// `\\?\UNC\server\share`). The extended-length prefix is a filesystem
+/// implementation detail and can make otherwise-identical paths compare unequal
+/// (e.g. when mixed with a non-verbatim `source_dir`), which shows up as a
+/// false-positive cycle / failed dedup. Strip it so the import stack and the
+/// loaded-set always compare the same normalized form.
+fn normalize_canonical(path: PathBuf) -> PathBuf {
+    let s = path.to_string_lossy();
+    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        return PathBuf::from(format!(r"\\{rest}"));
+    }
+    if let Some(rest) = s.strip_prefix(r"\\?\") {
+        return PathBuf::from(rest);
+    }
+    path
+}
+
 struct ModuleLoader {
     /// Canonical paths of the current import chain (for cycle detection).
     stack: Vec<PathBuf>,
@@ -155,7 +174,7 @@ impl ModuleLoader {
             ));
             return None;
         }
-        candidate.canonicalize().ok()
+        candidate.canonicalize().ok().map(normalize_canonical)
     }
 
     fn load_module(&mut self, canonical: &PathBuf, out: &mut Program) {
@@ -285,12 +304,20 @@ impl ModuleLoader {
 mod tests {
     use super::*;
     use std::fs;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Monotonic per-process discriminator. The wall clock can be too coarse on
+    /// some platforms (notably Windows) for two parallel tests to get distinct
+    /// nanosecond stamps, which previously made them share a temp directory and
+    /// race on cleanup. The atomic counter guarantees a unique suffix.
+    static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     fn temp_dir() -> PathBuf {
         let base = std::env::temp_dir();
         let unique = format!(
-            "xazz_mod_test_{}_{}",
+            "xazz_mod_test_{}_{}_{}",
             std::process::id(),
+            TEMP_COUNTER.fetch_add(1, Ordering::Relaxed),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()

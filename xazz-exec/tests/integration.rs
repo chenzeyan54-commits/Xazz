@@ -12,12 +12,20 @@
 //    to avoid parallel collisions.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use xazz_exec::run_pipeline;
 
 /// Serializes tests that change the process-global CWD so they don't interfere.
 static CWD_LOCK: Mutex<()> = Mutex::new(());
+
+/// Monotonic per-process discriminator. The wall clock can be too coarse on
+/// some platforms (notably Windows) for two parallel tests to get distinct
+/// nanosecond stamps, which previously made them share a temp directory and
+/// race on cleanup (flaky module-resolution tests, issue #96). The atomic
+/// counter guarantees a unique suffix regardless of clock resolution.
+static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Acquires the CWD lock, recovering from a poisoned mutex so a single test's
 /// panic cannot cascade into `PoisonError` for every other CWD-touching test.
@@ -29,8 +37,9 @@ fn lock_cwd() -> std::sync::MutexGuard<'static, ()> {
 fn temp_dir() -> PathBuf {
     let base = std::env::temp_dir();
     let unique = format!(
-        "xazz_test_{}_{}",
+        "xazz_test_{}_{}_{}",
         std::process::id(),
+        TEMP_COUNTER.fetch_add(1, Ordering::Relaxed),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
