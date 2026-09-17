@@ -952,7 +952,7 @@ async fn handle_security_verify(Json(payload): Json<VerifyRequest>) -> Json<Veri
 
     let mut hasher = Sha256::new();
     hasher.update(payload.code.as_bytes());
-    let computed = format!("{:x}", hasher.finalize());
+    let computed = hex::encode(hasher.finalize());
     let valid = computed == payload.hash;
     // Also return whether it exists in the log
     let logged = audit_log::lookup_by_hash(&payload.hash)

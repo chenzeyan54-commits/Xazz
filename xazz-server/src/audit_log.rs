@@ -89,14 +89,14 @@ fn compute_record_hash(r: &AuditRecord) -> String {
         hasher.update([0u8]);
     }
     hasher.update(r.prev_hash.as_bytes());
-    format!("{:x}", hasher.finalize())
+    hex::encode(hasher.finalize())
 }
 
 /// Returns the SHA-256 hash of a code string
 pub fn hash_code(code: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(code.as_bytes());
-    format!("{:x}", hasher.finalize())
+    hex::encode(hasher.finalize())
 }
 
 /// Creates the log file directory and returns its path.
@@ -307,6 +307,25 @@ mod tests {
         assert_ne!(hash_code("different"), a);
     }
 
+    /// Regression guard for the sha2 0.11 migration (issue #94): the hex encoding
+    /// must stay byte-for-byte identical to the previous `{:x}` output so that
+    /// existing audit hash chains remain verifiable.
+    #[test]
+    fn hash_code_matches_known_sha256_vectors() {
+        assert_eq!(
+            hash_code(""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            hash_code("abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(
+            hash_code("code"),
+            "5694d08a2e53ffcae0c3103e5ad6f6076abd960eb1f8a56577040bc1028f702b"
+        );
+    }
+
     #[test]
     fn append_to_path_records_outcome_and_chain() {
         let dir = std::env::temp_dir().join(format!(
@@ -371,6 +390,11 @@ mod tests {
             record_hash: String::new(),
         };
         r.record_hash = compute_record_hash(&r);
+        // Golden value — pins the sha2 0.11 hex output so the chain stays stable.
+        assert_eq!(
+            r.record_hash,
+            "72212b79155d1943fc1ea60f00104e1c5a6255b01ff9a5d9816e75515b57ca07"
+        );
         assert!(r.verify());
         // verification fails if the hash is tampered with
         let mut tampered = r.clone();
