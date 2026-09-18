@@ -12,7 +12,7 @@
 //!   GET  /security/policy                                  → the current Policy-as-Code policy
 //!   PUT  /security/policy                                  → store the tenant's policy pack (C2)
 //!   DELETE /security/policy                                → remove the tenant's policy pack (C2)
-//!   GET  /security/policy/history                          → tenant's policy-pack change audit (C2)
+//!   GET  /security/policy/history?limit=&offset=          → tenant's policy-pack change audit (C2)
 //!   POST /security/policy/check { "code": "<xzz DSL>" }    → static guardrail inspection report
 //!   POST /security/remediate    { "code": "<xzz DSL>" }    → safe code auto-remediation (deterministic + sLM)
 //!   GET  /runs                                → run history (SQLite, issue C1)
@@ -29,7 +29,7 @@ use std::sync::Arc;
 
 use axum::{
     Router,
-    extract::{Extension, Multipart, Path, State},
+    extract::{Extension, Multipart, Path, Query, State},
     http::{HeaderValue, StatusCode, header::AUTHORIZATION},
     middleware::{self, Next},
     response::{IntoResponse, Json},
@@ -54,8 +54,32 @@ const MAX_CONCURRENT_EXECUTIONS: usize = 4;
 /// /schema upload maximum allowed size (bytes).
 const MAX_UPLOAD_BYTES: usize = 50 * 1024 * 1024;
 
-/// Upper bound on policy-history entries returned by `GET /security/policy/history`.
+/// Default page size for `GET /security/policy/history`.
 const POLICY_HISTORY_LIMIT: usize = 100;
+
+/// Hard cap on `?limit=` for `GET /security/policy/history`.
+const POLICY_HISTORY_MAX_LIMIT: usize = 500;
+
+/// Pagination query for `GET /security/policy/history` (issue C2).
+#[derive(Debug, Deserialize)]
+struct PolicyHistoryQuery {
+    /// Page size; defaults to [`POLICY_HISTORY_LIMIT`], clamped to `1..=POLICY_HISTORY_MAX_LIMIT`.
+    limit: Option<usize>,
+    /// Rows to skip in the newest-first list; defaults to 0.
+    offset: Option<usize>,
+}
+
+impl PolicyHistoryQuery {
+    fn limit(&self) -> usize {
+        self.limit
+            .unwrap_or(POLICY_HISTORY_LIMIT)
+            .clamp(1, POLICY_HISTORY_MAX_LIMIT)
+    }
+
+    fn offset(&self) -> usize {
+        self.offset.unwrap_or(0)
+    }
+}
 
 /// AppState shared across requests.
 #[derive(Clone)]
@@ -1095,15 +1119,19 @@ async fn handle_policy_delete(
 /// who changed it, and when — so a pack replacement or removal is auditable even
 /// though `tenant_policies` only keeps the latest state (issue C2). Stored packs
 /// are returned as embedded JSON (falling back to a string if a legacy row is not
-/// parseable) rather than escaped text.
+/// parseable) rather than escaped text. `?limit=&offset=` page the newest-first
+/// list; the response echoes the effective page.
 async fn handle_policy_history(
     Extension(tenant): Extension<String>,
     State(state): State<AppState>,
+    Query(page): Query<PolicyHistoryQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let tenant = tenant_str(tenant.as_str());
+    let limit = page.limit();
+    let offset = page.offset();
     let records = state
         .store
-        .list_policy_history(tenant, POLICY_HISTORY_LIMIT)
+        .list_policy_history(tenant, limit, offset)
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -1124,7 +1152,12 @@ async fn handle_policy_history(
             })
         })
         .collect();
-    Ok(Json(json!({ "tenant": tenant, "history": history })))
+    Ok(Json(json!({
+        "tenant": tenant,
+        "limit": limit,
+        "offset": offset,
+        "history": history,
+    })))
 }
 
 /// Parses a stored policy-pack JSON text for embedding; unparseable legacy rows
@@ -2063,12 +2096,21 @@ v x = load(\"examples/data/seoul_air_2024.csv\") :: AQ
             .await
             .expect("delete");
 
-        let body = handle_policy_history(Extension("tenant-a".to_string()), State(state.clone()))
-            .await
-            .expect("history")
-            .0;
+        let body = handle_policy_history(
+            Extension("tenant-a".to_string()),
+            State(state.clone()),
+            Query(PolicyHistoryQuery {
+                limit: None,
+                offset: None,
+            }),
+        )
+        .await
+        .expect("history")
+        .0;
         let history = body["history"].as_array().expect("history array");
         assert_eq!(history.len(), 3, "{body}");
+        assert_eq!(body["limit"], json!(POLICY_HISTORY_LIMIT));
+        assert_eq!(body["offset"], json!(0));
         // Newest-first: delete, set(v2), set(v1).
         assert_eq!(history[0]["action"], json!("delete"));
         assert_eq!(history[0]["changed_by"], json!("tenant-a"));
@@ -2081,11 +2123,88 @@ v x = load(\"examples/data/seoul_air_2024.csv\") :: AQ
         assert!(history[0]["changed_at"].as_i64().unwrap() > 0);
 
         // A different tenant's history is empty (namespaced).
-        let other = handle_policy_history(Extension("tenant-b".to_string()), State(state))
-            .await
-            .expect("history b")
-            .0;
+        let other = handle_policy_history(
+            Extension("tenant-b".to_string()),
+            State(state),
+            Query(PolicyHistoryQuery {
+                limit: None,
+                offset: None,
+            }),
+        )
+        .await
+        .expect("history b")
+        .0;
         assert_eq!(other["history"].as_array().unwrap().len(), 0);
+    }
+
+    /// `?limit=`/`?offset=` page the newest-first history (issue C2).
+    #[tokio::test]
+    async fn policy_history_supports_pagination() {
+        let state = unique_state("hist_page");
+        for i in 1..=3 {
+            let mut pack = xazz_compiler::Policy::builtin();
+            pack.id = format!("v{i}");
+            let _ = handle_policy_set(
+                Extension("tenant-a".to_string()),
+                State(state.clone()),
+                Json(serde_json::to_value(&pack).unwrap()),
+            )
+            .await
+            .expect("set");
+        }
+
+        let page = |limit: usize, offset: usize| {
+            let state = state.clone();
+            async move {
+                handle_policy_history(
+                    Extension("tenant-a".to_string()),
+                    State(state),
+                    Query(PolicyHistoryQuery {
+                        limit: Some(limit),
+                        offset: Some(offset),
+                    }),
+                )
+                .await
+                .expect("history")
+                .0
+            }
+        };
+
+        let first = page(2, 0).await;
+        let first_ids: Vec<&str> = first["history"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|h| h["new_policy_json"]["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(first_ids, vec!["v3", "v2"]);
+        assert_eq!(first["limit"], json!(2));
+        assert_eq!(first["offset"], json!(0));
+
+        let second = page(2, 2).await;
+        let second_ids: Vec<&str> = second["history"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|h| h["new_policy_json"]["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(second_ids, vec!["v1"]);
+    }
+
+    /// `?limit=` is clamped to a sane page range (issue C2).
+    #[test]
+    fn policy_history_limit_is_clamped() {
+        let clamp = |limit: Option<usize>| {
+            PolicyHistoryQuery {
+                limit,
+                offset: None,
+            }
+            .limit()
+        };
+        assert_eq!(clamp(None), POLICY_HISTORY_LIMIT);
+        assert_eq!(clamp(Some(0)), 1);
+        assert_eq!(clamp(Some(25)), 25);
+        assert_eq!(clamp(Some(usize::MAX)), POLICY_HISTORY_MAX_LIMIT);
     }
 
     /// /execute applies the authenticated tenant's pack and never invokes the runner on block.

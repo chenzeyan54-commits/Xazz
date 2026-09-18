@@ -19,8 +19,12 @@ Versioning: [Semantic Versioning](https://semver.org/)
   이전 팩은 같은 트랜잭션에서 읽어 `old_policy_json`으로 보존
 - **`GET /security/policy/history`** — 인증된 tenant의 변경 이력을 최신순으로 반환
   (tenant 스코프, `old_policy_json`/`new_policy_json`은 임베드된 JSON)
-- 검증: 저장소 append-only·tenant 격리·이전 팩 보존, 엔드포인트 who/when/previous.
-  xazz-server 52 tests pass
+- **보존 상한 + 페이지네이션** — tenant별 이력은 `XAZZ_TENANT_POLICY_HISTORY_MAX`
+  (기본 1000, 0/무효는 기본값) 개수 상한을 두고, 변경과 같은 트랜잭션에서 오래된
+  행을 정리해 무한 성장을 막는다. `GET /security/policy/history?limit=&offset=`
+  로 최신순 페이징(`limit` 기본 100, `1..=500` 클램프, 응답에 `limit`/`offset` 에코)
+- 검증: 저장소 append-only·tenant 격리·이전 팩 보존, 엔드포인트 who/when/previous,
+  보존 상한 프루닝·페이지 오프셋·limit 클램프. xazz-server 57 tests pass
 
 ### Added — D3 하이퍼파라미터 스윕 (그리드 서치, issue #64)
 
