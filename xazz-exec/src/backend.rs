@@ -582,6 +582,28 @@ mod tests {
         cleanup(&trained.report.checkpoint_path);
     }
 
+    /// D3: a model whose final output is not a single scalar (e.g. Conv1d without a
+    /// final Dense(1)) is rejected instead of silently broadcasting the target.
+    #[test]
+    fn cpu_backend_rejects_non_scalar_output() {
+        let (df, _layers, config) = tiny_dataset();
+        let layers = vec![
+            LayerKind::Conv1d {
+                out_channels: 4,
+                kernel_size: 3,
+            },
+            LayerKind::ReLU,
+        ];
+
+        let (backend, warning) = resolve(None);
+        assert!(warning.is_none());
+
+        let err = backend
+            .train(&df, "backend_unit_bad_dim", &layers, &config)
+            .expect_err("multi-output model must be rejected");
+        assert!(err.contains("Dense(1)"), "오류 메시지에 안내가 없음: {err}");
+    }
+
     /// D3 Embedding: an Embedding -> ReLU -> Dense model trains and predicts end-to-end on CPU.
     #[test]
     fn cpu_backend_trains_embedding_model() {

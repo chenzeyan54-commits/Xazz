@@ -29,7 +29,7 @@ use burn::{
 use burn_ndarray::NdArray;
 use polars::prelude::{Column, DataFrame};
 use xazz_compiler::ast::{LayerKind, TrainConfig};
-use xazz_core::i18n::tr;
+use xazz_core::i18n::{is_korean, tr};
 
 use crate::tensor_bridge::{extract_data, series_to_f32};
 
@@ -437,6 +437,23 @@ pub fn train(
 
     let device: Device<AD> = Default::default();
     let mut model = build_mlp::<AD>(layers, input_dim, &device)?;
+    // A regression target is a single scalar; a model that ends in Conv1d/Embedding
+    // (or a multi-unit Dense without a final Dense(1)) produces several outputs.
+    // Fail closed instead of silently broadcasting the target (which then breaks
+    // predict() with a column-length error).
+    if model.out_dim != 1 {
+        return Err(if is_korean() {
+            format!(
+                "모델 '{model_name}' 의 출력 차원이 {} 입니다. 회귀 타겟은 스칼라 하나여야 합니다. 마지막에 Dense(1) 을 추가하세요.",
+                model.out_dim
+            )
+        } else {
+            format!(
+                "Model '{model_name}' outputs {} values; a regression target must be a single scalar. Add a final Dense(1).",
+                model.out_dim
+            )
+        });
+    }
 
     let batch_size = config.batch_size.unwrap_or(train_n.max(1));
     let lr = config.learning_rate;

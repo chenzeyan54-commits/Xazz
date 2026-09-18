@@ -591,6 +591,12 @@ impl Analyzer {
             }
         }
 
+        // Output-dimension guard (see `warn_model_output_dim`).
+        let cols = self.vars.get(source_var).map(|v| v.columns.clone());
+        if let Some(cols) = cols {
+            self.warn_model_output_dim(model_name, config, &cols);
+        }
+
         // TrainStmt is `run <var> |> train(...)` — recorded in the IR as a model-training node with no binding.
         let input_schema = self
             .vars
@@ -809,6 +815,47 @@ impl Analyzer {
         }
     }
 
+    /// Warns when a model's output dimension does not match the scalar target.
+    ///
+    /// Training feeds a single target column and compares it against the model
+    /// output, so any model whose final width is not 1 (e.g. Conv1d/Embedding
+    /// without a final Dense(1)) broadcasts the target and later fails at predict().
+    fn warn_model_output_dim(
+        &mut self,
+        model_name: &str,
+        config: &TrainConfig,
+        cols: &HashMap<String, CheckerColType>,
+    ) {
+        if !cols
+            .get(&config.target)
+            .is_some_and(CheckerColType::is_numeric)
+        {
+            return;
+        }
+        let input_dim = cols
+            .iter()
+            .filter(|(name, ty)| name.as_str() != config.target && ty.is_numeric())
+            .count();
+        let dim = match self.models.get(model_name) {
+            Some(layers) => model_output_dim(layers, input_dim),
+            None => return,
+        };
+        if dim == 1 {
+            return;
+        }
+        self.warning(Some(model_name), if is_korean() {
+            format!(
+                "train({}) : 모델 '{}' 의 출력 차원이 {} 입니다. 타겟 '{}' 은 스칼라 하나이므로 학습이 타겟을 브로드캐스트하고 predict() 가 실패합니다. 마지막에 Dense(1) 을 추가하세요.",
+                model_name, model_name, dim, config.target
+            )
+        } else {
+            format!(
+                "train({}) : model '{}' outputs {} values, but target '{}' is a single scalar; training will broadcast the target and predict() will fail. Add a final Dense(1).",
+                model_name, model_name, dim, config.target
+            )
+        });
+    }
+
     fn check_train_op(
         &mut self,
         model_name: &String,
@@ -833,6 +880,7 @@ impl Analyzer {
                 },
             );
         }
+        self.warn_model_output_dim(model_name, config, &st.cols);
         st.steps.push(ir::Step::ML(ir::MLOp::Train {
             model: model_name.clone(),
             config: config.clone(),
@@ -1588,6 +1636,24 @@ fn sorted_keys(map: &HashMap<String, CheckerColType>) -> Vec<String> {
     keys
 }
 
+/// Computes a model's final output dimension for a given numeric feature count.
+///
+/// Mirrors the runtime graph builder (`xazz-exec::dl::build_mlp`): Dense replaces
+/// the width, while Conv1d/Embedding flatten their output by multiplying. Used to
+/// catch models whose output is not the single scalar a regression target needs.
+fn model_output_dim(layers: &[LayerKind], input_dim: usize) -> usize {
+    let mut cur = input_dim;
+    for layer in layers {
+        match layer {
+            LayerKind::Dense(n) if *n > 0 => cur = *n,
+            LayerKind::Conv1d { out_channels, .. } if *out_channels > 0 => cur *= *out_channels,
+            LayerKind::Embedding { embed_dim, .. } if *embed_dim > 0 => cur *= *embed_dim,
+            _ => {}
+        }
+    }
+    cur
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1919,6 +1985,56 @@ mod tests {
              v trained = data |> train(CNN, target: \"y\", epochs: 3);",
         );
         assert!(r.is_ok(), "오류: {:?}", r.errors);
+    }
+
+    #[test]
+    fn conv1d_without_final_dense_warns_output_dim() {
+        // `v ... = ... |> train(...)` (VarDecl path)
+        let r = check(
+            "type X = { a: float, b: float, y: float };
+             model CNN { Conv1d(4, 3) -> ReLU() }
+             v data = load(\"x.csv\") :: X;
+             v trained = data |> train(CNN, target: \"y\", epochs: 3);",
+        );
+        assert!(r.is_ok(), "오류: {:?}", r.errors);
+        assert!(
+            r.warnings.iter().any(|w| w.message.contains("Dense(1)")),
+            "출력 차원 경고 없음: {:?}",
+            r.warnings.iter().map(|w| &w.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn run_train_without_final_dense_warns_output_dim() {
+        // `run ... |> train(...)` (TrainStmt path)
+        let r = check(
+            "type X = { a: float, b: float, y: float };
+             model CNN { Conv1d(4, 3) }
+             v data = load(\"x.csv\") :: X;
+             run data |> train(CNN, target: \"y\", epochs: 3);",
+        );
+        assert!(r.is_ok(), "오류: {:?}", r.errors);
+        assert!(
+            r.warnings.iter().any(|w| w.message.contains("Dense(1)")),
+            "출력 차원 경고 없음: {:?}",
+            r.warnings.iter().map(|w| &w.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn conv1d_with_final_dense_has_no_output_dim_warning() {
+        let r = check(
+            "type X = { a: float, b: float, y: float };
+             model CNN { Conv1d(4, 3) -> ReLU() -> Dense(1) }
+             v data = load(\"x.csv\") :: X;
+             v trained = data |> train(CNN, target: \"y\", epochs: 3);",
+        );
+        assert!(r.is_ok(), "오류: {:?}", r.errors);
+        assert!(
+            r.warnings.iter().all(|w| !w.message.contains("Dense(1)")),
+            "불필요한 경고: {:?}",
+            r.warnings.iter().map(|w| &w.message).collect::<Vec<_>>()
+        );
     }
 
     #[test]
