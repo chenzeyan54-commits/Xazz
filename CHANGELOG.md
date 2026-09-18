@@ -9,6 +9,18 @@ Versioning: [Semantic Versioning](https://semver.org/)
 
 ## [Unreleased]
 
+### Added — 관리자 대리 정책 변경 감사 actor (Track C2)
+
+- **`XAZZ_ADMIN_TOKEN`** — 이 토큰으로 인증된 요청은 `X-Xazz-Tenant`가 가리키는
+  임의 테넌트의 정책 팩을 변경할 수 있다. self-service 테넌트는 기존대로 자기
+  네임스페이스만 쓴다
+- **`X-Xazz-Actor` 헤더** — 관리자 대리 변경 시 `changed_by`에 기록할 주체 이름
+  (미지정/공백은 `admin`). 네임스페이스는 대상 테넌트로 유지되고 감사 이력에는
+  actor가 남는다. 관리자 요청이 `X-Xazz-Tenant`를 지정하지 않으면 400으로 거부해
+  빈/전역 네임스페이스에 변경이 떨어지지 않는다
+- 검증: 관리자 대리 set/delete가 대상 네임스페이스에 반영되고 이력 `changed_by`가
+  actor로 기록, 테넌트 격리 유지, 대상 미지정 400, actor 기본값. xazz-server 60 tests
+
 ### Added — 정책 팩 변경 이력 감사 (issue #59, Track C2)
 
 - **SQLite `tenant_policy_history` 테이블** — tenant별 정책 팩 변경을 append-only로

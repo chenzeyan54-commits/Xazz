@@ -352,19 +352,43 @@ fn clean_stale_uploads() {
 /// extension so `/runs` can scope its queries per tenant.
 const TENANT_HEADER: &str = "x-xazz-tenant";
 
+/// Actor header — an administrator may name the identity recorded as
+/// `changed_by` when delegating a policy change to a tenant (issue C2).
+const ACTOR_HEADER: &str = "x-xazz-actor";
+
+/// Admin credential env var — when set, a request bearing this Bearer token may
+/// act on any tenant's policy and is recorded under the actor identity.
+const ADMIN_TOKEN_ENV: &str = "XAZZ_ADMIN_TOKEN";
+
+/// Default actor identity when an admin request omits `X-Xazz-Actor`.
+const DEFAULT_ACTOR: &str = "admin";
+
+/// Identity of an administrator acting on behalf of a tenant (issue C2).
+///
+/// Inserted into the request extensions only when the request authenticated with
+/// `XAZZ_ADMIN_TOKEN`; absent for self-service tenant requests. Policy-change
+/// handlers use it as `changed_by`, so a delegated change is attributed to the
+/// administrator rather than the tenant whose namespace was edited.
+#[derive(Debug, Clone)]
+struct Actor(String);
+
 /// When `XAZZ_SERVER_TOKEN` is set, every request requires `Authorization: Bearer <token>`.
 /// When `XAZZ_TENANT_TOKENS` is set (format `tenant1=token1,tenant2=token2`), a request
 /// must present `X-Xazz-Tenant: <tenant>` + `Authorization: Bearer <token>` for that tenant.
-/// When neither is set, all requests pass (default local-only behavior).
+/// When `XAZZ_ADMIN_TOKEN` is set, a request bearing that token is an administrator:
+/// it may target any `X-Xazz-Tenant` namespace and is recorded under `X-Xazz-Actor`
+/// (default `admin`) as the policy-change actor.
+/// When none is set, all requests pass (default local-only behavior).
 async fn optional_bearer_auth(
     mut req: axum::extract::Request,
     next: Next,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let single_token = std::env::var("XAZZ_SERVER_TOKEN").unwrap_or_default();
     let tenant_map = parse_tenant_tokens(&std::env::var("XAZZ_TENANT_TOKENS").unwrap_or_default());
+    let admin_token = std::env::var(ADMIN_TOKEN_ENV).unwrap_or_default();
 
-    // Both auth modes unset → allow all (local loopback tool).
-    if single_token.is_empty() && tenant_map.is_empty() {
+    // No auth mode configured → allow all (local loopback tool).
+    if single_token.is_empty() && tenant_map.is_empty() && admin_token.is_empty() {
         req.extensions_mut().insert(String::new());
         return Ok(next.run(req).await);
     }
@@ -376,14 +400,18 @@ async fn optional_bearer_auth(
         .unwrap_or("")
         .to_string();
 
+    // Admin mode: cross-tenant, recorded under the actor identity.
+    if !admin_token.is_empty() && auth == format!("Bearer {admin_token}") {
+        let tenant = header_str(&req, TENANT_HEADER);
+        let actor = header_str(&req, ACTOR_HEADER);
+        req.extensions_mut().insert(tenant);
+        req.extensions_mut().insert(Actor(resolve_actor(&actor)));
+        return Ok(next.run(req).await);
+    }
+
     // Multi-tenant mode: tenant header + per-tenant token.
     if !tenant_map.is_empty() {
-        let tenant = req
-            .headers()
-            .get(TENANT_HEADER)
-            .and_then(|h: &HeaderValue| h.to_str().ok())
-            .unwrap_or("")
-            .to_string();
+        let tenant = header_str(&req, TENANT_HEADER);
         if tenant.is_empty() {
             return Err((
                 StatusCode::UNAUTHORIZED,
@@ -408,6 +436,26 @@ async fn optional_bearer_auth(
             StatusCode::UNAUTHORIZED,
             "missing or invalid bearer token".into(),
         ))
+    }
+}
+
+/// Reads a request header as a trimmed owned string (empty when absent/invalid).
+fn header_str(req: &axum::extract::Request, name: &str) -> String {
+    req.headers()
+        .get(name)
+        .and_then(|h: &HeaderValue| h.to_str().ok())
+        .map(str::trim)
+        .unwrap_or("")
+        .to_string()
+}
+
+/// Resolves the admin actor name from an `X-Xazz-Actor` value, defaulting to
+/// [`DEFAULT_ACTOR`] when blank.
+fn resolve_actor(raw: &str) -> String {
+    if raw.is_empty() {
+        DEFAULT_ACTOR.to_string()
+    } else {
+        raw.to_string()
     }
 }
 
@@ -1057,24 +1105,49 @@ async fn handle_policy_info(
 
 // ── PUT /security/policy ─────────────────────────────────────────────────────
 
+/// Resolves the audit actor for a policy change (issue C2).
+///
+/// A delegated admin change is attributed to the [`Actor`]; a self-service
+/// tenant change is attributed to the tenant itself. An admin request must name
+/// a target tenant via `X-Xazz-Tenant`, so a delegated change can never land in
+/// the empty/global namespace by accident.
+fn policy_change_actor(
+    tenant: &str,
+    actor: Option<&Extension<Actor>>,
+) -> Result<String, (StatusCode, Json<Value>)> {
+    match actor {
+        Some(_) if tenant.is_empty() => Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "admin policy change requires X-Xazz-Tenant" })),
+        )),
+        Some(Extension(a)) => Ok(a.0.clone()),
+        None => Ok(tenant.to_string()),
+    }
+}
+
 /// Stores (or replaces) the authenticated tenant's policy pack — issue C2.
 ///
-/// `self-service`: the tenant writes only its own namespace. The body is validated
-/// with the same parser used at load time, so an unparseable pack is rejected here
-/// instead of becoming a later fail-closed denial.
+/// `self-service`: the tenant writes only its own namespace. An administrator
+/// authenticated with `XAZZ_ADMIN_TOKEN` may instead target the namespace named
+/// by `X-Xazz-Tenant`; the change is then recorded under `X-Xazz-Actor`
+/// (default `admin`) rather than the tenant. The body is validated with the same
+/// parser used at load time, so an unparseable pack is rejected here instead of
+/// becoming a later fail-closed denial.
 async fn handle_policy_set(
     Extension(tenant): Extension<String>,
+    actor: Option<Extension<Actor>>,
     State(state): State<AppState>,
     Json(payload): Json<Value>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let tenant = tenant_str(tenant.as_str());
+    let changed_by = policy_change_actor(tenant, actor.as_ref())?;
     let text = payload.to_string();
     let policy = xazz_compiler::Policy::from_json_str(&text)
         .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({ "error": e.message }))))?;
 
     state
         .store
-        .set_tenant_policy(tenant, &text, tenant)
+        .set_tenant_policy(tenant, &text, &changed_by)
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -1094,14 +1167,18 @@ async fn handle_policy_set(
 /// Removes the authenticated tenant's stored policy pack — issue C2.
 ///
 /// After deletion the tenant falls back to the global policy / builtin baseline.
+/// As with [`handle_policy_set`], an admin may delete another tenant's pack and
+/// is recorded as the change actor.
 async fn handle_policy_delete(
     Extension(tenant): Extension<String>,
+    actor: Option<Extension<Actor>>,
     State(state): State<AppState>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let tenant = tenant_str(tenant.as_str());
+    let changed_by = policy_change_actor(tenant, actor.as_ref())?;
     let deleted = state
         .store
-        .delete_tenant_policy(tenant, tenant)
+        .delete_tenant_policy(tenant, &changed_by)
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -1992,6 +2069,7 @@ v x = load(\"examples/data/seoul_air_2024.csv\") :: AQ
         pack.direct_identifiers.push("region".to_string());
         let set = handle_policy_set(
             Extension("tenant-a".to_string()),
+            None,
             State(state.clone()),
             Json(serde_json::to_value(&pack).unwrap()),
         )
@@ -2041,10 +2119,14 @@ v x = load(\"examples/data/seoul_air_2024.csv\") :: AQ
         assert!(check_b.safe_to_execute);
 
         // Deleting tenant-a's pack reverts it to the builtin baseline.
-        let del = handle_policy_delete(Extension("tenant-a".to_string()), State(state.clone()))
-            .await
-            .expect("delete")
-            .0;
+        let del = handle_policy_delete(
+            Extension("tenant-a".to_string()),
+            None,
+            State(state.clone()),
+        )
+        .await
+        .expect("delete")
+        .0;
         assert_eq!(del["deleted"], json!(true));
         let info_a2 = handle_policy_info(Extension("tenant-a".to_string()), State(state))
             .await
@@ -2059,6 +2141,7 @@ v x = load(\"examples/data/seoul_air_2024.csv\") :: AQ
         let state = unique_state("bad");
         let result = handle_policy_set(
             Extension("t".to_string()),
+            None,
             State(state),
             Json(json!({ "not": "a policy" })),
         )
@@ -2066,6 +2149,87 @@ v x = load(\"examples/data/seoul_air_2024.csv\") :: AQ
         let (status, body) = result.expect_err("invalid pack was accepted");
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(body.0["error"].as_str().is_some());
+    }
+
+    /// An administrator may change another tenant's pack; the audit attributes the
+    /// change to the actor while the namespace stays the target tenant (issue C2).
+    #[tokio::test]
+    async fn admin_delegated_policy_change_records_actor() {
+        let state = unique_state("admin");
+
+        let mut pack = xazz_compiler::Policy::builtin();
+        pack.id = "admin-set".to_string();
+        let set = handle_policy_set(
+            Extension("tenant-a".to_string()),
+            Some(Extension(Actor("root".to_string()))),
+            State(state.clone()),
+            Json(serde_json::to_value(&pack).unwrap()),
+        )
+        .await
+        .expect("admin set")
+        .0;
+        assert_eq!(set["tenant"], json!("tenant-a"));
+        assert_eq!(set["origin"], json!("tenant:tenant-a"));
+
+        let _ = handle_policy_delete(
+            Extension("tenant-a".to_string()),
+            Some(Extension(Actor("root".to_string()))),
+            State(state.clone()),
+        )
+        .await
+        .expect("admin delete");
+
+        let body = handle_policy_history(
+            Extension("tenant-a".to_string()),
+            State(state.clone()),
+            Query(PolicyHistoryQuery {
+                limit: None,
+                offset: None,
+            }),
+        )
+        .await
+        .expect("history")
+        .0;
+        let history = body["history"].as_array().expect("history array");
+        assert_eq!(history.len(), 2, "{body}");
+        assert_eq!(history[0]["action"], json!("delete"));
+        assert_eq!(history[0]["changed_by"], json!("root"));
+        assert_eq!(history[1]["action"], json!("set"));
+        assert_eq!(history[1]["changed_by"], json!("root"));
+    }
+
+    /// An admin request must name the target tenant — it cannot land in the
+    /// empty/global namespace (issue C2).
+    #[tokio::test]
+    async fn admin_policy_change_requires_target_tenant() {
+        let state = unique_state("admin_target");
+        let pack = xazz_compiler::Policy::builtin();
+
+        let set = handle_policy_set(
+            Extension(String::new()),
+            Some(Extension(Actor("admin".to_string()))),
+            State(state.clone()),
+            Json(serde_json::to_value(&pack).unwrap()),
+        )
+        .await;
+        let (status, _) = set.expect_err("admin set without target was accepted");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        let del = handle_policy_delete(
+            Extension(String::new()),
+            Some(Extension(Actor("admin".to_string()))),
+            State(state),
+        )
+        .await;
+        let (status, _) = del.expect_err("admin delete without target was accepted");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    /// A blank `X-Xazz-Actor` falls back to the default admin identity (issue C2).
+    #[test]
+    fn actor_header_defaults_to_admin() {
+        assert_eq!(resolve_actor(""), "admin");
+        assert_eq!(resolve_actor("root"), "root");
     }
 
     /// Policy-pack changes are recorded append-only with who/when/previous (issue C2).
@@ -2080,6 +2244,7 @@ v x = load(\"examples/data/seoul_air_2024.csv\") :: AQ
 
         let _ = handle_policy_set(
             Extension("tenant-a".to_string()),
+            None,
             State(state.clone()),
             Json(serde_json::to_value(&v1).unwrap()),
         )
@@ -2087,14 +2252,19 @@ v x = load(\"examples/data/seoul_air_2024.csv\") :: AQ
         .expect("set v1");
         let _ = handle_policy_set(
             Extension("tenant-a".to_string()),
+            None,
             State(state.clone()),
             Json(serde_json::to_value(&v2).unwrap()),
         )
         .await
         .expect("set v2");
-        let _ = handle_policy_delete(Extension("tenant-a".to_string()), State(state.clone()))
-            .await
-            .expect("delete");
+        let _ = handle_policy_delete(
+            Extension("tenant-a".to_string()),
+            None,
+            State(state.clone()),
+        )
+        .await
+        .expect("delete");
 
         let body = handle_policy_history(
             Extension("tenant-a".to_string()),
@@ -2146,6 +2316,7 @@ v x = load(\"examples/data/seoul_air_2024.csv\") :: AQ
             pack.id = format!("v{i}");
             let _ = handle_policy_set(
                 Extension("tenant-a".to_string()),
+                None,
                 State(state.clone()),
                 Json(serde_json::to_value(&pack).unwrap()),
             )
@@ -2215,6 +2386,7 @@ v x = load(\"examples/data/seoul_air_2024.csv\") :: AQ
         pack.direct_identifiers.push("region".to_string());
         let _ = handle_policy_set(
             Extension("tenant-a".to_string()),
+            None,
             State(state.clone()),
             Json(serde_json::to_value(&pack).unwrap()),
         )
