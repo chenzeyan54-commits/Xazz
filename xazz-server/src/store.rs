@@ -74,6 +74,11 @@ fn ensure_schema(conn: &Connection) -> Result<(), String> {
             policy_json TEXT NOT NULL,
             updated_at INTEGER NOT NULL DEFAULT 0
         );
+        CREATE TABLE IF NOT EXISTS tenant_dp_config (
+            tenant TEXT PRIMARY KEY,
+            window_secs INTEGER NOT NULL DEFAULT 0,
+            updated_at INTEGER NOT NULL DEFAULT 0
+        );
         CREATE TABLE IF NOT EXISTS tenant_policy_history (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             tenant TEXT NOT NULL,
@@ -350,6 +355,73 @@ impl Store {
         )
         .map_err(|e| format!("failed to reset dp budget: {e}"))?;
         Ok(())
+    }
+
+    /// Returns the tenant's stored DP window override in seconds, if any — issue C2.
+    ///
+    /// `None` means the tenant has no override and the global default applies.
+    /// `Some(0)` is an explicit per-tenant "cumulative, no window" setting and must
+    /// not be confused with the absence of an override.
+    pub fn get_dp_window(&self, tenant: &str) -> Result<Option<u64>, String> {
+        let guard = self.open()?;
+        let conn = guard.as_ref().expect("open guarantees Some");
+        conn.query_row(
+            "SELECT window_secs FROM tenant_dp_config WHERE tenant = ?1",
+            params![tenant],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .map(|opt| opt.map(|secs| secs.max(0) as u64))
+        .map_err(|e| format!("failed to read tenant dp window: {e}"))
+    }
+
+    /// Stores a tenant's DP window override — issue C2.
+    ///
+    /// The window is keyed by tenant, so one tenant's setting never changes
+    /// another's. If the tenant already has a budget row, its window anchor is
+    /// re-anchored to now so the newly configured window starts at set time
+    /// (changing the length cannot retroactively expire spend that was accrued
+    /// under the previous setting).
+    pub fn set_dp_window(&self, tenant: &str, window_secs: u64) -> Result<(), String> {
+        let guard = self.open()?;
+        let conn = guard.as_ref().expect("open guarantees Some");
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| format!("failed to begin dp window transaction: {e}"))?;
+        let now = now_epoch();
+        tx.execute(
+            "INSERT INTO tenant_dp_config (tenant, window_secs, updated_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(tenant) DO UPDATE SET
+                 window_secs = excluded.window_secs,
+                 updated_at  = excluded.updated_at",
+            params![tenant, window_secs as i64, now],
+        )
+        .map_err(|e| format!("failed to store tenant dp window: {e}"))?;
+        tx.execute(
+            "UPDATE dp_budget SET window_started_at = ?1, updated_at = ?1 WHERE tenant = ?2",
+            params![now, tenant],
+        )
+        .map_err(|e| format!("failed to re-anchor dp window: {e}"))?;
+        tx.commit()
+            .map_err(|e| format!("failed to commit dp window transaction: {e}"))?;
+        Ok(())
+    }
+
+    /// Removes a tenant's DP window override. Returns `true` if one existed — issue C2.
+    ///
+    /// After removal the tenant falls back to the global `XAZZ_TENANT_DP_WINDOW_SECS`
+    /// default. Other tenants' overrides are untouched.
+    pub fn clear_dp_window(&self, tenant: &str) -> Result<bool, String> {
+        let guard = self.open()?;
+        let conn = guard.as_ref().expect("open guarantees Some");
+        let deleted = conn
+            .execute(
+                "DELETE FROM tenant_dp_config WHERE tenant = ?1",
+                params![tenant],
+            )
+            .map_err(|e| format!("failed to clear tenant dp window: {e}"))?;
+        Ok(deleted > 0)
     }
 
     /// Returns the tenant's stored policy pack JSON, if any — issue C2.
@@ -767,6 +839,72 @@ mod tests {
         // Window disabled (0) is cumulative across calls.
         store.add_dp_spend("a", 1.0, 0.0, 0).expect("spend again");
         assert!((store.dp_spent("a", 0).expect("read cumulative").0 - 1.0).abs() < 1e-12);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Tenant DP window overrides are stored, isolated per tenant, and clearable (issue C2).
+    #[test]
+    fn dp_window_override_is_per_tenant_and_clearable() {
+        let dir = std::env::temp_dir().join(format!(
+            "xazz_store_dpwin_{}_{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let db = dir.join("xazz.db");
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Store::open_at(&db);
+
+        // No override by default.
+        assert_eq!(store.get_dp_window("a").expect("read"), None);
+        store.set_dp_window("a", 3600).expect("set a");
+        // An explicit 0 is a stored override, not "unset".
+        store.set_dp_window("b", 0).expect("set b");
+        assert_eq!(store.get_dp_window("a").expect("read a"), Some(3600));
+        assert_eq!(store.get_dp_window("b").expect("read b"), Some(0));
+        assert_eq!(store.get_dp_window("c").expect("read c"), None);
+
+        // Clearing is tenant-scoped and reports whether a row existed.
+        assert!(store.clear_dp_window("a").expect("clear a"));
+        assert_eq!(store.get_dp_window("a").expect("read a"), None);
+        assert!(!store.clear_dp_window("a").expect("clear a again"));
+        assert_eq!(store.get_dp_window("b").expect("read b"), Some(0));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Setting a window re-anchors the existing budget row without wiping spend (issue C2).
+    #[test]
+    fn setting_dp_window_reanchors_without_wiping_spend() {
+        let dir = std::env::temp_dir().join(format!(
+            "xazz_store_dpwin_anchor_{}_{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let db = dir.join("xazz.db");
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Store::open_at(&db);
+
+        store.add_dp_spend("a", 2.0, 0.0, 0).expect("spend");
+        // Age the anchor far beyond the window that is about to be configured.
+        {
+            let conn = Connection::open(&db).expect("open raw");
+            conn.execute(
+                "UPDATE dp_budget SET window_started_at = window_started_at - 100000 WHERE tenant = 'a'",
+                [],
+            )
+            .expect("age window");
+        }
+
+        store.set_dp_window("a", 3600).expect("set window");
+        // The anchor moved to now, so the fresh one-hour window retains the spend.
+        assert!((store.dp_spent("a", 3600).expect("read").0 - 2.0).abs() < 1e-12);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

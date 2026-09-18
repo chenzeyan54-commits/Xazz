@@ -121,6 +121,9 @@ datasets. This track makes Xazz handle real workloads.
 - [x] DP budget reset / window API — `POST /dp/budget/reset` zeroes a tenant's spend and
       re-anchors its window (self-service, tenant-scoped); `XAZZ_TENANT_DP_WINDOW_SECS`
       enables an automatic sliding window (`GET /dp/budget` reports `window_secs`/`resets_at`).
+- [x] Per-tenant DP window length — a stored override (`tenant_dp_config`) takes precedence
+      over the global `XAZZ_TENANT_DP_WINDOW_SECS`; `PUT`/`DELETE /dp/budget/window` manage
+      it self-service and `GET /dp/budget` reports `window_source` (`tenant`/`global`).
 - [x] Same-tenant DP precheck is atomic — per-tenant execution lock serializes a tenant's
       precheck → run → accrue; concurrent runs can no longer read the same `remaining` and
       jointly exceed the envelope. Different tenants run in parallel.

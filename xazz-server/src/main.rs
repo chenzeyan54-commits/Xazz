@@ -33,7 +33,7 @@ use axum::{
     http::{HeaderValue, StatusCode, header::AUTHORIZATION},
     middleware::{self, Next},
     response::{IntoResponse, Json},
-    routing::{get, post},
+    routing::{get, post, put},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -175,6 +175,32 @@ fn tenant_dp_window_secs() -> u64 {
     resolve_dp_window(raw.as_deref())
 }
 
+/// A tenant's effective DP budget window and where it came from — issue C2.
+struct DpWindow {
+    /// Window length in seconds (`0` = cumulative, no window).
+    secs: u64,
+    /// `"tenant"` when a stored per-tenant override is in effect, else `"global"`.
+    source: &'static str,
+}
+
+/// Resolves a tenant's effective DP budget window — issue C2.
+///
+/// A stored per-tenant override (`tenant_dp_config`) takes precedence over the
+/// global `XAZZ_TENANT_DP_WINDOW_SECS` default. An explicit stored `0` is a
+/// tenant override (source `"tenant"`), distinct from having no override.
+fn effective_dp_window(store: &store::Store, tenant: &str) -> Result<DpWindow, String> {
+    match store.get_dp_window(tenant)? {
+        Some(secs) => Ok(DpWindow {
+            secs,
+            source: "tenant",
+        }),
+        None => Ok(DpWindow {
+            secs: tenant_dp_window_secs(),
+            source: "global",
+        }),
+    }
+}
+
 /// Extracts the (ε, δ) a run consumed from its `[xazz:dp]` marker.
 /// Returns `None` when the run used no `withDp` (nothing to bill).
 fn dp_spend_from_marker(dp: &Option<Value>) -> Option<(f64, f64)> {
@@ -284,6 +310,10 @@ async fn main() {
         .route("/runs/{id}", get(handle_run_by_id))
         .route("/dp/budget", get(handle_dp_budget))
         .route("/dp/budget/reset", post(handle_dp_budget_reset))
+        .route(
+            "/dp/budget/window",
+            put(handle_dp_window_set).delete(handle_dp_window_clear),
+        )
         .route("/catalog", post(handle_catalog))
         .with_state(AppState {
             exec_permits: Arc::new(Semaphore::new(MAX_CONCURRENT_EXECUTIONS)),
@@ -616,10 +646,11 @@ async fn handle_execute(
     //     budget, so cross-run composition is enforced by the existing DP
     //     accounting (the runner refuses a `withDp` that would exceed it).
     let (total_eps, total_delta) = tenant_dp_envelope();
-    let window_secs = tenant_dp_window_secs();
+    let window = effective_dp_window(&state.store, tenant_str(tenant.as_str()))
+        .map_err(|e| internal_err(format!("DP window 조회 실패: {e}")))?;
     let (spent_eps, spent_delta) = state
         .store
-        .dp_spent(tenant_str(tenant.as_str()), window_secs)
+        .dp_spent(tenant_str(tenant.as_str()), window.secs)
         .map_err(|e| internal_err(format!("DP 원장 조회 실패: {e}")))?;
     let remaining_eps = (total_eps - spent_eps).max(MIN_REMAINING_BUDGET);
     let remaining_delta = (total_delta - spent_delta).max(MIN_REMAINING_BUDGET);
@@ -653,7 +684,7 @@ async fn handle_execute(
         && let Err(e) =
             state
                 .store
-                .add_dp_spend(tenant_str(tenant.as_str()), eps, delta, window_secs)
+                .add_dp_spend(tenant_str(tenant.as_str()), eps, delta, window.secs)
     {
         eprintln!("[xazz] ⚠️ DP 원장 갱신 실패: {e}");
     }
@@ -1465,17 +1496,18 @@ async fn handle_dp_budget(
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let tenant = tenant_str(tenant.as_str());
     let (total_eps, total_delta) = tenant_dp_envelope();
-    let window_secs = tenant_dp_window_secs();
+    let window = effective_dp_window(&state.store, tenant)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
     let (spent_eps, spent_delta) = state
         .store
-        .dp_spent(tenant, window_secs)
+        .dp_spent(tenant, window.secs)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
     Ok(Json(dp_budget_view(
         &state,
         tenant,
         total_eps,
         total_delta,
-        window_secs,
+        window,
         spent_eps,
         spent_delta,
     )?))
@@ -1496,15 +1528,91 @@ async fn handle_dp_budget_reset(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     let (total_eps, total_delta) = tenant_dp_envelope();
-    let window_secs = tenant_dp_window_secs();
+    let window = effective_dp_window(&state.store, tenant)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
     Ok(Json(dp_budget_view(
         &state,
         tenant,
         total_eps,
         total_delta,
-        window_secs,
+        window,
         0.0,
         0.0,
+    )?))
+}
+
+/// Request body for `PUT /dp/budget/window`.
+#[derive(Deserialize)]
+struct DpWindowRequest {
+    /// Window length in seconds; `0` disables the window (cumulative budget).
+    window_secs: u64,
+}
+
+/// Sets the authenticated tenant's DP budget window override — issue C2.
+///
+/// Self-service and tenant-scoped: only the caller's override is written; the
+/// global `XAZZ_TENANT_DP_WINDOW_SECS` remains the fallback for tenants without
+/// one. `window_secs: 0` stores an explicit "cumulative" override, which differs
+/// from deleting the override (which restores the global default).
+async fn handle_dp_window_set(
+    State(state): State<AppState>,
+    Extension(tenant): Extension<String>,
+    Json(payload): Json<DpWindowRequest>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let tenant = tenant_str(tenant.as_str());
+    state
+        .store
+        .set_dp_window(tenant, payload.window_secs)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    let (total_eps, total_delta) = tenant_dp_envelope();
+    let (spent_eps, spent_delta) = state
+        .store
+        .dp_spent(tenant, payload.window_secs)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    Ok(Json(dp_budget_view(
+        &state,
+        tenant,
+        total_eps,
+        total_delta,
+        DpWindow {
+            secs: payload.window_secs,
+            source: "tenant",
+        },
+        spent_eps,
+        spent_delta,
+    )?))
+}
+
+/// Removes the authenticated tenant's DP budget window override — issue C2.
+///
+/// After removal the tenant falls back to the global `XAZZ_TENANT_DP_WINDOW_SECS`
+/// default. Tenant-scoped: other tenants' overrides are untouched.
+async fn handle_dp_window_clear(
+    State(state): State<AppState>,
+    Extension(tenant): Extension<String>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let tenant = tenant_str(tenant.as_str());
+    state
+        .store
+        .clear_dp_window(tenant)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    let (total_eps, total_delta) = tenant_dp_envelope();
+    let window = effective_dp_window(&state.store, tenant)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let (spent_eps, spent_delta) = state
+        .store
+        .dp_spent(tenant, window.secs)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    Ok(Json(dp_budget_view(
+        &state,
+        tenant,
+        total_eps,
+        total_delta,
+        window,
+        spent_eps,
+        spent_delta,
     )?))
 }
 
@@ -1514,7 +1622,7 @@ fn dp_budget_view(
     tenant: &str,
     total_eps: f64,
     total_delta: f64,
-    window_secs: u64,
+    window: DpWindow,
     spent_eps: f64,
     spent_delta: f64,
 ) -> Result<Value, (StatusCode, String)> {
@@ -1523,8 +1631,8 @@ fn dp_budget_view(
         .dp_window_started_at(tenant)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
         .unwrap_or(0);
-    let resets_at = if window_secs > 0 && anchor > 0 {
-        anchor + window_secs as i64
+    let resets_at = if window.secs > 0 && anchor > 0 {
+        anchor + window.secs as i64
     } else {
         0
     };
@@ -1536,7 +1644,8 @@ fn dp_budget_view(
         "total_delta": total_delta,
         "remaining_epsilon": (total_eps - spent_eps).max(0.0),
         "remaining_delta": (total_delta - spent_delta).max(0.0),
-        "window_secs": window_secs,
+        "window_secs": window.secs,
+        "window_source": window.source,
         "window_started_at": anchor,
         "resets_at": resets_at,
     }))
@@ -2041,6 +2150,63 @@ v x = load(\"examples/data/seoul_air_2024.csv\") :: AQ
             .expect("budget endpoint")
             .0;
         assert!((other_body["spent_epsilon"].as_f64().unwrap() - 1.0).abs() < 1e-12);
+    }
+
+    /// A tenant can override its own DP window; the global default is the fallback.
+    #[tokio::test]
+    async fn dp_window_endpoint_sets_and_clears_tenant_override() {
+        let state = test_state();
+        let tenant = format!("dp-window-{}", std::process::id());
+        let other = format!("dp-window-other-{}", std::process::id());
+
+        // Seed a budget row so setting the window exercises the re-anchor path.
+        state
+            .store
+            .add_dp_spend(&tenant, 1.0, 0.0, 0)
+            .expect("seed spend");
+
+        // No override: the effective window is the global default.
+        let window = effective_dp_window(&state.store, &tenant).expect("resolve");
+        assert_eq!(window.source, "global");
+        assert_eq!(window.secs, tenant_dp_window_secs());
+
+        // PUT stores a tenant-scoped override.
+        let body = handle_dp_window_set(
+            State(state.clone()),
+            Extension(tenant.clone()),
+            Json(DpWindowRequest { window_secs: 7200 }),
+        )
+        .await
+        .expect("set window")
+        .0;
+        assert_eq!(body["window_secs"], json!(7200));
+        assert_eq!(body["window_source"], json!("tenant"));
+        let anchor = body["window_started_at"].as_i64().unwrap();
+        assert!(anchor > 0, "set re-anchors the existing budget row");
+        assert_eq!(body["resets_at"].as_i64().unwrap(), anchor + 7200);
+        // Re-anchoring does not wipe the accrued spend.
+        assert!((body["spent_epsilon"].as_f64().unwrap() - 1.0).abs() < 1e-12);
+
+        // Another tenant still resolves to the global default.
+        let other_window = effective_dp_window(&state.store, &other).expect("resolve other");
+        assert_eq!(other_window.source, "global");
+
+        // GET reflects the tenant override.
+        let got = handle_dp_budget(State(state.clone()), Extension(tenant.clone()))
+            .await
+            .expect("budget")
+            .0;
+        assert_eq!(got["window_secs"], json!(7200));
+        assert_eq!(got["window_source"], json!("tenant"));
+
+        // DELETE clears it and restores the global default.
+        let cleared = handle_dp_window_clear(State(state.clone()), Extension(tenant.clone()))
+            .await
+            .expect("clear window")
+            .0;
+        assert_eq!(cleared["window_source"], json!("global"));
+        assert_eq!(cleared["window_secs"], json!(tenant_dp_window_secs()));
+        assert!(state.store.get_dp_window(&tenant).expect("read").is_none());
     }
 
     // ── Per-tenant policy packs (issue C2) ────────────────────────────────────

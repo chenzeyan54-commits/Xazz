@@ -9,6 +9,18 @@ Versioning: [Semantic Versioning](https://semver.org/)
 
 ## [Unreleased]
 
+### Added — per-tenant DP window 설정 (issue #59, Track C2)
+
+- **`tenant_dp_config` 테이블** — tenant별 DP window 길이 override 저장. `GET /dp/budget`에
+  `window_source`(`"tenant"` | `"global"`)를 추가해 override와 전역 기본값을 구분한다
+- **`PUT /dp/budget/window` / `DELETE /dp/budget/window`** — 인증된 tenant가 자기 window를
+  설정/해제(self-service). `window_secs: 0`은 명시적 누적 override, DELETE는 전역
+  `XAZZ_TENANT_DP_WINDOW_SECS` 기본값으로 복귀한다
+- **`Store::set_dp_window` 재앵커** — window 변경 시 기존 예산 row의 anchor를 현재로 옮겨
+  새 window가 설정 시점부터 시작하고, 이전에 누적된 spend를 소급 만료시키지 않는다
+- 검증: store override 격리/clear/재앵커(누적 spend 보존), 핸들러 tenant 격리·`window_source`.
+  xazz-server 63 tests
+
 ### Added — `xazz registry deploy` 테넌트 정책 배포 (Track C2)
 
 - **`xazz registry deploy <name> --tenant T`** — 내장 정책 팩을 실행 중인 서버의
