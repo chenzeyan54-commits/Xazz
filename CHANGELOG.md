@@ -9,6 +9,19 @@ Versioning: [Semantic Versioning](https://semver.org/)
 
 ## [Unreleased]
 
+### Added — 정책 팩 변경 이력 감사 (issue #59, Track C2)
+
+- **SQLite `tenant_policy_history` 테이블** — tenant별 정책 팩 변경을 append-only로
+  기록(누가/언제/이전 팩/새 팩). `tenant_policies`는 최신 상태만 유지하므로
+  교체·삭제 이력이 남지 않던 공백을 메운다
+- **`set_tenant_policy`/`delete_tenant_policy`에 `changed_by` 추가** — 팩 변경과 이력
+  append를 하나의 트랜잭션으로 커밋해 감사 기록이 실제 상태와 어긋나지 않음.
+  이전 팩은 같은 트랜잭션에서 읽어 `old_policy_json`으로 보존
+- **`GET /security/policy/history`** — 인증된 tenant의 변경 이력을 최신순으로 반환
+  (tenant 스코프, `old_policy_json`/`new_policy_json`은 임베드된 JSON)
+- 검증: 저장소 append-only·tenant 격리·이전 팩 보존, 엔드포인트 who/when/previous.
+  xazz-server 52 tests pass
+
 ### Added — D3 하이퍼파라미터 스윕 (그리드 서치, issue #64)
 
 - **`train()` 리스트 인자** — `epochs`/`lr`/`batch_size` 에 리스트를 넘기면

@@ -333,7 +333,7 @@ v out = load(\"data/p.csv\") :: Patient |> groupBy(\"age_band\") |> count(\"pati
         p.id = "tenant-a-pack".to_string();
         p.direct_identifiers.push("region".to_string());
         store
-            .set_tenant_policy("tenant-a", &p.to_json_string())
+            .set_tenant_policy("tenant-a", &p.to_json_string(), "tenant-a")
             .expect("store tenant-a pack");
 
         let code = "type P = { region: string };\n\
@@ -359,7 +359,7 @@ v out = load(\"data/p.csv\") :: Patient |> groupBy(\"age_band\") |> count(\"pati
         let db = std::env::temp_dir().join(format!("xazz_guard_pol_b_{}.db", std::process::id()));
         let store = Store::open_at(&db);
         store
-            .set_tenant_policy("t", "{ not json")
+            .set_tenant_policy("t", "{ not json", "t")
             .expect("store raw pack");
 
         let safe = "type P = { region: string };\n\

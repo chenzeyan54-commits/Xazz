@@ -54,6 +54,15 @@ fn ensure_schema(conn: &Connection) -> Result<(), String> {
             tenant TEXT PRIMARY KEY,
             policy_json TEXT NOT NULL,
             updated_at INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS tenant_policy_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tenant TEXT NOT NULL,
+            action TEXT NOT NULL,
+            old_policy_json TEXT,
+            new_policy_json TEXT,
+            changed_by TEXT NOT NULL DEFAULT '',
+            changed_at INTEGER NOT NULL
         );",
     )
     .map_err(|e| format!("failed to create store schema: {e}"))?;
@@ -81,6 +90,27 @@ pub struct RunRecord {
     pub tenant: String,
     /// Unix epoch seconds
     pub created_at: i64,
+}
+
+/// One append-only policy-pack change record (issue C2).
+///
+/// `action` is `"set"` (create/replace) or `"delete"`. `old_policy_json` is the
+/// pack that was in effect before the change (absent for the first set), and
+/// `new_policy_json` is the pack after it (absent for a delete). `changed_by`
+/// is the authenticated tenant that performed the self-service change.
+#[derive(Debug, Clone, Serialize)]
+pub struct PolicyChangeRecord {
+    pub id: i64,
+    pub tenant: String,
+    pub action: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub old_policy_json: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub new_policy_json: Option<String>,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub changed_by: String,
+    /// Unix epoch seconds
+    pub changed_at: i64,
 }
 
 /// Holds the lazily-opened SQLite connection.
@@ -308,37 +338,159 @@ impl Store {
         .map_err(|e| format!("failed to read tenant policy: {e}"))
     }
 
-    /// Stores (or replaces) a tenant's policy pack JSON — issue C2.
+    /// Stores (or replaces) a tenant's policy pack JSON and appends an
+    /// append-only change record — issue C2.
     ///
     /// Validation happens before the write (the caller parses with
     /// `Policy::from_json_str`), so a stored pack is always well-formed.
-    pub fn set_tenant_policy(&self, tenant: &str, policy_json: &str) -> Result<(), String> {
+    /// `changed_by` is the authenticated tenant performing the self-service
+    /// change; the previous pack (if any) is captured in the same transaction so
+    /// the audit trail is never out of sync with the stored pack.
+    pub fn set_tenant_policy(
+        &self,
+        tenant: &str,
+        policy_json: &str,
+        changed_by: &str,
+    ) -> Result<(), String> {
         let guard = self.open()?;
         let conn = guard.as_ref().expect("open guarantees Some");
-        conn.execute(
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| format!("failed to begin policy transaction: {e}"))?;
+        let now = now_epoch();
+        let previous = read_policy_json(&tx, tenant)?;
+        tx.execute(
             "INSERT INTO tenant_policies (tenant, policy_json, updated_at)
              VALUES (?1, ?2, ?3)
              ON CONFLICT(tenant) DO UPDATE SET
                  policy_json = excluded.policy_json,
                  updated_at  = excluded.updated_at",
-            params![tenant, policy_json, now_epoch()],
+            params![tenant, policy_json, now],
         )
         .map_err(|e| format!("failed to store tenant policy: {e}"))?;
+        insert_policy_change(
+            &tx,
+            tenant,
+            "set",
+            previous.as_deref(),
+            Some(policy_json),
+            changed_by,
+            now,
+        )?;
+        tx.commit()
+            .map_err(|e| format!("failed to commit policy transaction: {e}"))?;
         Ok(())
     }
 
     /// Deletes a tenant's stored policy pack. Returns `true` if one existed — issue C2.
-    pub fn delete_tenant_policy(&self, tenant: &str) -> Result<bool, String> {
+    ///
+    /// The removal and its append-only change record (`action = "delete"`) commit
+    /// together; the captured `old_policy_json` preserves what was in effect.
+    pub fn delete_tenant_policy(&self, tenant: &str, changed_by: &str) -> Result<bool, String> {
         let guard = self.open()?;
         let conn = guard.as_ref().expect("open guarantees Some");
-        let deleted = conn
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| format!("failed to begin policy transaction: {e}"))?;
+        let now = now_epoch();
+        let previous = read_policy_json(&tx, tenant)?;
+        let deleted = tx
             .execute(
                 "DELETE FROM tenant_policies WHERE tenant = ?1",
                 params![tenant],
             )
             .map_err(|e| format!("failed to delete tenant policy: {e}"))?;
+        if deleted > 0 {
+            insert_policy_change(
+                &tx,
+                tenant,
+                "delete",
+                previous.as_deref(),
+                None,
+                changed_by,
+                now,
+            )?;
+        }
+        tx.commit()
+            .map_err(|e| format!("failed to commit policy transaction: {e}"))?;
         Ok(deleted > 0)
     }
+
+    /// Lists a tenant's policy-pack change history, newest-first — issue C2.
+    ///
+    /// History is tenant-scoped like the packs themselves, so one tenant's change
+    /// trail is never visible to another. The rows are append-only (never updated
+    /// or deleted) and survive pack replacement/deletion.
+    pub fn list_policy_history(
+        &self,
+        tenant: &str,
+        limit: usize,
+    ) -> Result<Vec<PolicyChangeRecord>, String> {
+        let guard = self.open()?;
+        let conn = guard.as_ref().expect("open guarantees Some");
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, tenant, action, old_policy_json, new_policy_json, changed_by, changed_at
+                 FROM tenant_policy_history WHERE tenant = ?1 ORDER BY id DESC LIMIT ?2",
+            )
+            .map_err(|e| format!("failed to prepare policy history: {e}"))?;
+        let rows = stmt
+            .query_map(params![tenant, limit as i64], |row| {
+                Ok(PolicyChangeRecord {
+                    id: row.get(0)?,
+                    tenant: row.get(1)?,
+                    action: row.get(2)?,
+                    old_policy_json: row.get(3)?,
+                    new_policy_json: row.get(4)?,
+                    changed_by: row.get(5)?,
+                    changed_at: row.get(6)?,
+                })
+            })
+            .map_err(|e| format!("failed to query policy history: {e}"))?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(|e| format!("failed to read policy history row: {e}"))?);
+        }
+        Ok(out)
+    }
+}
+
+/// Reads a tenant's stored pack within a transaction, if present.
+fn read_policy_json(conn: &Connection, tenant: &str) -> Result<Option<String>, String> {
+    conn.query_row(
+        "SELECT policy_json FROM tenant_policies WHERE tenant = ?1",
+        params![tenant],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()
+    .map_err(|e| format!("failed to read tenant policy: {e}"))
+}
+
+/// Appends one policy-pack change row (never updates/deletes).
+fn insert_policy_change(
+    conn: &Connection,
+    tenant: &str,
+    action: &str,
+    old_policy_json: Option<&str>,
+    new_policy_json: Option<&str>,
+    changed_by: &str,
+    changed_at: i64,
+) -> Result<(), String> {
+    conn.execute(
+        "INSERT INTO tenant_policy_history
+             (tenant, action, old_policy_json, new_policy_json, changed_by, changed_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            tenant,
+            action,
+            old_policy_json,
+            new_policy_json,
+            changed_by,
+            changed_at
+        ],
+    )
+    .map_err(|e| format!("failed to record policy change: {e}"))?;
+    Ok(())
 }
 
 impl Default for Store {
@@ -582,10 +734,10 @@ mod tests {
         assert!(store.get_tenant_policy("a").expect("read").is_none());
 
         store
-            .set_tenant_policy("a", r#"{"id":"a-pack"}"#)
+            .set_tenant_policy("a", r#"{"id":"a-pack"}"#, "a")
             .expect("write a");
         store
-            .set_tenant_policy("b", r#"{"id":"b-pack"}"#)
+            .set_tenant_policy("b", r#"{"id":"b-pack"}"#, "b")
             .expect("write b");
 
         // Each tenant reads only its own pack.
@@ -600,7 +752,7 @@ mod tests {
 
         // Replacing a pack only affects that tenant.
         store
-            .set_tenant_policy("a", r#"{"id":"a-v2"}"#)
+            .set_tenant_policy("a", r#"{"id":"a-v2"}"#, "a")
             .expect("rewrite a");
         assert_eq!(
             store.get_tenant_policy("a").expect("reread a").as_deref(),
@@ -612,10 +764,26 @@ mod tests {
         );
 
         // Deleting a pack is tenant-scoped.
-        assert!(store.delete_tenant_policy("a").expect("delete a"));
+        assert!(store.delete_tenant_policy("a", "a").expect("delete a"));
         assert!(store.get_tenant_policy("a").expect("read a").is_none());
         assert!(store.get_tenant_policy("b").expect("read b").is_some());
-        assert!(!store.delete_tenant_policy("a").expect("delete again"));
+        assert!(!store.delete_tenant_policy("a", "a").expect("delete again"));
+
+        // The change history is append-only and tenant-scoped: set, replace, delete.
+        let hist_a = store.list_policy_history("a", 10).expect("history a");
+        let actions: Vec<&str> = hist_a.iter().map(|h| h.action.as_str()).collect();
+        assert_eq!(actions, vec!["delete", "set", "set"], "{hist_a:?}");
+        assert_eq!(hist_a[0].changed_by, "a");
+        assert_eq!(
+            hist_a[0].old_policy_json.as_deref(),
+            Some(r#"{"id":"a-v2"}"#)
+        );
+        assert!(hist_a[0].new_policy_json.is_none());
+        assert!(hist_a[1].old_policy_json.is_some());
+        // tenant-b's history is separate and untouched by a's deletes.
+        let hist_b = store.list_policy_history("b", 10).expect("history b");
+        assert_eq!(hist_b.len(), 1);
+        assert_eq!(hist_b[0].action, "set");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

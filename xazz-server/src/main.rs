@@ -12,6 +12,7 @@
 //!   GET  /security/policy                                  → the current Policy-as-Code policy
 //!   PUT  /security/policy                                  → store the tenant's policy pack (C2)
 //!   DELETE /security/policy                                → remove the tenant's policy pack (C2)
+//!   GET  /security/policy/history                          → tenant's policy-pack change audit (C2)
 //!   POST /security/policy/check { "code": "<xzz DSL>" }    → static guardrail inspection report
 //!   POST /security/remediate    { "code": "<xzz DSL>" }    → safe code auto-remediation (deterministic + sLM)
 //!   GET  /runs                                → run history (SQLite, issue C1)
@@ -52,6 +53,9 @@ const MAX_CONCURRENT_EXECUTIONS: usize = 4;
 
 /// /schema upload maximum allowed size (bytes).
 const MAX_UPLOAD_BYTES: usize = 50 * 1024 * 1024;
+
+/// Upper bound on policy-history entries returned by `GET /security/policy/history`.
+const POLICY_HISTORY_LIMIT: usize = 100;
 
 /// AppState shared across requests.
 #[derive(Clone)]
@@ -249,6 +253,7 @@ async fn main() {
                 .delete(handle_policy_delete),
         )
         .route("/security/policy/check", post(handle_policy_check))
+        .route("/security/policy/history", get(handle_policy_history))
         .route("/security/remediate", post(handle_remediate))
         .route("/security/inference/check", post(handle_inference_check))
         .route("/runs", get(handle_runs_list))
@@ -1043,12 +1048,15 @@ async fn handle_policy_set(
     let policy = xazz_compiler::Policy::from_json_str(&text)
         .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({ "error": e.message }))))?;
 
-    state.store.set_tenant_policy(tenant, &text).map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": e })),
-        )
-    })?;
+    state
+        .store
+        .set_tenant_policy(tenant, &text, tenant)
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": e })),
+            )
+        })?;
 
     Ok(Json(json!({
         "tenant": tenant,
@@ -1067,13 +1075,65 @@ async fn handle_policy_delete(
     State(state): State<AppState>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let tenant = tenant_str(tenant.as_str());
-    let deleted = state.store.delete_tenant_policy(tenant).map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": e })),
-        )
-    })?;
+    let deleted = state
+        .store
+        .delete_tenant_policy(tenant, tenant)
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": e })),
+            )
+        })?;
     Ok(Json(json!({ "tenant": tenant, "deleted": deleted })))
+}
+
+// ── GET /security/policy/history ─────────────────────────────────────────────
+
+/// Returns the authenticated tenant's append-only policy-pack change history.
+///
+/// Each entry records the action (`set`/`delete`), the previous and new pack JSON,
+/// who changed it, and when — so a pack replacement or removal is auditable even
+/// though `tenant_policies` only keeps the latest state (issue C2). Stored packs
+/// are returned as embedded JSON (falling back to a string if a legacy row is not
+/// parseable) rather than escaped text.
+async fn handle_policy_history(
+    Extension(tenant): Extension<String>,
+    State(state): State<AppState>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let tenant = tenant_str(tenant.as_str());
+    let records = state
+        .store
+        .list_policy_history(tenant, POLICY_HISTORY_LIMIT)
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": e })),
+            )
+        })?;
+    let history: Vec<Value> = records
+        .into_iter()
+        .map(|r| {
+            json!({
+                "id": r.id,
+                "tenant": r.tenant,
+                "action": r.action,
+                "old_policy_json": embed_policy_json(r.old_policy_json),
+                "new_policy_json": embed_policy_json(r.new_policy_json),
+                "changed_by": r.changed_by,
+                "changed_at": r.changed_at,
+            })
+        })
+        .collect();
+    Ok(Json(json!({ "tenant": tenant, "history": history })))
+}
+
+/// Parses a stored policy-pack JSON text for embedding; unparseable legacy rows
+/// are returned as a plain string so the endpoint never fails on history.
+fn embed_policy_json(raw: Option<String>) -> Value {
+    match raw {
+        Some(s) => serde_json::from_str(&s).unwrap_or(Value::String(s)),
+        None => Value::Null,
+    }
 }
 
 // ── POST /security/policy/check ──────────────────────────────────────────────
@@ -1973,6 +2033,59 @@ v x = load(\"examples/data/seoul_air_2024.csv\") :: AQ
         let (status, body) = result.expect_err("invalid pack was accepted");
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(body.0["error"].as_str().is_some());
+    }
+
+    /// Policy-pack changes are recorded append-only with who/when/previous (issue C2).
+    #[tokio::test]
+    async fn policy_history_records_who_when_and_previous_pack() {
+        let state = unique_state("hist");
+
+        let mut v1 = xazz_compiler::Policy::builtin();
+        v1.id = "v1".to_string();
+        let mut v2 = xazz_compiler::Policy::builtin();
+        v2.id = "v2".to_string();
+
+        let _ = handle_policy_set(
+            Extension("tenant-a".to_string()),
+            State(state.clone()),
+            Json(serde_json::to_value(&v1).unwrap()),
+        )
+        .await
+        .expect("set v1");
+        let _ = handle_policy_set(
+            Extension("tenant-a".to_string()),
+            State(state.clone()),
+            Json(serde_json::to_value(&v2).unwrap()),
+        )
+        .await
+        .expect("set v2");
+        let _ = handle_policy_delete(Extension("tenant-a".to_string()), State(state.clone()))
+            .await
+            .expect("delete");
+
+        let body = handle_policy_history(Extension("tenant-a".to_string()), State(state.clone()))
+            .await
+            .expect("history")
+            .0;
+        let history = body["history"].as_array().expect("history array");
+        assert_eq!(history.len(), 3, "{body}");
+        // Newest-first: delete, set(v2), set(v1).
+        assert_eq!(history[0]["action"], json!("delete"));
+        assert_eq!(history[0]["changed_by"], json!("tenant-a"));
+        assert_eq!(history[0]["old_policy_json"]["id"], json!("v2"));
+        assert!(history[0]["new_policy_json"].is_null());
+        assert_eq!(history[1]["action"], json!("set"));
+        assert_eq!(history[1]["old_policy_json"]["id"], json!("v1"));
+        assert_eq!(history[1]["new_policy_json"]["id"], json!("v2"));
+        assert_eq!(history[2]["old_policy_json"], Value::Null);
+        assert!(history[0]["changed_at"].as_i64().unwrap() > 0);
+
+        // A different tenant's history is empty (namespaced).
+        let other = handle_policy_history(Extension("tenant-b".to_string()), State(state))
+            .await
+            .expect("history b")
+            .0;
+        assert_eq!(other["history"].as_array().unwrap().len(), 0);
     }
 
     /// /execute applies the authenticated tenant's pack and never invokes the runner on block.
