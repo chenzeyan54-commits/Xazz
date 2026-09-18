@@ -11,6 +11,8 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::http;
+
 /// What an entry installs as.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EntryKind {
@@ -179,6 +181,110 @@ pub fn install(name: &str, out: Option<&Path>, force: bool) -> i32 {
     0
 }
 
+/// The server endpoint a policy pack is deployed to (issue C2).
+///
+/// Pure so the URL join is testable without a server. `server` is the base URL;
+/// a trailing slash is optional.
+pub fn policy_endpoint(server: &str) -> String {
+    format!("{}/security/policy", server.trim().trim_end_matches('/'))
+}
+
+/// Token fallback for `xazz registry deploy` — the admin token wins over the
+/// single-server token, matching the server's authentication precedence.
+fn env_token() -> Option<String> {
+    ["XAZZ_ADMIN_TOKEN", "XAZZ_SERVER_TOKEN"]
+        .iter()
+        .find_map(|key| std::env::var(key).ok())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+/// `xazz registry deploy <name> --tenant T [--server URL] [--token TOKEN] [--actor A]`
+///
+/// Deploys an embedded policy pack to a tenant namespace through the server's
+/// `PUT /security/policy` endpoint (issue C2). Only policy packs can be deployed;
+/// stdlib modules are project-local files and are rejected before any network call.
+pub fn deploy(
+    name: &str,
+    server: &str,
+    tenant: &str,
+    token: Option<&str>,
+    actor: Option<&str>,
+) -> i32 {
+    let Some(entry) = find(name) else {
+        eprintln!("[xazz] registry: unknown entry '{name}'");
+        eprintln!("        run `xazz registry list` to see available entries");
+        return 1;
+    };
+    if entry.kind != EntryKind::PolicyPack {
+        eprintln!(
+            "[xazz] registry: '{}' is a {} and cannot be deployed as a tenant policy",
+            entry.name,
+            entry.kind.as_str()
+        );
+        return 1;
+    }
+
+    let tenant = tenant.trim();
+    if tenant.is_empty() {
+        eprintln!("[xazz] registry: --tenant must not be empty");
+        return 1;
+    }
+    if server.trim().is_empty() {
+        eprintln!("[xazz] registry: --server must not be empty");
+        return 1;
+    }
+
+    let token = token
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(env_token);
+    let Some(token) = token else {
+        eprintln!(
+            "[xazz] registry: no token — pass --token or set XAZZ_ADMIN_TOKEN / XAZZ_SERVER_TOKEN"
+        );
+        return 1;
+    };
+
+    let endpoint = policy_endpoint(server);
+    let mut headers: Vec<(&str, String)> = vec![
+        ("Authorization", format!("Bearer {token}")),
+        ("X-Xazz-Tenant", tenant.to_string()),
+    ];
+    if let Some(actor) = actor.map(str::trim).filter(|value| !value.is_empty()) {
+        headers.push(("X-Xazz-Actor", actor.to_string()));
+    }
+
+    match http::put_json(&endpoint, &headers, entry.source) {
+        Ok(resp) if (200..300).contains(&resp.status) => {
+            println!(
+                "✔ deployed {} '{}' → tenant '{}'",
+                entry.kind.as_str(),
+                entry.name,
+                tenant
+            );
+            println!("  server: {endpoint}");
+            0
+        }
+        Ok(resp) => {
+            eprintln!(
+                "[xazz] registry: server returned HTTP {} for tenant '{}'",
+                resp.status, tenant
+            );
+            let body = resp.body.trim();
+            if !body.is_empty() {
+                eprintln!("        {body}");
+            }
+            1
+        }
+        Err(e) => {
+            eprintln!("[xazz] registry: deploy failed — {e}");
+            1
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -211,5 +317,120 @@ mod tests {
         assert_eq!(default_dest(hc), PathBuf::from("xazz.policy.json"));
         let models = find("models").unwrap();
         assert_eq!(default_dest(models), PathBuf::from("std/models.xzz"));
+    }
+
+    #[test]
+    fn policy_endpoint_joins_base_and_trims_slash() {
+        assert_eq!(
+            policy_endpoint("http://127.0.0.1:8005"),
+            "http://127.0.0.1:8005/security/policy"
+        );
+        assert_eq!(
+            policy_endpoint(" http://127.0.0.1:8005/ "),
+            "http://127.0.0.1:8005/security/policy"
+        );
+        assert_eq!(
+            policy_endpoint("http://host/api/"),
+            "http://host/api/security/policy"
+        );
+    }
+
+    #[test]
+    fn deploy_rejects_stdlib_entry_before_any_network_call() {
+        let code = deploy("models", "http://127.0.0.1:1", "acme", Some("secret"), None);
+        assert_eq!(code, 1, "stdlib modules are not deployable");
+    }
+
+    /// Minimal one-shot HTTP server: captures the raw request and replies with the
+    /// given status line/body. Lets `deploy` be verified end-to-end without a real
+    /// xazz-server.
+    fn spawn_policy_server(
+        status_line: &str,
+        response_body: &str,
+    ) -> (String, std::sync::mpsc::Receiver<String>) {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake server");
+        let addr = listener.local_addr().expect("local addr");
+        let status_line = status_line.to_string();
+        let response_body = response_body.to_string();
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut buf: Vec<u8> = Vec::new();
+            let mut chunk = [0u8; 1024];
+            let header_end = loop {
+                let n = stream.read(&mut chunk).expect("read request");
+                if n == 0 {
+                    break buf.len();
+                }
+                buf.extend_from_slice(&chunk[..n]);
+                if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break pos + 4;
+                }
+            };
+            let head = String::from_utf8_lossy(&buf[..header_end]).to_string();
+            let content_length = head
+                .lines()
+                .find_map(|line| {
+                    let lower = line.to_ascii_lowercase();
+                    lower
+                        .strip_prefix("content-length:")
+                        .and_then(|value| value.trim().parse::<usize>().ok())
+                })
+                .unwrap_or(0);
+            while buf.len() < header_end + content_length {
+                let n = stream.read(&mut chunk).expect("read body");
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+            }
+            tx.send(String::from_utf8_lossy(&buf).into_owned())
+                .expect("send captured request");
+
+            let response = format!(
+                "{status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response_body}",
+                response_body.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write response");
+            stream.flush().expect("flush response");
+        });
+
+        (format!("http://{addr}"), rx)
+    }
+
+    #[test]
+    fn deploy_puts_pack_to_tenant_endpoint() {
+        let (server, rx) = spawn_policy_server("HTTP/1.1 200 OK", r#"{"tenant":"acme"}"#);
+        let code = deploy("healthcare", &server, "acme", Some("secret"), Some("admin"));
+        assert_eq!(code, 0);
+
+        let request = rx.recv().expect("captured request");
+        assert!(
+            request.starts_with("PUT /security/policy HTTP/1.1\r\n"),
+            "{request}"
+        );
+        assert!(request.contains("X-Xazz-Tenant: acme\r\n"), "{request}");
+        assert!(
+            request.contains("Authorization: Bearer secret\r\n"),
+            "{request}"
+        );
+        assert!(request.contains("X-Xazz-Actor: admin\r\n"), "{request}");
+        assert!(
+            request.ends_with(find("healthcare").unwrap().source),
+            "body must be the embedded pack"
+        );
+    }
+
+    #[test]
+    fn deploy_reports_server_error_status() {
+        let (server, _rx) = spawn_policy_server("HTTP/1.1 400 Bad Request", r#"{"error":"bad"}"#);
+        let code = deploy("healthcare", &server, "acme", Some("secret"), None);
+        assert_eq!(code, 1);
     }
 }

@@ -195,4 +195,33 @@ pub enum RegistryAction {
         #[arg(long)]
         force: bool,
     },
+
+    /// Deploy an embedded policy pack to a tenant through a running server
+    ///
+    /// Policy packs only. Writes the pack to `PUT /security/policy` in the target
+    /// tenant namespace (issue C2).
+    ///
+    /// Example: xazz registry deploy healthcare --tenant acme --token $TOKEN
+    /// Example: xazz registry deploy finance --server http://127.0.0.1:8005 \
+    ///          --tenant acme --token $ADMIN --actor ops
+    Deploy {
+        /// Registry policy-pack name (e.g. healthcare, finance)
+        name: String,
+
+        /// Xazz server base URL
+        #[arg(long, default_value = "http://127.0.0.1:8005")]
+        server: String,
+
+        /// Target tenant namespace (sent as X-Xazz-Tenant)
+        #[arg(long)]
+        tenant: String,
+
+        /// Bearer token — defaults to XAZZ_ADMIN_TOKEN, then XAZZ_SERVER_TOKEN
+        #[arg(long)]
+        token: Option<String>,
+
+        /// Audit actor for an admin-delegated change (sent as X-Xazz-Actor)
+        #[arg(long)]
+        actor: Option<String>,
+    },
 }

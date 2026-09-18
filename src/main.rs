@@ -2,6 +2,7 @@
 #![allow(clippy::result_large_err)]
 
 mod cli;
+mod http;
 mod policy_cli;
 mod project;
 mod registry;
@@ -426,6 +427,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 cli::RegistryAction::Install { name, out, force } => {
                     registry::install(&name, out.as_deref(), force)
                 }
+                cli::RegistryAction::Deploy {
+                    name,
+                    server,
+                    tenant,
+                    token,
+                    actor,
+                } => registry::deploy(&name, &server, &tenant, token.as_deref(), actor.as_deref()),
             };
             if code != 0 {
                 std::process::exit(code);

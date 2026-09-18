@@ -9,6 +9,18 @@ Versioning: [Semantic Versioning](https://semver.org/)
 
 ## [Unreleased]
 
+### Added — `xazz registry deploy` 테넌트 정책 배포 (Track C2)
+
+- **`xazz registry deploy <name> --tenant T`** — 내장 정책 팩을 실행 중인 서버의
+  `PUT /security/policy`로 배포한다. `--server`(기본 `http://127.0.0.1:8005`),
+  `--token`(미지정 시 `XAZZ_ADMIN_TOKEN` → `XAZZ_SERVER_TOKEN`), `--actor`(관리자
+  대리 변경 시 `X-Xazz-Actor`)를 지원한다. stdlib 모듈은 배포 대상이 아니며
+  네트워크 호출 전에 거부된다
+- **`src/http.rs`** — Tokio/Polars 없이 std만 쓰는 최소 HTTP/1.1 클라이언트
+  (`http://` 전용, chunked 디코딩·헤더 인젝션 거부). CLI 경량 제약 유지
+- 검증: URL/응답 파싱 단위 테스트 + 로컬 TcpListener 가짜 서버로 PUT 경로·헤더·
+  본문·오류 상태 E2E 검증. xazz 14 tests
+
 ### Added — 관리자 대리 정책 변경 감사 actor (Track C2)
 
 - **`XAZZ_ADMIN_TOKEN`** — 이 토큰으로 인증된 요청은 `X-Xazz-Tenant`가 가리키는
