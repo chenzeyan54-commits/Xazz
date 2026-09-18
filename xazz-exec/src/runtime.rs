@@ -1354,9 +1354,27 @@ fn execute_node(
                         )
                     }
                 })?;
-                let trained = crate::backend::active()
-                    .train(&snapshot, model, &layers, config)
-                    .map_err(|e| format!("{}: {e}", tr("training failed", "학습 실패")))?;
+                let trained = if config.is_sweep() {
+                    let (trained, sweep_report) = crate::backend::active()
+                        .sweep(&snapshot, model, &layers, config)
+                        .map_err(|e| format!("{}: {e}", tr("training failed", "학습 실패")))?;
+                    print_sweep_report(&sweep_report);
+                    let sweep_json = serde_json::json!({
+                        "type": "sweep_stmt",
+                        "success": true,
+                        "model_name": model,
+                        "report": serde_json::to_value(&sweep_report).unwrap_or_default(),
+                    });
+                    println!(
+                        "[xazz:sweep] {}",
+                        serde_json::to_string(&sweep_json).unwrap_or_default()
+                    );
+                    trained
+                } else {
+                    crate::backend::active()
+                        .train(&snapshot, model, &layers, config)
+                        .map_err(|e| format!("{}: {e}", tr("training failed", "학습 실패")))?
+                };
                 print_train_report(&trained);
 
                 let source_var = node.name.clone().unwrap_or_else(|| match &node.source {
@@ -1589,6 +1607,55 @@ fn handle_model_decl(name: &str, layers: &[LayerKind]) {
         "[xazz:model] {}",
         serde_json::to_string(&model_json).unwrap_or_default()
     );
+}
+
+/// Prints a hyperparameter sweep table (D3) — one row per combination plus the winner.
+fn print_sweep_report(report: &crate::dl::SweepReport) {
+    println!("{}", "─".repeat(60));
+    println!(
+        "🔎  {} ({} {})",
+        tr("hyperparameter sweep", "하이퍼파라미터 스윕"),
+        report.combos.len(),
+        tr("combinations", "조합")
+    );
+    println!(
+        "  {:>3}  {:>6}  {:>7}  {:>10}  {:>12}  {:>10}",
+        "#",
+        tr("epochs", "에폭"),
+        tr("batch", "배치"),
+        tr("lr", "학습률"),
+        tr("val loss", "검증 손실"),
+        tr("train loss", "학습 손실")
+    );
+    for (i, c) in report.combos.iter().enumerate() {
+        let val = c
+            .final_val_loss
+            .map(|v| format!("{v:.6}"))
+            .unwrap_or_else(|| "-".to_string());
+        let mark = if i == report.best_index { " ★" } else { "" };
+        println!(
+            "  {:>3}  {:>6}  {:>7}  {:>10.6}  {:>12}  {:>10.6}{}",
+            i, c.epochs, c.batch_size, c.learning_rate, val, c.final_train_loss, mark
+        );
+        if c.stopped_early {
+            println!(
+                "       └─ {} (best epoch {})",
+                tr("stopped early", "조기 종료"),
+                c.best_epoch
+            );
+        }
+    }
+    if let Some(best) = report.combos.get(report.best_index) {
+        println!(
+            "★  {}: #{} (epochs={}, batch={}, lr={:.6})",
+            tr("best combination", "최적 조합"),
+            report.best_index,
+            best.epochs,
+            best.batch_size,
+            best.learning_rate
+        );
+    }
+    println!();
 }
 
 /// Prints the trained model's (TrainedModel) report to the console.

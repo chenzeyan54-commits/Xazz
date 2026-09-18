@@ -287,7 +287,7 @@ python benches/render_benchmark_chart.py        # 위 차트 재생성
 | `xazz new` | 샘플 CSV + 실행 가능한 예제가 포함된 프로젝트 생성 | Stable |
 | `xazz emit rust` | `.xzz` → Rust 소스 변환 (Polars LazyFrame + Burn) | Stable |
 | `xazz policy` | Policy-as-Code 가드레일 — 실행 전 개인정보·시크릿 유출 차단 | Stable |
-| `model {}` + `train()` | Burn 딥러닝 모델 선언·학습 (Adam + MSE, 체크포인트) | Stable |
+| `model {}` + `train()` | Burn 딥러닝 모델 선언·학습 (Adam + MSE, 검증 분할, 조기 종료, 하이퍼파라미터 스윕, 체크포인트) | Stable |
 | `withDp(epsilon:)` | 차등 프라이버시 노이즈 (laplace / gaussian) + 예산 추적 | Stable |
 | 내장 `chart {}` | 결과를 bar / line / pie / scatter로 렌더링 (HTML) | Stable |
 | `Option<T>` 타입 시스템 | 널 안전 컬럼 선언, `fillNull(strategy:)` | Stable |

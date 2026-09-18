@@ -462,7 +462,61 @@ impl Analyzer {
         }
     }
 
+    /// Validates the list-valued sweep axes of a `train()` config (D3).
+    ///
+    /// Emits a compile error for out-of-range values (`epochs`/`batch_size` < 1,
+    /// `lr` <= 0 or non-finite). Non-sweep configs are a no-op.
+    fn validate_train_sweep(&mut self, model_name: &str, config: &TrainConfig) {
+        if !config.is_sweep() {
+            return;
+        }
+        for &epochs in &config.sweep.epochs {
+            if epochs == 0 {
+                self.error(
+                    ErrorKind::Other("잘못된 하이퍼파라미터".to_string()),
+                    Some(model_name),
+                    if is_korean() {
+                        format!("train({model_name}) 스윕: epochs 값은 1 이상이어야 합니다.")
+                    } else {
+                        format!("train({model_name}) sweep: epochs values must be >= 1.")
+                    },
+                );
+            }
+        }
+        for &lr in &config.sweep.learning_rate {
+            if !(lr.is_finite() && lr > 0.0) {
+                self.error(
+                    ErrorKind::Other("잘못된 하이퍼파라미터".to_string()),
+                    Some(model_name),
+                    if is_korean() {
+                        format!(
+                            "train({model_name}) 스윕: lr 값은 0보다 큰 유한한 수여야 합니다. 실제: {lr}"
+                        )
+                    } else {
+                        format!(
+                            "train({model_name}) sweep: lr values must be finite and > 0. Got: {lr}"
+                        )
+                    },
+                );
+            }
+        }
+        for &bs in &config.sweep.batch_size {
+            if bs == 0 {
+                self.error(
+                    ErrorKind::Other("잘못된 하이퍼파라미터".to_string()),
+                    Some(model_name),
+                    if is_korean() {
+                        format!("train({model_name}) 스윕: batch_size 값은 1 이상이어야 합니다.")
+                    } else {
+                        format!("train({model_name}) sweep: batch_size values must be >= 1.")
+                    },
+                );
+            }
+        }
+    }
+
     fn check_train_stmt(&mut self, source_var: &str, model_name: &str, config: &TrainConfig) {
+        self.validate_train_sweep(model_name, config);
         if !self.vars.contains_key(source_var) {
             self.error(
                 ErrorKind::UndeclaredVariable(source_var.to_string()),
@@ -761,6 +815,7 @@ impl Analyzer {
         config: &TrainConfig,
         st: &mut PipelineCheckState,
     ) -> bool {
+        self.validate_train_sweep(model_name, config);
         if !self.models.contains_key(model_name) {
             self.error(
                 ErrorKind::Other("미선언 모델".to_string()),
@@ -1777,6 +1832,54 @@ mod tests {
              v pred = data |> predict(trained, as: \"pred\");",
         );
         assert!(r.is_ok(), "오류: {:?}", r.errors);
+    }
+
+    // ── D3 hyperparameter sweep validation ─────────────────────────────────────
+    #[test]
+    fn valid_train_sweep_no_error() {
+        let r = check(
+            "type X = { a: float, y: float };
+             model M { Dense(4) -> Dense(1) }
+             v data = load(\"x.csv\") :: X;
+             v trained = data |> train(M, target: \"y\", epochs: [5, 10], lr: [0.01, 0.001]);",
+        );
+        assert!(r.is_ok(), "오류: {:?}", r.errors);
+    }
+
+    #[test]
+    fn train_sweep_zero_epochs_is_error() {
+        let r = check(
+            "type X = { a: float, y: float };
+             model M { Dense(4) -> Dense(1) }
+             v data = load(\"x.csv\") :: X;
+             v trained = data |> train(M, target: \"y\", epochs: [0, 10]);",
+        );
+        assert!(r.is_err());
+        assert!(
+            err_kinds(&r)
+                .iter()
+                .any(|k| k.contains("잘못된 하이퍼파라미터")),
+            "스윕 오류 진단 없음: {:?}",
+            err_kinds(&r)
+        );
+    }
+
+    #[test]
+    fn train_sweep_nonpositive_lr_is_error() {
+        let r = check(
+            "type X = { a: float, y: float };
+             model M { Dense(4) -> Dense(1) }
+             v data = load(\"x.csv\") :: X;
+             v trained = data |> train(M, target: \"y\", lr: [0.01, 0.0]);",
+        );
+        assert!(r.is_err());
+        assert!(
+            err_kinds(&r)
+                .iter()
+                .any(|k| k.contains("잘못된 하이퍼파라미터")),
+            "스윕 lr 오류 진단 없음: {:?}",
+            err_kinds(&r)
+        );
     }
 
     #[test]

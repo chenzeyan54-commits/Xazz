@@ -289,6 +289,53 @@ pub struct TrainedModel {
     pub target: String,
 }
 
+/// One evaluated point of a hyperparameter sweep (D3).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SweepCombo {
+    pub epochs: usize,
+    pub batch_size: usize,
+    pub learning_rate: f32,
+    pub final_train_loss: f64,
+    pub final_val_loss: Option<f64>,
+    pub stopped_early: bool,
+    pub best_epoch: usize,
+    /// Whether this combination was selected as the sweep winner.
+    pub selected: bool,
+}
+
+/// Result of a grid-search hyperparameter sweep (D3).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SweepReport {
+    pub model_name: String,
+    pub target: String,
+    pub combos: Vec<SweepCombo>,
+    /// Index into `combos` of the selected (best) combination.
+    pub best_index: usize,
+}
+
+impl SweepReport {
+    /// Selection metric: validation loss when available, else training loss.
+    /// Non-finite losses rank last.
+    pub fn score(combo: &SweepCombo) -> f64 {
+        match combo.final_val_loss {
+            Some(v) if v.is_finite() => v,
+            _ if combo.final_train_loss.is_finite() => combo.final_train_loss,
+            _ => f64::INFINITY,
+        }
+    }
+}
+
+/// Persists an inference model to `path` (Burn appends the `.json` extension).
+pub fn save_checkpoint(model: &Mlp<Plain>, path: &str) -> Result<(), String> {
+    let recorder = PrettyJsonFileRecorder::<FullPrecisionSettings>::new();
+    model.clone().save_file(path, &recorder).map_err(|e| {
+        format!(
+            "{}: {e}",
+            tr("checkpoint save failed", "체크포인트 저장 실패")
+        )
+    })
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Public API
 // ─────────────────────────────────────────────────────────────────────────────

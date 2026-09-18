@@ -994,6 +994,10 @@ fn emit_dl_train_call(
             .to_string()
     };
 
+    if config.is_sweep() {
+        return emit_dl_sweep_call(source_var, model_name, config, &xs_norm, val_split);
+    }
+
     format!(
         r#"    // ── Deep Learning: run {source_var} |> train({model_name}, target: "{target}") ──────
     {{
@@ -1066,6 +1070,129 @@ fn emit_dl_train_call(
         std::fs::create_dir_all("checkpoints")?;
         valid.save_file(&format!("checkpoints/{model_name}"), &recorder)?;
         println!("[xazz] ✅ 체크포인트 저장 → checkpoints/{model_name}.json");
+    }}
+"#
+    )
+}
+
+/// `run <src> |> train(<Model>, epochs: [..], lr: [..], ...)` → grid-search code block.
+///
+/// Emits the same normalization preamble as the single-run path, then a loop over
+/// the cartesian-product combinations; each combo saves its own checkpoint and the
+/// lowest training loss is reported as the best.
+fn emit_dl_sweep_call(
+    source_var: &str,
+    model_name: &str,
+    config: &TrainConfig,
+    xs_norm: &str,
+    val_split: f64,
+) -> String {
+    let target = &config.target;
+    let combos = config.expand_sweep();
+    let combo_list = combos
+        .iter()
+        .map(|c| {
+            format!(
+                "({}, {:.10}f64, {})",
+                c.epochs,
+                c.learning_rate,
+                c.batch_size.unwrap_or(DEFAULT_BATCH_SIZE).max(1)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    format!(
+        r#"    // ── Deep Learning (sweep): run {source_var} |> train({model_name}, target: "{target}") ──────
+    {{
+        let (xs, ys, feature_count) = extract_xy(&{source_var}, "{target}")?;
+        let n = ys.len();
+        if n == 0 {{
+            return Err("학습 데이터가 비어 있습니다.".into());
+        }}
+
+        // NaN → mean imputation + standardization (per-feature z-score)
+        let mut fmean = vec![0f64; feature_count];
+        let mut fstd = vec![1f64; feature_count];
+        for j in 0..feature_count {{
+            let (mut s, mut c) = (0f64, 0usize);
+            for i in 0..n {{
+                let v = xs[i * feature_count + j] as f64;
+                if v.is_finite() {{ s += v; c += 1; }}
+            }}
+            fmean[j] = if c > 0 {{ s / c as f64 }} else {{ 0.0 }};
+        }}
+        for j in 0..feature_count {{
+            let (mut s, mut c) = (0f64, 0usize);
+            for i in 0..n {{
+                let d = xs[i * feature_count + j] as f64 - fmean[j];
+                if d.is_finite() {{ s += d * d; c += 1; }}
+            }}
+            fstd[j] = if c > 1 {{ (s / (c - 1) as f64).max(1e-8).sqrt() }} else {{ 1.0 }};
+        }}
+{xs_norm}
+        let tmean: f64 = {{
+            let (mut s, mut c) = (0f64, 0usize);
+            for &t in &ys {{ if t.is_finite() {{ s += t as f64; c += 1; }} }}
+            if c > 0 {{ s / c as f64 }} else {{ 0.0 }}
+        }};
+        let ys: Vec<f32> = ys
+            .iter()
+            .map(|&t| if t.is_finite() {{ t as f32 }} else {{ tmean as f32 }})
+            .collect();
+
+        let train_n = n - ((n as f64 * {val_split}) as usize);
+        let combos: Vec<(usize, f64, usize)> = vec![{combo_list}];
+        let mut best: Option<(f64, usize, f64, usize)> = None;
+        for (epochs, lr, batch_size) in combos {{
+            let device: Device<TrainBackend> = Default::default();
+            let mut model = {model_name}::<TrainBackend>::new(&device, feature_count);
+            let mut optim = AdamConfig::new().init::<TrainBackend, _>();
+            let mut last_loss = 0f32;
+            for epoch in 0..epochs {{
+                let mut loss_sum = 0f32;
+                let mut steps = 0usize;
+                for b in 0..((train_n + batch_size - 1) / batch_size) {{
+                    let start = b * batch_size;
+                    let end = ((b + 1) * batch_size).min(train_n);
+                    let (x, y) = make_both_tensors(&xs, &ys, feature_count, start, end, &device);
+                    let out = model.forward(x);
+                    let loss = ((out - y).powf_scalar(2.0)).mean();
+                    let lv = loss.clone().into_data().to_vec::<f32>().unwrap_or_default()[0];
+                    let grads = loss.backward();
+                    let grads = GradientsParams::from_grads(grads, &model);
+                    model = optim.step(lr, model, grads);
+                    loss_sum += lv;
+                    steps += 1;
+                }}
+                last_loss = if steps > 0 {{ loss_sum / steps as f32 }} else {{ 0.0 }};
+                println!(
+                    "[Epoch {{epoch:>3}}/{{}}]  train_loss(MSE) = {{:.6}}",
+                    epochs, last_loss
+                );
+            }}
+
+            let valid = model.valid();
+            let recorder = PrettyJsonFileRecorder::<FullPrecisionSettings>::new();
+            std::fs::create_dir_all("checkpoints")?;
+            valid.save_file(
+                &format!("checkpoints/{model_name}_{{}}_{{}}_{{}}", epochs, lr, batch_size),
+                &recorder,
+            )?;
+            println!(
+                "[xazz] combo epochs={{}} lr={{}} batch={{}} train_loss={{:.6}}",
+                epochs, lr, batch_size, last_loss
+            );
+            if best.map_or(true, |(loss, _, _, _)| (last_loss as f64) < loss) {{
+                best = Some((last_loss as f64, epochs, lr, batch_size));
+            }}
+        }}
+        if let Some((loss, epochs, lr, batch_size)) = best {{
+            println!(
+                "[xazz] ✅ best combo: epochs={{}} lr={{}} batch={{}} train_loss={{:.6}}",
+                epochs, lr, batch_size, loss
+            );
+        }}
     }}
 "#
     )
@@ -1390,6 +1517,23 @@ mod tests {
         assert!(out.contains("use burn::"), "burn import 없음");
         assert!(out.contains("struct M<B: Backend>"), "모델 구조체 없음");
         assert!(out.contains("Adam"), "Adam 옵티마이저 없음");
+    }
+
+    /// D3 sweep: list-valued train args emit a cartesian grid loop + best tracking.
+    #[test]
+    fn emit_rust_sweep_emits_combo_loop() {
+        let out = emit(
+            "type S = { a: float, y: float };
+             model M { Dense(4) -> Dense(1) }
+             v data = load(\"x.csv\") :: S;
+             run data |> train(M, target: \"y\", epochs: [3, 5], lr: [0.01, 0.001]);",
+        );
+        assert!(
+            out.contains("let combos: Vec<(usize, f64, usize)> = vec![(3,"),
+            "스윕 조합 목록 누락: {out}"
+        );
+        assert!(out.contains("(5,"), "두 번째 에폭 조합 누락: {out}");
+        assert!(out.contains("best combo"), "최적 조합 출력 누락: {out}");
     }
 
     #[test]

@@ -310,13 +310,52 @@ fn print_with_dp(args: &DpArgs) -> String {
 }
 
 fn print_train_args(model_name: &str, config: &TrainConfig) -> String {
+    let epochs = if config.sweep.epochs.is_empty() {
+        config.epochs.to_string()
+    } else {
+        format!(
+            "[{}]",
+            config
+                .sweep
+                .epochs
+                .iter()
+                .map(|e| e.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+    let lr = if config.sweep.learning_rate.is_empty() {
+        print_f64(config.learning_rate)
+    } else {
+        format!(
+            "[{}]",
+            config
+                .sweep
+                .learning_rate
+                .iter()
+                .map(|v| print_f64(*v))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
     let mut parts = vec![
         model_name.to_string(),
         format!("target: \"{}\"", escape(&config.target)),
-        format!("epochs: {}", config.epochs),
-        format!("lr: {}", print_f64(config.learning_rate)),
+        format!("epochs: {epochs}"),
+        format!("lr: {lr}"),
     ];
-    if let Some(bs) = config.batch_size {
+    if !config.sweep.batch_size.is_empty() {
+        parts.push(format!(
+            "batch_size: [{}]",
+            config
+                .sweep
+                .batch_size
+                .iter()
+                .map(|b| b.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    } else if let Some(bs) = config.batch_size {
         parts.push(format!("batch_size: {}", bs));
     }
     if let Some(vs) = config.validation_split {

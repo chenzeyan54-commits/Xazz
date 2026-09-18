@@ -9,6 +9,23 @@ Versioning: [Semantic Versioning](https://semver.org/)
 
 ## [Unreleased]
 
+### Added — D3 하이퍼파라미터 스윕 (그리드 서치, issue #64)
+
+- **`train()` 리스트 인자** — `epochs`/`lr`/`batch_size` 에 리스트를 넘기면
+  카티전 곱 그리드 서치로 전 조합을 학습한다. 예:
+  `train(M, target: "y", epochs: [10, 20], lr: [0.01, 0.001], batch_size: [16, 32])`.
+  단일 원소 리스트(`[0.05]`)는 기존 스칼라 인자로 취급된다. 파서는 빈 목록
+  `[]` 을 오류로 거부한다
+- **결과 보고** — 조합별 표(epochs/batch/lr/검증·학습 손실)와 `★ 최적 조합` 을
+  출력하고, `validation_split` 이 있으면 검증 손실, 없으면 학습 손실이 가장
+  낮은 조합을 선택한다. 선택된 모델이 이후 `predict()` 에 사용되며, 체크포인트도
+  최적 모델로 다시 저장된다. `[xazz:sweep]` JSON 마커로도 노출
+- **반영 범위**: AST(`SweepGrid`/`TrainConfig::expand_sweep`) → 파서 → 체커
+  (범위 검증: epochs/batch_size ≥ 1, lr > 0) → emitter(조합 루프 코드 생성) →
+  policy printer → 런타임(`ComputeBackend::sweep` 기본 메서드) → dl 체크포인트 재저장
+- 테스트: AST 전개, 파서 목록/빈 목록, 체커 유효·범위 오류, emitter 문자열,
+  xazz-exec CPU 백엔드 선택·E2E 스윕
+
 ### Added — v0.23 `agg([...])` 다중 집계 + `load()` sep/header 옵션
 
 - **`agg([...])`** — 한 번의 group/select 패스로 여러 집계를 계산하는 파이프라인

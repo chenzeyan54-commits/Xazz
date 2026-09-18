@@ -32,9 +32,9 @@ use std::sync::OnceLock;
 
 use polars::prelude::DataFrame;
 use xazz_compiler::ast::{LayerKind, TrainConfig};
-use xazz_core::i18n::is_korean;
+use xazz_core::i18n::{is_korean, tr};
 
-use crate::dl::TrainedModel;
+use crate::dl::{SweepCombo, SweepReport, TrainedModel};
 
 /// A pluggable ML engine behind the Typed IR's `MLOp` boundary.
 ///
@@ -62,6 +62,71 @@ pub trait ComputeBackend: Send + Sync {
         df: &DataFrame,
         as_col: Option<&str>,
     ) -> Result<DataFrame, String>;
+
+    /// `dataset |> train(model, ..)` over a hyperparameter grid (D3).
+    ///
+    /// The default implementation evaluates every combination via [`Self::train`]
+    /// and returns the best model plus a per-combination report. Selection uses
+    /// validation loss when a `validation_split` is configured, else training loss.
+    fn sweep(
+        &self,
+        df: &DataFrame,
+        model_name: &str,
+        layers: &[LayerKind],
+        config: &TrainConfig,
+    ) -> Result<(TrainedModel, SweepReport), String> {
+        let combos = config.expand_sweep();
+        let mut best: Option<(usize, TrainedModel)> = None;
+        let mut entries: Vec<SweepCombo> = Vec::with_capacity(combos.len());
+
+        for (index, combo) in combos.iter().enumerate() {
+            let trained = self.train(df, model_name, layers, combo)?;
+            let report = &trained.report;
+            let entry = SweepCombo {
+                epochs: report.epochs,
+                batch_size: report.batch_size,
+                learning_rate: report.learning_rate,
+                final_train_loss: report.final_train_loss,
+                final_val_loss: report.final_val_loss,
+                stopped_early: report.stopped_early,
+                best_epoch: report.best_epoch,
+                selected: false,
+            };
+            let is_better = match &best {
+                None => true,
+                Some((best_index, _)) => {
+                    SweepReport::score(&entry) < SweepReport::score(&entries[*best_index])
+                }
+            };
+            if is_better {
+                best = Some((index, trained));
+            }
+            entries.push(entry);
+        }
+
+        let (best_index, best_model) = best.ok_or_else(|| {
+            tr(
+                "hyperparameter sweep produced no combinations.",
+                "하이퍼파라미터 스윕 조합이 없습니다.",
+            )
+            .to_string()
+        })?;
+        entries[best_index].selected = true;
+
+        // Every combination re-trains onto the same checkpoint path, so the file
+        // left on disk is the last combination's. Re-save the winner so the
+        // checkpoint matches the model returned for downstream predict().
+        let base = best_model.report.checkpoint_path.trim_end_matches(".json");
+        crate::dl::save_checkpoint(&best_model.model, base)?;
+
+        let report = SweepReport {
+            model_name: model_name.to_string(),
+            target: config.target.clone(),
+            combos: entries,
+            best_index,
+        };
+        Ok((best_model, report))
+    }
 }
 
 /// Reference provider: Burn + burn-ndarray (pure-Rust CPU).
@@ -398,6 +463,7 @@ mod tests {
             batch_size: Some(3),
             validation_split: None,
             early_stopping_patience: None,
+            sweep: Default::default(),
         };
         (df, layers, config)
     }
@@ -495,6 +561,7 @@ mod tests {
             batch_size: Some(4),
             validation_split: None,
             early_stopping_patience: None,
+            sweep: Default::default(),
         };
 
         let (backend, warning) = resolve(None);
@@ -542,6 +609,7 @@ mod tests {
             batch_size: Some(4),
             validation_split: None,
             early_stopping_patience: None,
+            sweep: Default::default(),
         };
 
         let (backend, warning) = resolve(None);
@@ -556,6 +624,46 @@ mod tests {
         let out = backend
             .predict(&trained, &df, Some("pred"))
             .expect("cpu embedding predict");
+        assert_eq!(out.height(), df.height());
+        assert!(out.column("pred").is_ok());
+
+        cleanup(&trained.report.checkpoint_path);
+    }
+
+    /// D3 sweep: the grid is fully evaluated and the selected best model is usable.
+    #[test]
+    fn cpu_backend_sweep_selects_best_combination() {
+        let (df, layers, mut config) = tiny_dataset();
+        config.sweep.epochs = vec![2, 3];
+        config.sweep.learning_rate = vec![0.05, 0.01];
+        assert!(config.is_sweep());
+
+        let (backend, warning) = resolve(None);
+        assert!(warning.is_none());
+
+        let (trained, report) = backend
+            .sweep(&df, "backend_unit_sweep", &layers, &config)
+            .expect("cpu sweep");
+        assert_eq!(report.combos.len(), 4, "2×2 그리드");
+        assert!(
+            report.combos[report.best_index].selected,
+            "best_index 조합이 선택되어야 함"
+        );
+        assert_eq!(
+            report.combos.iter().filter(|c| c.selected).count(),
+            1,
+            "선택 조합은 하나여야 함"
+        );
+        assert!(
+            report.combos[report.best_index]
+                .final_train_loss
+                .is_finite(),
+            "최적 조합 손실이 유한해야 함"
+        );
+
+        let out = backend
+            .predict(&trained, &df, Some("pred"))
+            .expect("cpu sweep predict");
         assert_eq!(out.height(), df.height());
         assert!(out.column("pred").is_ok());
 

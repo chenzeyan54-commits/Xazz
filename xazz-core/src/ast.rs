@@ -405,6 +405,32 @@ impl LayerKind {
     }
 }
 
+/// Hyperparameter sweep grid (D3) — list-valued `train()` arguments.
+///
+/// Each non-empty vector is one axis of a full cartesian-product grid search;
+/// an empty vector means "use the scalar value on [`TrainConfig`]".
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct SweepGrid {
+    /// `epochs: [10, 20]`
+    pub epochs: Vec<usize>,
+    /// `lr: [0.01, 0.001]`
+    pub learning_rate: Vec<f64>,
+    /// `batch_size: [16, 32]`
+    pub batch_size: Vec<usize>,
+}
+
+impl SweepGrid {
+    /// Whether any axis was declared as a list.
+    pub fn is_empty(&self) -> bool {
+        self.epochs.is_empty() && self.learning_rate.is_empty() && self.batch_size.is_empty()
+    }
+
+    /// Number of combinations the grid expands to (at least 1).
+    pub fn len(&self) -> usize {
+        self.epochs.len().max(1) * self.learning_rate.len().max(1) * self.batch_size.len().max(1)
+    }
+}
+
 /// Training hyperparameter configuration
 #[derive(Debug, Clone, PartialEq)]
 pub struct TrainConfig {
@@ -421,6 +447,8 @@ pub struct TrainConfig {
     /// Early stopping: stop after this many epochs without validation-loss
     /// improvement (requires `validation_split`). None disables it (D3).
     pub early_stopping_patience: Option<usize>,
+    /// Hyperparameter sweep axes (D3). Empty when no list argument was given.
+    pub sweep: SweepGrid,
 }
 
 impl Default for TrainConfig {
@@ -432,7 +460,56 @@ impl Default for TrainConfig {
             batch_size: None,
             validation_split: None,
             early_stopping_patience: None,
+            sweep: SweepGrid::default(),
         }
+    }
+}
+
+impl TrainConfig {
+    /// Whether this config declares a hyperparameter sweep.
+    pub fn is_sweep(&self) -> bool {
+        !self.sweep.is_empty()
+    }
+
+    /// Expands the sweep grid into concrete configs (cartesian product).
+    ///
+    /// A non-sweep config expands to exactly one config equal to itself. The
+    /// returned configs always carry an empty [`SweepGrid`] so they can be run
+    /// directly.
+    pub fn expand_sweep(&self) -> Vec<TrainConfig> {
+        let epochs_axis = if self.sweep.epochs.is_empty() {
+            vec![self.epochs]
+        } else {
+            self.sweep.epochs.clone()
+        };
+        let lr_axis = if self.sweep.learning_rate.is_empty() {
+            vec![self.learning_rate]
+        } else {
+            self.sweep.learning_rate.clone()
+        };
+        let bs_axis: Vec<Option<usize>> = if self.sweep.batch_size.is_empty() {
+            vec![self.batch_size]
+        } else {
+            self.sweep.batch_size.iter().copied().map(Some).collect()
+        };
+
+        let mut out = Vec::with_capacity(epochs_axis.len() * lr_axis.len() * bs_axis.len());
+        for &epochs in &epochs_axis {
+            for &lr in &lr_axis {
+                for &bs in &bs_axis {
+                    out.push(TrainConfig {
+                        target: self.target.clone(),
+                        epochs,
+                        learning_rate: lr,
+                        batch_size: bs,
+                        validation_split: self.validation_split,
+                        early_stopping_patience: self.early_stopping_patience,
+                        sweep: SweepGrid::default(),
+                    });
+                }
+            }
+        }
+        out
     }
 }
 
@@ -620,5 +697,56 @@ mod tests {
         };
         let cloned = e.clone();
         assert_eq!(e, cloned);
+    }
+
+    // ── D3 hyperparameter sweep expansion ─────────────────────────────────────
+
+    /// A non-sweep config expands to exactly itself.
+    #[test]
+    fn test_expand_sweep_single() {
+        let config = TrainConfig {
+            target: "y".into(),
+            epochs: 7,
+            learning_rate: 0.02,
+            batch_size: Some(4),
+            ..Default::default()
+        };
+        assert!(!config.is_sweep());
+        let combos = config.expand_sweep();
+        assert_eq!(combos.len(), 1);
+        assert_eq!(combos[0].epochs, 7);
+        assert_eq!(combos[0].learning_rate, 0.02);
+        assert_eq!(combos[0].batch_size, Some(4));
+        assert!(!combos[0].is_sweep());
+    }
+
+    /// List axes expand to the full cartesian product.
+    #[test]
+    fn test_expand_sweep_cartesian() {
+        let mut config = TrainConfig {
+            target: "y".into(),
+            epochs: 99,
+            learning_rate: 0.5,
+            ..Default::default()
+        };
+        config.sweep.epochs = vec![10, 20];
+        config.sweep.learning_rate = vec![0.1, 0.01, 0.001];
+        assert!(config.is_sweep());
+        assert_eq!(config.sweep.len(), 6);
+
+        let combos = config.expand_sweep();
+        assert_eq!(combos.len(), 6);
+        assert!(combos.iter().all(|c| c.batch_size.is_none()));
+        assert!(combos.iter().all(|c| !c.is_sweep()));
+        assert!(
+            combos
+                .iter()
+                .any(|c| c.epochs == 10 && c.learning_rate == 0.001)
+        );
+        assert!(
+            combos
+                .iter()
+                .any(|c| c.epochs == 20 && c.learning_rate == 0.1)
+        );
     }
 }

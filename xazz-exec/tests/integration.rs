@@ -384,3 +384,32 @@ fn load_separator_and_header_options_end_to_end() {
     );
     assert_eq!(df.height(), 2, "2행 기대");
 }
+
+/// D3 hyperparameter sweep: list-valued train args train every combination and
+/// the best model is used for the downstream predict().
+#[test]
+fn train_hyperparameter_sweep_end_to_end() {
+    let dir = temp_dir();
+    write_csv(
+        &dir,
+        "x1,x2,y\n0,1,0\n1,1,1\n2,0,2\n3,0,3\n4,1,4\n5,1,5\n6,0,6\n7,0,7\n",
+    );
+    write_xzz(
+        &dir.join("data.csv"),
+        "type D = { x1: float, x2: float, y: float };
+         model M { Dense(4) -> ReLU() -> Dense(1) }
+         v data = load(\"data.csv\") :: D;
+         v m = data |> train(M, target: \"y\", epochs: [2, 3], lr: [0.05, 0.01], validation_split: 0.25);
+         v out = data |> predict(m, as: \"pred\") |> save(\"out.parquet\");",
+    );
+    let result = run_in_dir(&dir);
+    assert!(
+        result.is_ok(),
+        "하이퍼파라미터 스윕 실행 실패: {:?}",
+        result
+    );
+
+    let df = read_parquet(&dir.join("out.parquet"));
+    assert!(df.column("pred").is_ok(), "예측 컬럼 없음");
+    assert_eq!(df.height(), 8, "8행 기대");
+}

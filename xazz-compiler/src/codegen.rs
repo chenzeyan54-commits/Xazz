@@ -287,6 +287,15 @@ impl Codegen {
         lines.push(format!("// learning rate: {}", config.learning_rate));
         lines.push(format!("// batch size: {}", batch_str));
         lines.push(format!("// validation split: {}", val_str));
+        if config.is_sweep() {
+            lines.push(format!(
+                "// sweep: {} combination(s) (epochs: {:?}, lr: {:?}, batch_size: {:?})",
+                config.sweep.len(),
+                config.sweep.epochs,
+                config.sweep.learning_rate,
+                config.sweep.batch_size
+            ));
+        }
         lines.push(String::new());
         lines.push(format!(
             "// let mut model = {}::new(&device, input_dim);",

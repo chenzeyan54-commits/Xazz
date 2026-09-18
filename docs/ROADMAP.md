@@ -186,11 +186,16 @@ datasets. This track makes Xazz handle real workloads.
 - [x] **Embedding layer** — `Embedding(vocab_size, embed_dim)` in the `model {}`
       declaration (first layer only; raw category indices, no z-score), wired through
       parser/checker/emitter/dl; CPU E2E train/predict test added (2026-09-18)
-- [ ] Hyperparameter sweep, checkpoint versioning
+- [x] **Hyperparameter sweep** — list-valued `epochs`/`lr`/`batch_size` in `train()`
+      run a cartesian grid search; the best combination (validation loss when a
+      split is set, else training loss) is reported and kept for `predict()`
+      (2026-09-18)
+- [ ] Checkpoint versioning
 - Depends on: D1. Acceptance: a CNN pipeline trains end-to-end on image-style tabular data.
-  ⏳ **Partial 2026-09-11 / updated 2026-09-18**: early stopping, the Conv1d layer, and the
-  Embedding layer are shipped and verified end-to-end on CPU (early stopping + `best_epoch`;
-  Conv1d/Embedding CPU train/predict). Sweep remains.
+  ⏳ **Partial 2026-09-11 / updated 2026-09-18**: early stopping, the Conv1d layer,
+  the Embedding layer, and the hyperparameter sweep are shipped and verified end-to-end
+  on CPU (early stopping + `best_epoch`; Conv1d/Embedding CPU train/predict; sweep grid
+  selection). Checkpoint versioning remains.
 
 ---
 

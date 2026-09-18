@@ -292,6 +292,58 @@ impl Parser {
         })
     }
 
+    /// Parses a sweep-capable integer argument: either a scalar (`10`) or a
+    /// bracketed list (`[10, 20]`). An empty list is rejected.
+    fn parse_usize_list_or_scalar(&mut self) -> CompileResult<Vec<usize>> {
+        if self.eat(&TokenKind::LBracket) {
+            if matches!(self.current_kind(), TokenKind::RBracket) {
+                return Err(CompileError::new(
+                    ErrorKind::UnexpectedToken("]".into()),
+                    self.current_span(),
+                    "하이퍼파라미터 목록은 비어 있을 수 없습니다.",
+                ));
+            }
+            let mut vals = Vec::new();
+            loop {
+                vals.push(self.expect_number()? as usize);
+                if self.eat(&TokenKind::Comma) {
+                    continue;
+                }
+                break;
+            }
+            self.expect(&TokenKind::RBracket)?;
+            Ok(vals)
+        } else {
+            Ok(vec![self.expect_number()? as usize])
+        }
+    }
+
+    /// Parses a sweep-capable float argument: either a scalar (`0.01`) or a
+    /// bracketed list (`[0.01, 0.001]`). An empty list is rejected.
+    fn parse_float_list_or_scalar(&mut self) -> CompileResult<Vec<f64>> {
+        if self.eat(&TokenKind::LBracket) {
+            if matches!(self.current_kind(), TokenKind::RBracket) {
+                return Err(CompileError::new(
+                    ErrorKind::UnexpectedToken("]".into()),
+                    self.current_span(),
+                    "하이퍼파라미터 목록은 비어 있을 수 없습니다.",
+                ));
+            }
+            let mut vals = Vec::new();
+            loop {
+                vals.push(self.expect_float()?);
+                if self.eat(&TokenKind::Comma) {
+                    continue;
+                }
+                break;
+            }
+            self.expect(&TokenKind::RBracket)?;
+            Ok(vals)
+        } else {
+            Ok(vec![self.expect_float()?])
+        }
+    }
+
     /// Parses the named arguments of train() (called after consuming model_name).
     /// train_args = ("," named_arg)*
     /// named_arg = ("target" | "epochs" | "lr" | "batch_size" | "validation_split" | "patience") ":" literal
@@ -344,13 +396,28 @@ impl Parser {
                     };
                 }
                 "epochs" => {
-                    config.epochs = self.expect_number()? as usize;
+                    let vals = self.parse_usize_list_or_scalar()?;
+                    if vals.len() == 1 {
+                        config.epochs = vals[0];
+                    } else {
+                        config.sweep.epochs = vals;
+                    }
                 }
                 "lr" => {
-                    config.learning_rate = self.expect_float()?;
+                    let vals = self.parse_float_list_or_scalar()?;
+                    if vals.len() == 1 {
+                        config.learning_rate = vals[0];
+                    } else {
+                        config.sweep.learning_rate = vals;
+                    }
                 }
                 "batch_size" => {
-                    config.batch_size = Some(self.expect_number()? as usize);
+                    let vals = self.parse_usize_list_or_scalar()?;
+                    if vals.len() == 1 {
+                        config.batch_size = Some(vals[0]);
+                    } else {
+                        config.sweep.batch_size = vals;
+                    }
                 }
                 "validation_split" => {
                     config.validation_split = Some(self.expect_float()?);
@@ -2023,6 +2090,55 @@ type AirQuality = {
             }
             other => panic!("ModelDecl 예상, 실제: {:?}", other),
         }
+    }
+
+    // ── D3 hyperparameter sweep list arguments ────────────────────────────────
+    #[test]
+    fn test_train_sweep_list_parse() {
+        let src = r#"
+            model M { Dense(4) -> Dense(1) }
+            v data = load("x.csv") :: S;
+            run data |> train(M, target: "y", epochs: [10, 20], lr: [0.01, 0.001], batch_size: [8, 16]);
+        "#;
+        let program = parse_src(src).expect("파싱 실패");
+        match &program.stmts[2] {
+            Stmt::TrainStmt { config, .. } => {
+                assert_eq!(config.epochs, 10);
+                assert_eq!(config.sweep.epochs, vec![10, 20]);
+                assert_eq!(config.sweep.learning_rate, vec![0.01, 0.001]);
+                assert_eq!(config.sweep.batch_size, vec![8, 16]);
+                assert!(config.is_sweep());
+                assert_eq!(config.sweep.len(), 8);
+            }
+            other => panic!("TrainStmt 예상, 실제: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_train_single_element_list_is_scalar() {
+        let src = r#"
+            model M { Dense(1) }
+            v data = load("x.csv") :: S;
+            run data |> train(M, target: "y", lr: [0.05]);
+        "#;
+        let program = parse_src(src).expect("파싱 실패");
+        match &program.stmts[2] {
+            Stmt::TrainStmt { config, .. } => {
+                assert_eq!(config.learning_rate, 0.05);
+                assert!(!config.is_sweep());
+            }
+            other => panic!("TrainStmt 예상, 실제: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_train_empty_sweep_list_is_error() {
+        let src = r#"
+            model M { Dense(1) }
+            v data = load("x.csv") :: S;
+            run data |> train(M, target: "y", epochs: []);
+        "#;
+        assert!(parse_src(src).is_err());
     }
 
     #[test]
