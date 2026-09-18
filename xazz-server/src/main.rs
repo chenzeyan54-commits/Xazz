@@ -149,8 +149,14 @@ const TENANT_DP_BUDGET_ENV: &str = "XAZZ_TENANT_DP_BUDGET";
 const TENANT_DP_DELTA_BUDGET_ENV: &str = "XAZZ_TENANT_DP_DELTA_BUDGET";
 /// Per-tenant DP budget window length in seconds (0 = cumulative, no window).
 const TENANT_DP_WINDOW_ENV: &str = "XAZZ_TENANT_DP_WINDOW_SECS";
+/// How long a cross-instance DP reservation stays valid before it can be
+/// reclaimed by another instance (guards against a crashed run blocking a tenant).
+const DP_RESERVATION_TTL_ENV: &str = "XAZZ_DP_RESERVATION_TTL_SECS";
 const DEFAULT_TENANT_DP_BUDGET: f64 = 10.0;
 const DEFAULT_TENANT_DP_DELTA_BUDGET: f64 = 1e-4;
+/// Default reservation TTL: one hour is far longer than a normal run while still
+/// bounding how long a crashed instance can hold a tenant's envelope.
+const DEFAULT_DP_RESERVATION_TTL_SECS: u64 = 3600;
 
 /// Floor for the remaining budget handed to the runner. The runner's env parser
 /// ignores non-positive totals, so passing 0 would silently reset to its own
@@ -186,6 +192,20 @@ fn resolve_dp_window(raw: Option<&str>) -> u64 {
 fn tenant_dp_window_secs() -> u64 {
     let raw = std::env::var(TENANT_DP_WINDOW_ENV).ok();
     resolve_dp_window(raw.as_deref())
+}
+
+/// Parses the cross-instance DP reservation TTL. Invalid or `0` falls back to the
+/// default so a reservation can never become immediately reclaimable by accident.
+fn resolve_dp_reservation_ttl(raw: Option<&str>) -> u64 {
+    raw.and_then(|v| v.parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(DEFAULT_DP_RESERVATION_TTL_SECS)
+}
+
+/// Reads the DP reservation TTL from the environment.
+fn dp_reservation_ttl_secs() -> u64 {
+    let raw = std::env::var(DP_RESERVATION_TTL_ENV).ok();
+    resolve_dp_reservation_ttl(raw.as_deref())
 }
 
 /// A tenant's effective DP budget window and where it came from — issue C2.
@@ -224,6 +244,85 @@ fn dp_spend_from_marker(dp: &Option<Value>) -> Option<(f64, f64)> {
         .and_then(Value::as_f64)
         .unwrap_or(0.0);
     Some((epsilon, delta))
+}
+
+/// Releases a tenant's cross-instance DP reservation, billing only the run's
+/// actual `[xazz:dp]` spend (0 when the run used no `withDp`) — issue C2.
+///
+/// Never fatal: a failed settle leaves the reservation in place until its TTL
+/// expires, which is safer than dropping the response on an accounting hiccup.
+fn settle_dp_reservation(
+    store: &store::Store,
+    tenant: &str,
+    reservation: &store::DpReservation,
+    dp: &Option<Value>,
+    window_secs: u64,
+) {
+    let (epsilon, delta) = dp_spend_from_marker(dp).unwrap_or((0.0, 0.0));
+    if let Err(e) =
+        store.settle_dp_reservation(tenant, &reservation.id, epsilon, delta, window_secs)
+    {
+        eprintln!("[xazz] ⚠️ DP 예약 정산 실패: {e}");
+    }
+}
+
+/// RAII holder for a tenant's cross-instance DP reservation (issue C2).
+///
+/// A run's `[xazz:dp]` marker is only known after the runner exits, but the
+/// reservation must be released on *every* exit path (temp-file failure, missing
+/// executable, command error). `Drop` releases it with zero spend unless
+/// [`DpReservationGuard::settle`] billed the run's actual spend first.
+struct DpReservationGuard<'a> {
+    store: &'a store::Store,
+    tenant: &'a str,
+    reservation: store::DpReservation,
+    window_secs: u64,
+    settled: bool,
+}
+
+impl<'a> DpReservationGuard<'a> {
+    fn new(
+        store: &'a store::Store,
+        tenant: &'a str,
+        reservation: store::DpReservation,
+        window_secs: u64,
+    ) -> Self {
+        Self {
+            store,
+            tenant,
+            reservation,
+            window_secs,
+            settled: false,
+        }
+    }
+
+    /// Bills the run's actual `[xazz:dp]` spend and releases the reservation.
+    fn settle(&mut self, dp: &Option<Value>) {
+        settle_dp_reservation(
+            self.store,
+            self.tenant,
+            &self.reservation,
+            dp,
+            self.window_secs,
+        );
+        self.settled = true;
+    }
+}
+
+impl Drop for DpReservationGuard<'_> {
+    fn drop(&mut self) {
+        if !self.settled {
+            // An early return: release without billing (the run never produced a
+            // marker, or never started).
+            settle_dp_reservation(
+                self.store,
+                self.tenant,
+                &self.reservation,
+                &None,
+                self.window_secs,
+            );
+        }
+    }
 }
 
 // ── request / response types ─────────────────────────────────────────────────
@@ -637,6 +736,53 @@ async fn handle_execute(
             guardrail::Decision::Allow { report, .. } => report,
         };
 
+    // 0c. Cross-instance DP budget reservation (issue C2): the in-process tenant
+    //     lock above only serializes runs inside this server. The DB reservation
+    //     atomically claims the tenant's whole remaining envelope so a second
+    //     instance cannot hand the same budget to a concurrent run. It is released
+    //     on every exit path by the guard's Drop; actual spend is billed after the
+    //     run produces its `[xazz:dp]` marker.
+    let (total_eps, total_delta) = tenant_dp_envelope();
+    let window = effective_dp_window(&state.store, tenant_str(tenant.as_str()))
+        .map_err(|e| internal_err(format!("DP window 조회 실패: {e}")))?;
+    let reservation = state
+        .store
+        .reserve_dp_budget(
+            tenant_str(tenant.as_str()),
+            total_eps,
+            total_delta,
+            window.secs,
+            dp_reservation_ttl_secs(),
+        )
+        .map_err(|e| internal_err(format!("DP 예약 실패: {e}")))?;
+    let Some(reservation) = reservation else {
+        // Another instance holds this tenant's reservation → fail-closed, no queue.
+        return Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(ExecuteResponse {
+                success: false,
+                rows: json!([]),
+                schema: json!([]),
+                logs: vec![],
+                stdout: String::new(),
+                training: None,
+                dp: None,
+                diagnostics: None,
+                policy: None,
+                error: Some(
+                    "tenant already has an execution in flight; try again shortly".to_string(),
+                ),
+                run_id: None,
+            }),
+        ));
+    };
+    let mut dp_reservation = DpReservationGuard::new(
+        &state.store,
+        tenant_str(tenant.as_str()),
+        reservation,
+        window.secs,
+    );
+
     // 1. Save the DSL code to a temp .xzz file
     let tmp = tempfile::Builder::new()
         .suffix(".xzz")
@@ -654,24 +800,16 @@ async fn handle_execute(
     // 2. Locate the xazz.exe executable path
     let exe_path = find_xazz_exe().map_err(internal_err)?;
 
-    // 2b. Per-tenant DP budget isolation (issue C2): a tenant may only consume up
-    //     to its own cumulative envelope. The runner receives the *remaining*
-    //     budget, so cross-run composition is enforced by the existing DP
-    //     accounting (the runner refuses a `withDp` that would exceed it).
-    let (total_eps, total_delta) = tenant_dp_envelope();
-    let window = effective_dp_window(&state.store, tenant_str(tenant.as_str()))
-        .map_err(|e| internal_err(format!("DP window 조회 실패: {e}")))?;
-    let (spent_eps, spent_delta) = state
-        .store
-        .dp_spent(tenant_str(tenant.as_str()), window.secs)
-        .map_err(|e| internal_err(format!("DP 원장 조회 실패: {e}")))?;
-    let remaining_eps = (total_eps - spent_eps).max(MIN_REMAINING_BUDGET);
-    let remaining_delta = (total_delta - spent_delta).max(MIN_REMAINING_BUDGET);
+    // The runner receives the reserved remaining budget, so cross-run composition
+    // is enforced by the existing DP accounting (the runner refuses a `withDp`
+    // that would exceed it).
+    let remaining_eps = dp_reservation.reservation.epsilon.max(MIN_REMAINING_BUDGET);
+    let remaining_delta = dp_reservation.reservation.delta.max(MIN_REMAINING_BUDGET);
 
     // 3. Run xazz run <tmp.xzz>
     //    Only requests that pass the gate reach this point — tests verify with the counter.
     guardrail::note_runner_invocation();
-    let output = tokio::task::spawn_blocking(move || {
+    let output = match tokio::task::spawn_blocking(move || {
         Command::new(&exe_path)
             .arg("run")
             .arg(&tmp_path)
@@ -680,8 +818,12 @@ async fn handle_execute(
             .output()
     })
     .await
-    .map_err(|e| internal_err(format!("spawn_blocking 실패: {}", e)))?
-    .map_err(|e| internal_err(format!("xazz.exe 실행 실패: {}", e)))?;
+    {
+        Ok(Ok(output)) => output,
+        // The guard's Drop releases the reservation on these early returns.
+        Ok(Err(e)) => return Err(internal_err(format!("xazz.exe 실행 실패: {}", e))),
+        Err(e) => return Err(internal_err(format!("spawn_blocking 실패: {}", e))),
+    };
 
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -691,16 +833,9 @@ async fn handle_execute(
     // 4. Parse stdout: extract [xazz:result], [xazz:chart], [xazz:train], [xazz:dp] markers
     let (rows, schema, logs, training, dp, diagnostics) = parse_stdout_markers(&stdout, &stderr);
 
-    // 4b. Bill this run's DP consumption to the tenant's ledger (issue C2).
-    //     Only the marker's cumulative spend is billed; no withDp → nothing billed.
-    if let Some((eps, delta)) = dp_spend_from_marker(&dp)
-        && let Err(e) =
-            state
-                .store
-                .add_dp_spend(tenant_str(tenant.as_str()), eps, delta, window.secs)
-    {
-        eprintln!("[xazz] ⚠️ DP 원장 갱신 실패: {e}");
-    }
+    // 4b. Release the reservation, billing only this run's actual DP consumption
+    //     (issue C2). No withDp → nothing billed but the reservation is freed.
+    dp_reservation.settle(&dp);
 
     // 5. Auto-audit the execution history (trust infrastructure — persist all operation history)
     //    Even on failure, return the execution, logging only the audit-record failure as a warning.
@@ -1953,6 +2088,58 @@ v out = load(\"data/p.csv\") :: Patient |> select([name, patient_id, age_band]);
         );
     }
 
+    /// A tenant whose DP reservation is held by another instance is rejected with
+    /// 429 before the runner is invoked (issue C2, multi-instance).
+    #[tokio::test]
+    async fn execute_rejects_when_tenant_reservation_is_held() {
+        let state = test_state();
+        let tenant = format!("dp-res-{}", std::process::id());
+        // Model another server instance holding this tenant's reservation.
+        let held = state
+            .store
+            .reserve_dp_budget(&tenant, 10.0, 1e-4, 0, 3600)
+            .expect("reserve")
+            .expect("granted");
+
+        let before = guardrail::runner_invocations();
+        let result = handle_execute(
+            Extension(tenant.clone()),
+            State(state.clone()),
+            Json(ExecuteRequest {
+                code: "type P = { a: string }; v x = load(\"data/a.csv\") :: P;".to_string(),
+            }),
+        )
+        .await;
+
+        let (status, body) = result
+            .err()
+            .expect("execution proceeded despite a held reservation");
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert!(
+            body.0.error.as_deref().unwrap_or("").contains("in flight"),
+            "no error message: {:?}",
+            body.0.error
+        );
+        assert_eq!(
+            guardrail::runner_invocations(),
+            before,
+            "runner must not run while the reservation is held"
+        );
+
+        // Releasing the held reservation unblocks the tenant.
+        state
+            .store
+            .settle_dp_reservation(&tenant, &held.id, 0.0, 0.0, 0)
+            .expect("release");
+        assert!(
+            state
+                .store
+                .reserve_dp_budget(&tenant, 10.0, 1e-4, 0, 3600)
+                .expect("reserve after release")
+                .is_some()
+        );
+    }
+
     /// Same-tenant executions share one lock; different tenants do not (issue C2).
     #[tokio::test]
     async fn tenant_execution_locks_are_per_tenant() {
@@ -2105,6 +2292,24 @@ v x = load(\"examples/data/seoul_air_2024.csv\") :: AQ
         assert_eq!(resolve_dp_window(Some("0")), 0);
         assert_eq!(resolve_dp_window(Some("abc")), 0);
         assert_eq!(resolve_dp_window(Some("-5")), 0);
+    }
+
+    #[test]
+    fn resolve_dp_reservation_ttl_parses_and_defaults() {
+        assert_eq!(
+            resolve_dp_reservation_ttl(None),
+            DEFAULT_DP_RESERVATION_TTL_SECS
+        );
+        assert_eq!(resolve_dp_reservation_ttl(Some("120")), 120);
+        // 0/invalid would make a reservation instantly reclaimable → default.
+        assert_eq!(
+            resolve_dp_reservation_ttl(Some("0")),
+            DEFAULT_DP_RESERVATION_TTL_SECS
+        );
+        assert_eq!(
+            resolve_dp_reservation_ttl(Some("abc")),
+            DEFAULT_DP_RESERVATION_TTL_SECS
+        );
     }
 
     #[test]

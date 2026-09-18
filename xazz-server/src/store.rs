@@ -52,6 +52,11 @@ fn now_epoch() -> i64 {
 
 /// Creates the run-history and per-tenant DP-budget tables if missing (idempotent).
 fn ensure_schema(conn: &Connection) -> Result<(), String> {
+    // Multi-instance deployments share one SQLite file: without a busy timeout a
+    // concurrent writer fails immediately with SQLITE_BUSY instead of waiting for
+    // the other instance's short transaction (issue C2).
+    conn.busy_timeout(std::time::Duration::from_secs(5))
+        .map_err(|e| format!("failed to set sqlite busy timeout: {e}"))?;
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS runs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -87,6 +92,14 @@ fn ensure_schema(conn: &Connection) -> Result<(), String> {
             new_policy_json TEXT,
             changed_by TEXT NOT NULL DEFAULT '',
             changed_at INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS dp_reservation (
+            tenant TEXT PRIMARY KEY,
+            reservation_id TEXT NOT NULL,
+            reserved_epsilon REAL NOT NULL DEFAULT 0,
+            reserved_delta REAL NOT NULL DEFAULT 0,
+            reserved_at INTEGER NOT NULL DEFAULT 0,
+            expires_at INTEGER NOT NULL DEFAULT 0
         );",
     )
     .map_err(|e| format!("failed to create store schema: {e}"))?;
@@ -135,6 +148,21 @@ pub struct PolicyChangeRecord {
     pub changed_by: String,
     /// Unix epoch seconds
     pub changed_at: i64,
+}
+
+/// A reserved slice of a tenant's DP envelope for one in-flight run — issue C2.
+///
+/// The reservation reserves the tenant's *entire remaining* envelope so that a
+/// second server instance cannot hand the same budget to a concurrent run.
+/// `id` is an opaque token the holder passes back to
+/// [`Store::settle_dp_reservation`]; if the reservation expired and was
+/// reclaimed by another instance, the stale token matches nothing and the
+/// reclaiming reservation is left intact.
+#[derive(Debug, Clone, Serialize)]
+pub struct DpReservation {
+    pub id: String,
+    pub epsilon: f64,
+    pub delta: f64,
 }
 
 /// Holds the lazily-opened SQLite connection.
@@ -303,6 +331,11 @@ impl Store {
     ///
     /// `window_secs` behaves exactly as in [`Store::dp_spent`]: an elapsed window is
     /// rolled (zeroed) before the increment is applied.
+    ///
+    /// Retained as the direct accrual primitive; `/execute` now bills through
+    /// [`Store::settle_dp_reservation`] so the accrual and reservation release are
+    /// atomic. Tests use it to seed ledger state.
+    #[allow(dead_code)]
     pub fn add_dp_spend(
         &self,
         tenant: &str,
@@ -332,6 +365,136 @@ impl Store {
             params![tenant, epsilon, delta, now],
         )
         .map_err(|e| format!("failed to update dp budget: {e}"))?;
+        Ok(())
+    }
+
+    /// Atomically reserves a tenant's entire remaining DP envelope for one run — issue C2.
+    ///
+    /// The in-process per-tenant lock only serializes runs inside one server
+    /// process. Across instances the reservation is the cross-process lock: the
+    /// reserve is a single SQLite statement that reads the ledger and writes the
+    /// reservation together, so exactly one instance can hold a tenant's
+    /// reservation at a time. A second instance gets `Ok(None)` and must
+    /// fail-closed instead of handing the same budget to another run.
+    ///
+    /// An elapsed window is rolled before the remaining envelope is computed, and
+    /// a reservation whose `ttl_secs` has passed is reclaimed in the same
+    /// statement (so an instance that crashed mid-run cannot block the tenant
+    /// forever). Only the tenant's own reservation is considered; other tenants
+    /// are unaffected.
+    ///
+    /// Returns `Some(reservation)` with the reserved (remaining) ε/δ, or `None`
+    /// when another live reservation already holds the tenant.
+    pub fn reserve_dp_budget(
+        &self,
+        tenant: &str,
+        total_epsilon: f64,
+        total_delta: f64,
+        window_secs: u64,
+        ttl_secs: u64,
+    ) -> Result<Option<DpReservation>, String> {
+        if !total_epsilon.is_finite() || !total_delta.is_finite() {
+            return Err("dp envelope must be finite".to_string());
+        }
+        let guard = self.open()?;
+        let conn = guard.as_ref().expect("open guarantees Some");
+        let now = now_epoch();
+        // Roll an elapsed window first so "remaining" is computed against the
+        // current window. The reserve statement below is what serializes writers.
+        roll_dp_window(conn, tenant, window_secs, now)?;
+
+        let reservation_id = uuid::Uuid::new_v4().to_string();
+        let expires_at = now + ttl_secs.max(1) as i64;
+        // A single statement: insert the reservation only when no live one exists,
+        // computing the remaining envelope from the ledger. If an expired row is
+        // present the conflict clause overwrites it (that is the reclaim path).
+        let changed = conn
+            .execute(
+                "INSERT INTO dp_reservation
+                     (tenant, reservation_id, reserved_epsilon, reserved_delta, reserved_at, expires_at)
+                 SELECT ?1, ?2,
+                        MAX(?3 - COALESCE((SELECT spent_epsilon FROM dp_budget WHERE tenant = ?1), 0.0), 0.0),
+                        MAX(?4 - COALESCE((SELECT spent_delta   FROM dp_budget WHERE tenant = ?1), 0.0), 0.0),
+                        ?5, ?6
+                 WHERE NOT EXISTS (
+                     SELECT 1 FROM dp_reservation WHERE tenant = ?1 AND expires_at > ?5
+                 )
+                 ON CONFLICT(tenant) DO UPDATE SET
+                     reservation_id   = excluded.reservation_id,
+                     reserved_epsilon = excluded.reserved_epsilon,
+                     reserved_delta   = excluded.reserved_delta,
+                     reserved_at      = excluded.reserved_at,
+                     expires_at       = excluded.expires_at
+                 WHERE dp_reservation.expires_at <= ?5",
+                params![tenant, reservation_id, total_epsilon, total_delta, now, expires_at],
+            )
+            .map_err(|e| format!("failed to reserve dp budget: {e}"))?;
+
+        if changed == 0 {
+            return Ok(None);
+        }
+        conn.query_row(
+            "SELECT reservation_id, reserved_epsilon, reserved_delta
+             FROM dp_reservation WHERE tenant = ?1",
+            params![tenant],
+            |row| {
+                Ok(DpReservation {
+                    id: row.get(0)?,
+                    epsilon: row.get(1)?,
+                    delta: row.get(2)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(|e| format!("failed to read dp reservation: {e}"))
+    }
+
+    /// Releases a reservation and bills the run's *actual* spend in one transaction — issue C2.
+    ///
+    /// Only the reservation with the matching `reservation_id` is removed, so a
+    /// stale settle (its reservation was reclaimed after the TTL expired) cannot
+    /// release a newer holder's reservation. `epsilon`/`delta` are the spend the
+    /// run actually consumed (0 for a run with no `withDp`), and an elapsed window
+    /// is rolled before it is billed.
+    pub fn settle_dp_reservation(
+        &self,
+        tenant: &str,
+        reservation_id: &str,
+        epsilon: f64,
+        delta: f64,
+        window_secs: u64,
+    ) -> Result<(), String> {
+        if !epsilon.is_finite() || !delta.is_finite() {
+            return Err("dp spend must be finite".to_string());
+        }
+        let epsilon = epsilon.max(0.0);
+        let delta = delta.max(0.0);
+        let guard = self.open()?;
+        let conn = guard.as_ref().expect("open guarantees Some");
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| format!("failed to begin dp settle transaction: {e}"))?;
+        let now = now_epoch();
+        roll_dp_window(&tx, tenant, window_secs, now)?;
+        if epsilon != 0.0 || delta != 0.0 {
+            tx.execute(
+                "INSERT INTO dp_budget (tenant, spent_epsilon, spent_delta, window_started_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?4)
+                 ON CONFLICT(tenant) DO UPDATE SET
+                     spent_epsilon = spent_epsilon + excluded.spent_epsilon,
+                     spent_delta   = spent_delta   + excluded.spent_delta,
+                     updated_at    = excluded.updated_at",
+                params![tenant, epsilon, delta, now],
+            )
+            .map_err(|e| format!("failed to update dp budget: {e}"))?;
+        }
+        tx.execute(
+            "DELETE FROM dp_reservation WHERE tenant = ?1 AND reservation_id = ?2",
+            params![tenant, reservation_id],
+        )
+        .map_err(|e| format!("failed to release dp reservation: {e}"))?;
+        tx.commit()
+            .map_err(|e| format!("failed to commit dp settle transaction: {e}"))?;
         Ok(())
     }
 
@@ -1078,5 +1241,146 @@ mod tests {
         assert!(page(6).is_empty(), "offset past the end is empty");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn unique_db(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "xazz_store_{tag}_{}_{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("xazz.db")
+    }
+
+    /// A reservation holds the tenant's whole remaining envelope until settled,
+    /// and settling bills only the actual spend (issue C2, multi-instance).
+    #[test]
+    fn dp_reservation_serializes_and_settles_actual_spend() {
+        let db = unique_db("reserve");
+        let store = Store::open_at(&db);
+
+        // The first reservation takes the full remaining envelope.
+        let r1 = store
+            .reserve_dp_budget("a", 10.0, 1e-4, 0, 3600)
+            .expect("reserve")
+            .expect("first reservation granted");
+        assert!((r1.epsilon - 10.0).abs() < 1e-12);
+        assert!((r1.delta - 1e-4).abs() < 1e-15);
+
+        // A live reservation blocks a second one for the same tenant...
+        assert!(
+            store
+                .reserve_dp_budget("a", 10.0, 1e-4, 0, 3600)
+                .expect("reserve again")
+                .is_none()
+        );
+        // ...but not for other tenants (isolation).
+        assert!(
+            store
+                .reserve_dp_budget("b", 10.0, 1e-4, 0, 3600)
+                .expect("reserve b")
+                .is_some()
+        );
+
+        // Settling bills only the actual spend and frees the reservation.
+        store
+            .settle_dp_reservation("a", &r1.id, 2.5, 0.0, 0)
+            .expect("settle");
+        assert!((store.dp_spent("a", 0).expect("spent").0 - 2.5).abs() < 1e-12);
+        // Tenant b's reservation was untouched by a's spend.
+        assert!((store.dp_spent("b", 0).expect("spent b").0).abs() < 1e-12);
+
+        // The remaining envelope is available again.
+        let r2 = store
+            .reserve_dp_budget("a", 10.0, 1e-4, 0, 3600)
+            .expect("reserve after settle")
+            .expect("second reservation granted");
+        assert!((r2.epsilon - 7.5).abs() < 1e-12);
+
+        let _ = std::fs::remove_dir_all(db.parent().unwrap());
+    }
+
+    /// Two `Store`s over the same file model two server instances: only one can
+    /// hold a tenant's reservation at a time (issue C2, multi-instance).
+    #[test]
+    fn dp_reservation_is_exclusive_across_store_instances() {
+        let db = unique_db("reserve_x");
+        let store1 = Store::open_at(&db);
+        let store2 = Store::open_at(&db);
+
+        let r1 = store1
+            .reserve_dp_budget("a", 10.0, 1e-4, 0, 3600)
+            .expect("reserve 1")
+            .expect("instance 1 granted");
+        // The second instance sees the live reservation and must fail-closed.
+        assert!(
+            store2
+                .reserve_dp_budget("a", 10.0, 1e-4, 0, 3600)
+                .expect("reserve 2")
+                .is_none()
+        );
+
+        store1
+            .settle_dp_reservation("a", &r1.id, 1.0, 0.0, 0)
+            .expect("settle");
+
+        // Once released, the other instance can reserve what is left.
+        let r2 = store2
+            .reserve_dp_budget("a", 10.0, 1e-4, 0, 3600)
+            .expect("reserve after settle")
+            .expect("instance 2 granted");
+        assert!((r2.epsilon - 9.0).abs() < 1e-12);
+
+        let _ = std::fs::remove_dir_all(db.parent().unwrap());
+    }
+
+    /// An expired reservation is reclaimed by the next reserve, and a stale
+    /// settle cannot release the newer holder's reservation (issue C2).
+    #[test]
+    fn expired_dp_reservation_is_reclaimed_and_stale_settle_is_inert() {
+        let db = unique_db("reserve_ttl");
+        let store = Store::open_at(&db);
+
+        let stale = store
+            .reserve_dp_budget("a", 10.0, 1e-4, 0, 3600)
+            .expect("reserve")
+            .expect("granted");
+        // Age the reservation so its TTL has elapsed (simulates a crashed instance).
+        {
+            let conn = Connection::open(&db).expect("open raw");
+            conn.execute(
+                "UPDATE dp_reservation SET expires_at = 0 WHERE tenant = 'a'",
+                [],
+            )
+            .expect("expire reservation");
+        }
+
+        // The expired reservation is reclaimed and the full envelope is available.
+        let fresh = store
+            .reserve_dp_budget("a", 10.0, 1e-4, 0, 3600)
+            .expect("reclaim")
+            .expect("reclaimed");
+        assert!((fresh.epsilon - 10.0).abs() < 1e-12);
+        assert_ne!(fresh.id, stale.id);
+
+        // A stale settle still bills its run's spend, but must not release the
+        // fresh reservation.
+        store
+            .settle_dp_reservation("a", &stale.id, 3.0, 0.0, 0)
+            .expect("stale settle");
+        assert!((store.dp_spent("a", 0).expect("spent").0 - 3.0).abs() < 1e-12);
+        assert!(
+            store
+                .reserve_dp_budget("a", 10.0, 1e-4, 0, 3600)
+                .expect("reserve")
+                .is_none(),
+            "stale settle must not release the fresh holder's reservation"
+        );
+
+        let _ = std::fs::remove_dir_all(db.parent().unwrap());
     }
 }
