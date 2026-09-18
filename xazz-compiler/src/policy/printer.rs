@@ -106,7 +106,17 @@ fn print_source(source: &PipelineSource) -> String {
         PipelineSource::Load {
             file_path,
             schema_name,
-        } => format!("load(\"{}\") :: {}", escape(file_path), schema_name),
+            options,
+        } => {
+            let mut args = format!("\"{}\"", escape(file_path));
+            if let Some(sep) = options.separator {
+                args.push_str(&format!(", sep: \"{}\"", sep as char));
+            }
+            if let Some(header) = options.has_header {
+                args.push_str(&format!(", header: {}", header));
+            }
+            format!("load({}) :: {}", args, schema_name)
+        }
         PipelineSource::VarRef(name) => name.clone(),
     }
 }
@@ -137,6 +147,25 @@ pub fn print_op(op: &PipelineOp) -> String {
         PipelineOp::Median(col) => format!("median(\"{}\")", escape(col)),
         PipelineOp::Variance(col) => format!("variance(\"{}\")", escape(col)),
         PipelineOp::Std(col) => format!("std(\"{}\")", escape(col)),
+        PipelineOp::Agg(specs) => {
+            let args: Vec<String> = specs
+                .iter()
+                .map(|s| {
+                    let name = match s.func {
+                        crate::ast::AggFn::Sum => "sum",
+                        crate::ast::AggFn::Mean => "mean",
+                        crate::ast::AggFn::Min => "min",
+                        crate::ast::AggFn::Max => "max",
+                        crate::ast::AggFn::Count => "count",
+                        crate::ast::AggFn::Median => "median",
+                        crate::ast::AggFn::Variance => "variance",
+                        crate::ast::AggFn::Std => "std",
+                    };
+                    format!("{}(\"{}\")", name, escape(&s.col))
+                })
+                .collect();
+            format!("agg([{}])", args.join(", "))
+        }
         PipelineOp::OrderBy { col, desc } => {
             format!("orderBy(\"{}\", desc: {})", escape(col), desc)
         }

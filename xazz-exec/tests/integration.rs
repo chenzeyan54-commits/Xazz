@@ -12,8 +12,8 @@
 //    to avoid parallel collisions.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use xazz_exec::run_pipeline;
 
@@ -306,4 +306,81 @@ fn module_cyclic_import_fails_closed() {
         msg.contains("cyclic import") || msg.contains("MODULE ERROR"),
         "사이클 진단 메시지: {msg}"
     );
+}
+
+// ── v0.23: agg([...]) multi-aggregation + load() sep/header options ──────────
+
+/// Reads a Parquet artifact written by `save()` for content assertions.
+fn read_parquet(path: &Path) -> polars::prelude::DataFrame {
+    use polars::prelude::{ParquetReader, SerReader};
+    let file = std::fs::File::open(path).expect("parquet 열기 실패");
+    ParquetReader::new(file)
+        .finish()
+        .expect("parquet 파싱 실패")
+}
+
+/// `agg([...])` after `groupBy` runs as one pass and produces aliased columns.
+#[test]
+fn agg_list_multi_aggregation_in_one_pass() {
+    let dir = temp_dir();
+    write_csv(
+        &dir,
+        "station,pm10\ngangnam,80\ngangnam,40\nseocho,120\nseocho,100\n",
+    );
+    write_xzz(
+        &dir.join("data.csv"),
+        "type AQ = { station: string, pm10: float };
+         v s = load(\"data.csv\") :: AQ
+           |> groupBy(\"station\")
+           |> agg([min(\"pm10\"), mean(\"pm10\"), max(\"pm10\")])
+           |> save(\"out.parquet\");",
+    );
+    let result = run_in_dir(&dir);
+    assert!(result.is_ok(), "agg([...]) 실행 실패: {:?}", result);
+
+    let df = read_parquet(&dir.join("out.parquet"));
+    let names: Vec<String> = df
+        .get_column_names()
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    for expected in ["pm10_min", "pm10_mean", "pm10_max"] {
+        assert!(
+            names.contains(&expected.to_string()),
+            "{expected} 컬럼 없음: {names:?}"
+        );
+    }
+    assert_eq!(df.height(), 2, "station 그룹 2개 기대");
+}
+
+/// `load(sep:, header:)` parses a headerless, ';'-separated file end to end.
+#[test]
+fn load_separator_and_header_options_end_to_end() {
+    let dir = temp_dir();
+    // No header, ';'-separated — schema fields map by position.
+    std::fs::write(dir.join("data.csv"), "gangnam;80\nseocho;120\n").unwrap();
+    write_xzz(
+        &dir.join("data.csv"),
+        "type AQ = { station: string, pm10: float };
+         v s = load(\"data.csv\", sep: \";\", header: false) :: AQ
+           |> save(\"out.parquet\");",
+    );
+    let result = run_in_dir(&dir);
+    assert!(result.is_ok(), "load(sep, header) 실행 실패: {:?}", result);
+
+    let df = read_parquet(&dir.join("out.parquet"));
+    let names: Vec<String> = df
+        .get_column_names()
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    assert!(
+        names.contains(&"station".to_string()),
+        "station 컬럼 없음: {names:?}"
+    );
+    assert!(
+        names.contains(&"pm10".to_string()),
+        "pm10 컬럼 없음: {names:?}"
+    );
+    assert_eq!(df.height(), 2, "2행 기대");
 }

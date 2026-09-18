@@ -434,6 +434,15 @@ pub fn infer_shape(
                 cols.push(OutputColumn::agg(col));
                 shape.set_columns(cols);
             }
+            PipelineOp::Agg(specs) => {
+                shape.aggregated = true;
+                let mut cols: Vec<OutputColumn> =
+                    group_keys.iter().map(OutputColumn::raw).collect();
+                for spec in specs {
+                    cols.push(OutputColumn::agg(&spec.col));
+                }
+                shape.set_columns(cols);
+            }
             PipelineOp::Count(None) => {
                 shape.aggregated = true;
                 let mut cols: Vec<OutputColumn> =
@@ -960,6 +969,33 @@ mod tests {
             "v out = load(\"data/p.csv\") :: Patient
                |> groupBy(\"disease\")
                |> count(\"patient_id\")
+               |> withDp(epsilon: 1.0, mechanism: laplace, sensitivity: 1.0);",
+        );
+        assert!(
+            r.safe_to_execute,
+            "DP 적용 후에도 차단됨: {:?}",
+            r.violations
+        );
+    }
+
+    /// v0.23: an `agg([...])` over a sensitive group key also requires DP.
+    #[test]
+    fn sensitive_agg_list_requires_dp() {
+        assert!(blocked_by(
+            "v out = load(\"data/p.csv\") :: Patient
+               |> groupBy(\"disease\")
+               |> agg([count(\"age\"), mean(\"age\")]);",
+            RULE_AGGREGATE_WITHOUT_DP
+        ));
+    }
+
+    /// v0.23: the `agg([...])` aggregate passes once withDp is added.
+    #[test]
+    fn sensitive_agg_list_passes_with_dp() {
+        let r = report_for(
+            "v out = load(\"data/p.csv\") :: Patient
+               |> groupBy(\"disease\")
+               |> agg([count(\"age\"), mean(\"age\")])
                |> withDp(epsilon: 1.0, mechanism: laplace, sensitivity: 1.0);",
         );
         assert!(

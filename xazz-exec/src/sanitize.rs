@@ -100,7 +100,7 @@ const MAX_TOP_CATEGORIES: usize = 5;
 
 /// Runs the sanitization checks on a source file.
 pub fn sanitize_file(path: &str) -> Result<SanitizeReport, String> {
-    let df = crate::runtime::load_source_as_df(path)
+    let df = crate::runtime::load_source_as_df(path, &xazz_compiler::ast::LoadOptions::default())
         .map_err(|e| format!("failed to read '{}': {e}", path))?;
     Ok(sanitize_df(&df, path))
 }

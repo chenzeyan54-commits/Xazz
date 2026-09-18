@@ -23,7 +23,9 @@
 use std::collections::HashMap;
 use std::fs;
 
-use crate::ast::{Expr, LayerKind, PipelineOp, PipelineSource, Program, Stmt, TrainConfig};
+use crate::ast::{
+    Expr, LayerKind, LoadOptions, PipelineOp, PipelineSource, Program, Stmt, TrainConfig,
+};
 use crate::policy::printer::escape;
 use crate::{Codegen, Lexer, Parser, StructField};
 
@@ -31,6 +33,22 @@ use crate::{Codegen, Lexer, Parser, StructField};
 const DEFAULT_BATCH_SIZE: usize = 32;
 /// validation split ratio upper bound (the clamp in generated code).
 const MAX_VALIDATION_SPLIT: f64 = 0.9;
+
+/// Human-readable `load()` option suffix for comments, e.g. `, sep: ";", header: false`.
+fn load_options_comment(options: &LoadOptions) -> String {
+    let mut parts = Vec::new();
+    if let Some(sep) = options.separator {
+        parts.push(format!("sep: \"{}\"", sep as char));
+    }
+    if let Some(header) = options.has_header {
+        parts.push(format!("header: {}", header));
+    }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!(", {}", parts.join(", "))
+    }
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // ── public entry points ───────────────────────────────────────────────────────────────
@@ -214,17 +232,25 @@ fn generate_rust_src(
                 PipelineSource::Load {
                     file_path,
                     schema_name,
+                    options,
                 } => {
                     out.push_str(&format!(
-                        "    // load(\"{}\") :: {}\n",
+                        "    // load(\"{}\"{}) :: {}\n",
                         escape(file_path),
+                        load_options_comment(options),
                         schema_name
                     ));
+                    let separator = match options.separator {
+                        Some(sep) => format!("Some(b'\\x{:02x}')", sep),
+                        None => "None".to_string(),
+                    };
                     out.push_str(&format!(
-                        "    let {}{} = load_csv(\"{}\")? // :: {}\n",
+                        "    let {}{} = load_csv(\"{}\", {}, {})? // :: {}\n",
                         mut_kw,
                         var_name,
                         escape(file_path),
+                        options.has_header.unwrap_or(true),
+                        separator,
                         schema_name
                     ));
                     out.push_str("        .lazy()\n");
@@ -539,6 +565,30 @@ fn generate_rust_src(
                             out.push_str(&format!(
                                 "        .select([{}])  // |> std(\"{}\")\n",
                                 agg, agg_col
+                            ));
+                        }
+                    }
+                    // ── v0.23 agg([...]) — multi-aggregation in one pass ─────────────
+                    PipelineOp::Agg(specs) => {
+                        let aggs: Vec<String> = specs
+                            .iter()
+                            .map(|s| {
+                                crate::polars_text::agg_expr_to_polars_aliased(
+                                    crate::ir::AggKind::from(s.func),
+                                    &s.col,
+                                )
+                            })
+                            .collect();
+                        let joined = aggs.join(", ");
+                        if let Some(gc) = pending_group_col.take() {
+                            out.push_str(&format!(
+                                "        .group_by([col(\"{}\")])\n        .agg([{}])  // |> groupBy(\"{}\") |> agg([...])\n",
+                                escape(&gc), joined, gc
+                            ));
+                        } else {
+                            out.push_str(&format!(
+                                "        .select([{}])  // |> agg([...])\n",
+                                joined
                             ));
                         }
                     }
@@ -1021,6 +1071,11 @@ fn validate_op_columns(
         | PipelineOp::DropNull(col) => {
             check_col(col.as_str())?;
         }
+        PipelineOp::Agg(specs) => {
+            for spec in specs {
+                check_col(spec.col.as_str())?;
+            }
+        }
         PipelineOp::OrderBy { col, .. } => {
             check_col(col.as_str())?;
         }
@@ -1171,7 +1226,11 @@ fn edit_distance(a: &str, b: &str) -> usize {
 fn emit_csv_loader_fn() -> String {
     r#"/// EUC-KR(CP949) auto-detecting CSV loader
 /// Tries UTF-8 first, falls back to EUC-KR decoding (for Korean public data)
-fn load_csv(file_path: &str) -> Result<DataFrame, Box<dyn std::error::Error>> {
+fn load_csv(
+    file_path: &str,
+    has_header: bool,
+    separator: Option<u8>,
+) -> Result<DataFrame, Box<dyn std::error::Error>> {
     let raw_bytes = std::fs::read(file_path)?;
 
     // Try UTF-8 directly, fall back to EUC-KR(CP949) decoding
@@ -1183,13 +1242,17 @@ fn load_csv(file_path: &str) -> Result<DataFrame, Box<dyn std::error::Error>> {
         }
     };
 
+    let mut parse_opts = CsvParseOptions::default()
+        .with_null_values(Some(NullValues::AllColumnsSingle("-".into())));
+    if let Some(sep) = separator {
+        parse_opts = parse_opts.with_separator(sep);
+    }
+
     let cursor = Cursor::new(utf8_string.into_bytes());
     let df = CsvReadOptions::default()
         .with_infer_schema_length(Some(200))
-        .with_parse_options(
-            CsvParseOptions::default()
-                .with_null_values(Some(NullValues::AllColumnsSingle("-".into()))),
-        )
+        .with_has_header(has_header)
+        .with_parse_options(parse_opts)
         .into_reader_with_file_handle(cursor)
         .finish()?;
 
@@ -1337,6 +1400,63 @@ mod tests {
             out.contains(".select([col(\"a\")])"),
             "select 컬럼 생성 누락: {}",
             out
+        );
+    }
+
+    /// v0.23 agg([...]) with a preceding groupBy → group_by(...).agg([aliased...]).
+    #[test]
+    fn emit_rust_group_by_agg_list() {
+        let out = emit(
+            "type S = { g: string, val: float };
+             v p = load(\"x.csv\") :: S
+               |> groupBy(\"g\")
+               |> agg([min(\"val\"), mean(\"val\"), max(\"val\")]);",
+        );
+        assert!(
+            out.contains(".group_by([col(\"g\")])"),
+            "group_by 누락: {out}"
+        );
+        assert!(out.contains(".agg(["), ".agg([ 누락: {out}");
+        assert!(out.contains(".alias(\"val_min\")"), "alias 누락: {out}");
+        assert!(out.contains(".alias(\"val_mean\")"), "alias 누락: {out}");
+        assert!(out.contains(".alias(\"val_max\")"), "alias 누락: {out}");
+    }
+
+    /// v0.23 agg([...]) without a group → select([...]) aggregate.
+    #[test]
+    fn emit_rust_ungrouped_agg_list() {
+        let out = emit(
+            "type S = { g: string, val: float };
+             v p = load(\"x.csv\") :: S |> agg([mean(\"val\")]);",
+        );
+        assert!(
+            out.contains(".select([col(\"val\").mean().alias(\"val_mean\")])"),
+            "ungrouped agg 누락: {out}"
+        );
+    }
+
+    /// load(sep, header) options are emitted as reader builder calls.
+    #[test]
+    fn emit_rust_load_separator_and_header_options() {
+        let out = emit(
+            "type S = { g: string, val: float };
+             v p = load(\"x.csv\", sep: \";\", header: false) :: S;",
+        );
+        assert!(
+            out.contains("load_csv(\"x.csv\", false, Some(b'\\x3b'))"),
+            "load_csv 옵션 인자 누락: {out}"
+        );
+        assert!(
+            out.contains("separator: Option<u8>"),
+            "load_csv 시그니처 누락: {out}"
+        );
+        assert!(
+            out.contains(".with_separator(sep)"),
+            "with_separator 누락: {out}"
+        );
+        assert!(
+            out.contains(".with_has_header(has_header)"),
+            "with_has_header 누락: {out}"
         );
     }
 }

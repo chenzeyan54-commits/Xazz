@@ -10,7 +10,9 @@
 ///   - Data/ML/side effects are split into domain enums (DataOp/MLOp/SideOp), but
 ///     stored as a sequential `Step`-tagged sequence to **preserve pipeline order**.
 ///     (e.g. `filter |> withDp |> select` and `filter |> select |> withDp` differ.)
-use crate::ast::{BinOpKind, ChartConfig, DpArgs, JoinHow, LayerKind, SaveFormat, TrainConfig};
+use crate::ast::{
+    AggFn, BinOpKind, ChartConfig, DpArgs, JoinHow, LayerKind, LoadOptions, SaveFormat, TrainConfig,
+};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Column types / schema
@@ -166,6 +168,21 @@ pub enum AggKind {
     Std,
 }
 
+impl From<AggFn> for AggKind {
+    fn from(func: AggFn) -> Self {
+        match func {
+            AggFn::Sum => AggKind::Sum,
+            AggFn::Mean => AggKind::Mean,
+            AggFn::Min => AggKind::Min,
+            AggFn::Max => AggKind::Max,
+            AggFn::Count => AggKind::Count,
+            AggFn::Median => AggKind::Median,
+            AggFn::Variance => AggKind::Variance,
+            AggFn::Std => AggKind::Std,
+        }
+    }
+}
+
 /// Data-layer operations. Lowered to a Polars LazyFrame.
 #[derive(Debug, Clone, PartialEq)]
 pub enum DataOp {
@@ -177,6 +194,9 @@ pub enum DataOp {
         kind: AggKind,
         col: String,
     },
+    /// Multiple aggregations in a single pass (`agg([...])`), lowered to one
+    /// `group_by(...).agg([...])` (or `select([...])` when ungrouped).
+    AggList(Vec<(AggKind, String)>),
     Sort {
         col: String,
         desc: bool,
@@ -266,6 +286,8 @@ pub enum Source {
         file_path: String,
         /// Schema bound via `:: SchemaName` (None if absent).
         schema: Option<Schema>,
+        /// Parser options from `load(...)` (separator / header toggle).
+        options: LoadOptions,
     },
     /// Reference to an already-declared variable.
     Ref { var: String },

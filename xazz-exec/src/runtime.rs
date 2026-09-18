@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::fs;
 
 use crate::chart::{build_chart_spec, df_to_json_array, write_chart_html};
-use xazz_compiler::ast::{LayerKind, SaveFormat};
+use xazz_compiler::ast::{LayerKind, LoadOptions, SaveFormat};
 use xazz_compiler::ir::{ColType, MLOp, PipelineNode, Schema, SideOp, Source, Step as IrStep};
 use xazz_compiler::{Lexer, Parser};
 use xazz_core::i18n::{is_korean, tr};
@@ -595,6 +595,7 @@ fn validate_schema_types(df: &polars::frame::DataFrame, label: &str, schema: &Sc
 //                     eager EUC-KR decode fallback (small Korean public data).
 fn load_source_lazy(
     file_path: &str,
+    options: &LoadOptions,
 ) -> Result<polars::prelude::LazyFrame, Box<dyn std::error::Error>> {
     // DuckDB/PostgreSQL URIs produce an eager in-memory result — wrap in LazyFrame.
     if parse_duckdb_uri(file_path).is_some() {
@@ -625,10 +626,10 @@ fn load_source_lazy(
             // UTF-8 → true out-of-core scan_csv. Non-UTF-8 (EUC-KR/CP949) →
             // eager decode fallback (these files are small Korean public datasets).
             if String::from_utf8(raw_bytes.clone()).is_ok() {
-                load_csv_lazy(file_path)
+                load_csv_lazy(file_path, options)
             } else {
                 use polars::prelude::IntoLazy;
-                let df = load_csv_as_df_from_bytes(raw_bytes)?;
+                let df = load_csv_as_df_from_bytes(raw_bytes, options)?;
                 Ok(df.lazy())
             }
         }
@@ -641,6 +642,7 @@ fn load_source_lazy(
 /// Also the entry point for the sanitization checks (issue #72, F3).
 pub(crate) fn load_source_as_df(
     file_path: &str,
+    options: &LoadOptions,
 ) -> Result<polars::frame::DataFrame, Box<dyn std::error::Error>> {
     // DuckDB/PostgreSQL source URIs are not file paths — handle before extension dispatch.
     if parse_duckdb_uri(file_path).is_some() {
@@ -658,7 +660,7 @@ pub(crate) fn load_source_as_df(
     match ext.as_str() {
         "parquet" | "pq" => load_parquet_as_df(file_path),
         "arrow" | "ipc" | "feather" => load_arrow_as_df(file_path),
-        _ => load_csv_as_df_from_file(file_path),
+        _ => load_csv_as_df_from_file(file_path, options),
     }
 }
 
@@ -1114,6 +1116,7 @@ fn load_arrow_lazy(
 /// of materializing the whole file; null normalization mirrors load_csv_as_df.
 fn load_csv_lazy(
     file_path: &str,
+    options: &LoadOptions,
 ) -> Result<polars::prelude::LazyFrame, Box<dyn std::error::Error>> {
     use polars::prelude::{LazyCsvReader, LazyFileListReader, NullValues, PlRefPath, PlSmallStr};
 
@@ -1125,8 +1128,16 @@ fn load_csv_lazy(
         "N/A".into(),
     ];
 
-    LazyCsvReader::new(PlRefPath::new(file_path))
-        .with_infer_schema_length(Some(SCHEMA_INFERENCE_ROWS))
+    let mut reader = LazyCsvReader::new(PlRefPath::new(file_path))
+        .with_infer_schema_length(Some(SCHEMA_INFERENCE_ROWS));
+    if let Some(has_header) = options.has_header {
+        reader = reader.with_has_header(has_header);
+    }
+    if let Some(separator) = options.separator {
+        reader = reader.with_separator(separator);
+    }
+
+    reader
         .map_parse_options(move |p| {
             p.with_null_values(Some(NullValues::AllColumns(null_strings.clone())))
         })
@@ -1187,6 +1198,7 @@ fn collect_lazy(
 // ── CSV loader (automatic encoding handling + dirty-data null normalization) ──
 fn load_csv_as_df_from_bytes(
     raw_bytes: Vec<u8>,
+    options: &LoadOptions,
 ) -> Result<polars::frame::DataFrame, Box<dyn std::error::Error>> {
     use polars::prelude::{CsvParseOptions, CsvReadOptions, NullValues, SerReader};
     use std::io::Cursor;
@@ -1208,18 +1220,27 @@ fn load_csv_as_df_from_bytes(
         "N/A".into(),
     ]);
 
-    let cursor = Cursor::new(utf8_string.into_bytes());
-    let df = CsvReadOptions::default()
+    let mut parse_opts = CsvParseOptions::default().with_null_values(Some(null_vals));
+    if let Some(separator) = options.separator {
+        parse_opts = parse_opts.with_separator(separator);
+    }
+
+    let mut read_opts = CsvReadOptions::default()
         .with_infer_schema_length(Some(SCHEMA_INFERENCE_ROWS))
-        .with_parse_options(CsvParseOptions::default().with_null_values(Some(null_vals)))
-        .into_reader_with_file_handle(cursor)
-        .finish()?;
+        .with_parse_options(parse_opts);
+    if let Some(has_header) = options.has_header {
+        read_opts = read_opts.with_has_header(has_header);
+    }
+
+    let cursor = Cursor::new(utf8_string.into_bytes());
+    let df = read_opts.into_reader_with_file_handle(cursor).finish()?;
 
     Ok(df)
 }
 
 fn load_csv_as_df_from_file(
     file_path: &str,
+    options: &LoadOptions,
 ) -> Result<polars::frame::DataFrame, Box<dyn std::error::Error>> {
     let raw_bytes = std::fs::read(file_path).map_err(|e| {
         if is_korean() {
@@ -1228,7 +1249,7 @@ fn load_csv_as_df_from_file(
             format!("IO error: failed to read CSV file '{}' — {}", file_path, e)
         }
     })?;
-    load_csv_as_df_from_bytes(raw_bytes)
+    load_csv_as_df_from_bytes(raw_bytes, options)
 }
 
 // ── Single pipeline node execution (consumes Typed IR) ──────────────────
@@ -1249,7 +1270,11 @@ fn execute_node(
         Option<&Schema>,
         bool,
     ) = match &node.source {
-        Source::Load { file_path, schema } => {
+        Source::Load {
+            file_path,
+            schema,
+            options,
+        } => {
             let is_large = !source_is_small(file_path);
 
             if !is_large {
@@ -1257,7 +1282,7 @@ fn execute_node(
                 // Read the file once via the format-dispatched eager loader, validate
                 // in-memory, then wrap in LazyFrame. Avoids the lazy-scan plus a
                 // second disk pass for null-validation (which regressed small files).
-                let df_raw = load_source_as_df(file_path)?;
+                let df_raw = load_source_as_df(file_path, options)?;
                 let src_headers: Vec<String> = df_raw
                     .get_column_names()
                     .iter()
@@ -1280,7 +1305,7 @@ fn execute_node(
                 // Source stays a LazyFrame until the terminal collect; large files
                 // are never fully materialized upfront. Schema null-validation's
                 // eager collect is skipped (it would defeat out-of-core).
-                let mut lf_raw = load_source_lazy(file_path)?;
+                let mut lf_raw = load_source_lazy(file_path, options)?;
                 let src_headers: Vec<String> = lf_raw
                     .collect_schema()
                     .map_err(|e| format!("schema inference failed for '{}' — {}", file_path, e))?

@@ -202,6 +202,7 @@ impl<'src> Lexer<'src> {
             "median" => TokenKind::Median,
             "variance" => TokenKind::Variance,
             "std" => TokenKind::Std,
+            "agg" => TokenKind::Agg,
             "seed" => TokenKind::Seed,
             // ── v0.3 deep-learning keywords ───────────────────────────────
             "model" => TokenKind::Model,

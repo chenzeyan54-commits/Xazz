@@ -46,6 +46,26 @@ pub fn typed_expr_to_polars(expr: &TypedExpr) -> polars::prelude::Expr {
     }
 }
 
+/// Maps an aggregation kind + column to the corresponding Polars expression.
+fn agg_expr(kind: &AggKind, agg_col: &str) -> polars::prelude::Expr {
+    match kind {
+        AggKind::Count => col(agg_col).count(),
+        AggKind::Len => polars::prelude::len(),
+        AggKind::Sum => col(agg_col).sum(),
+        AggKind::Mean => col(agg_col).mean(),
+        AggKind::Min => col(agg_col).min(),
+        AggKind::Max => col(agg_col).max(),
+        AggKind::Median => col(agg_col).median(),
+        AggKind::Variance => col(agg_col).var(1),
+        AggKind::Std => col(agg_col).std(1),
+    }
+}
+
+/// Short suffix used to name `agg([...])` output columns (`<col>_<name>`).
+fn agg_kind_name(kind: &AggKind) -> &'static str {
+    xazz_compiler::polars_text::agg_kind_suffix(*kind)
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Operation lowering
 // ─────────────────────────────────────────────────────────────────────────────
@@ -83,24 +103,24 @@ pub fn lower_data(
             *pending_group = Some(group_col.clone());
         }
         DataOp::Aggregate { kind, col: agg_col } => {
-            let agg_expr: polars::prelude::Expr = match kind {
-                AggKind::Count => col(agg_col.as_str()).count(),
-                AggKind::Len => polars::prelude::len(),
-                AggKind::Sum => col(agg_col.as_str()).sum(),
-                AggKind::Mean => col(agg_col.as_str()).mean(),
-                AggKind::Min => col(agg_col.as_str()).min(),
-                AggKind::Max => col(agg_col.as_str()).max(),
-                AggKind::Median => col(agg_col.as_str()).median(),
-                AggKind::Variance => col(agg_col.as_str()).var(1),
-                AggKind::Std => col(agg_col.as_str()).std(1),
-            };
+            let expr = agg_expr(kind, agg_col);
             if let Some(group_col) = pending_group.take() {
-                *lf = lf
-                    .clone()
-                    .group_by([col(group_col.as_str())])
-                    .agg([agg_expr]);
+                *lf = lf.clone().group_by([col(group_col.as_str())]).agg([expr]);
             } else {
-                *lf = lf.clone().select([agg_expr]);
+                *lf = lf.clone().select([expr]);
+            }
+        }
+        DataOp::AggList(specs) => {
+            let exprs: Vec<polars::prelude::Expr> = specs
+                .iter()
+                .map(|(kind, agg_col)| {
+                    agg_expr(kind, agg_col).alias(format!("{}_{}", agg_col, agg_kind_name(kind)))
+                })
+                .collect();
+            if let Some(group_col) = pending_group.take() {
+                *lf = lf.clone().group_by([col(group_col.as_str())]).agg(exprs);
+            } else {
+                *lf = lf.clone().select(exprs);
             }
         }
         DataOp::Sort {

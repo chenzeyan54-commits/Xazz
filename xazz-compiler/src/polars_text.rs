@@ -101,6 +101,35 @@ pub fn agg_expr_to_polars(kind: crate::ir::AggKind, col: &str) -> String {
     format!("col(\"{}\").{}", escape(col), method)
 }
 
+/// Short suffix used to name `agg([...])` output columns (`<col>_<suffix>`).
+///
+/// Shared by the runtime lowering (xazz-exec) and the text backends so a
+/// multi-aggregation produces the same column names on both paths.
+pub fn agg_kind_suffix(kind: crate::ir::AggKind) -> &'static str {
+    match kind {
+        crate::ir::AggKind::Count => "count",
+        crate::ir::AggKind::Len => "len",
+        crate::ir::AggKind::Sum => "sum",
+        crate::ir::AggKind::Mean => "mean",
+        crate::ir::AggKind::Min => "min",
+        crate::ir::AggKind::Max => "max",
+        crate::ir::AggKind::Median => "median",
+        crate::ir::AggKind::Variance => "var",
+        crate::ir::AggKind::Std => "std",
+    }
+}
+
+/// Like [`agg_expr_to_polars`] but aliases the result to `<col>_<suffix>` so a
+/// multi-aggregation `agg([...])` does not emit duplicate column names.
+pub fn agg_expr_to_polars_aliased(kind: crate::ir::AggKind, col: &str) -> String {
+    format!(
+        "{}.alias(\"{}_{}\")",
+        agg_expr_to_polars(kind, col),
+        escape(col),
+        agg_kind_suffix(kind)
+    )
+}
+
 /// cast() target DSL type → Polars DataType source string (shared by codegen/emitter).
 ///
 /// Unknown types are returned as the original string (the checker has already handled errors).

@@ -138,6 +138,26 @@ pub struct ChartConfig {
     pub value: Option<String>,
 }
 
+/// Aggregation function for the multi-aggregate `agg([...])` operator (v0.23).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AggFn {
+    Sum,
+    Mean,
+    Min,
+    Max,
+    Count,
+    Median,
+    Variance,
+    Std,
+}
+
+/// A single aggregation spec inside `agg([...])`, e.g. `mean("measurement")`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AggSpec {
+    pub func: AggFn,
+    pub col: String,
+}
+
 /// Pipeline operation step
 #[derive(Debug, Clone, PartialEq)]
 pub enum PipelineOp {
@@ -194,6 +214,8 @@ pub enum PipelineOp {
     Variance(String),
     /// std("col") — standard deviation aggregation (v0.22)
     Std(String),
+    /// agg([min("c"), mean("c"), max("c")]) — multiple aggregations in one pass (v0.23)
+    Agg(Vec<AggSpec>),
     /// train(ModelName, target: "col", epochs: N, lr: F) — training operator (v0.5)
     Train {
         model_name: String,
@@ -301,13 +323,24 @@ impl Default for DpArgs {
     }
 }
 
+/// Parsing options for a `load()` source. All fields fall back to the backend
+/// default when `None` (comma separator, header row present).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct LoadOptions {
+    /// Field separator byte for delimited text (e.g. `b';'`). `None` = backend default (`,`).
+    pub separator: Option<u8>,
+    /// Whether the source has a header row. `None` = backend default (`true`).
+    pub has_header: Option<bool>,
+}
+
 /// Pipeline source (data origin)
 #[derive(Debug, Clone, PartialEq)]
 pub enum PipelineSource {
-    /// load("file_path") :: SchemaName
+    /// load("file_path", sep: ";", header: false) :: SchemaName
     Load {
         file_path: String,
         schema_name: String,
+        options: LoadOptions,
     },
     /// Reference to an already-declared variable
     VarRef(String),

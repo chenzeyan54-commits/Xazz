@@ -9,6 +9,22 @@ Versioning: [Semantic Versioning](https://semver.org/)
 
 ## [Unreleased]
 
+### Added — v0.23 `agg([...])` 다중 집계 + `load()` sep/header 옵션
+
+- **`agg([...])`** — 한 번의 group/select 패스로 여러 집계를 계산하는 파이프라인
+  연산자. `groupBy("station") |> agg([min("pm10"), mean("pm10"), max("pm10")])`
+  처럼 사용하며, 각 결과 컬럼은 `<col>_<agg>` 로 aliasing 된다
+  (`pm10_min`, `pm10_mean`, `pm10_max`). 그룹이 없으면 `select([...])` 로 축약된다.
+  `sum`/`mean`/`min`/`max`/`count`/`median`/`variance`/`std` 지원, 빈 목록·미지원
+  함수·비숫자형 집계는 진단(오류/경고)으로 처리
+- **`load(..., sep: ";", header: false)`** — CSV 파서 옵션 named argument. `sep:`/
+  `separator:`(1바이트), `header:`/`hasHeader:`(true/false)를 지원하며 런타임·emitter
+  양쪽 CSV 리더에 반영. 헤더가 없어도 `:: Schema` 로 위치 기반 컬럼 매핑
+- 반영 범위: AST/토큰/파서 → IR → 체커 → codegen/emitter → 런타임(lower) →
+  policy(shape/lineage) → catalog
+- 테스트: 파서 AST/별칭/오류, 체커 lowering/누락컬럼/경고, codegen·emitter 문자열,
+  policy DP 규칙, xazz-exec E2E(집계 컬럼·sep/header 파싱)
+
 ### Added — D3 Conv1d 레이어 (CNN, issue #64)
 
 - **`Conv1d(out_channels, kernel_size)`** — `model {}` 선언에서 1D 합성곱 레이어 지원.

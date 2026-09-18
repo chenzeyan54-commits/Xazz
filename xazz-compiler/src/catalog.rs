@@ -149,6 +149,15 @@ fn apply_data_op(op: &DataOp, provenance: &mut Vec<(String, Vec<String>, usize)>
             }
         }
 
+        // AggList — each aggregation's source column becomes lineage.
+        AggList(specs) => {
+            for (_, col) in specs {
+                if !provenance.iter().any(|(c, _, _)| c == col) {
+                    provenance.push((col.clone(), vec![col.clone()], step_idx));
+                }
+            }
+        }
+
         // Join — merge the other side's columns. We don't have the other side's
         // schema here (it's a variable ref), so provenance for joined columns
         // is best-effort: keep existing columns, mark join keys.
@@ -205,6 +214,7 @@ mod tests {
             source: crate::ir::Source::Load {
                 file_path: "d.csv".into(),
                 schema: None,
+                options: Default::default(),
             },
             input_schema: Some(input),
             output_schema: Schema::default(),

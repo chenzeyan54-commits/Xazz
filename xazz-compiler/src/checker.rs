@@ -19,8 +19,8 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::ast::{
-    BinOpKind, ChartConfig, DpArgs, Expr, FillNullValue, JoinHow, LayerKind, PipelineOp,
-    PipelineSource, Program, Stmt, StructField, TrainConfig,
+    AggFn, AggSpec, BinOpKind, ChartConfig, DpArgs, Expr, FillNullValue, JoinHow, LayerKind,
+    PipelineOp, PipelineSource, Program, Stmt, StructField, TrainConfig,
 };
 use crate::error::{CompileError, ErrorKind};
 use crate::ir;
@@ -586,6 +586,7 @@ impl Analyzer {
             PipelineSource::Load {
                 file_path,
                 schema_name,
+                options,
             } => {
                 let schema_ir = self
                     .schemas
@@ -623,6 +624,7 @@ impl Analyzer {
                     ir::Source::Load {
                         file_path: file_path.clone(),
                         schema: schema_ir,
+                        options: options.clone(),
                     },
                 )
             }
@@ -688,6 +690,7 @@ impl Analyzer {
             | PipelineOp::Median(_)
             | PipelineOp::Variance(_)
             | PipelineOp::Std(_) => self.check_aggregate_op(op, st),
+            PipelineOp::Agg(specs) => self.check_agg_list_op(specs, st),
             PipelineOp::Count(None) => self.check_count_all_op(st),
             PipelineOp::OrderBy { col, desc } => self.check_orderby_op(col, *desc, st),
             PipelineOp::Take(n) => self.check_take_op(*n, st),
@@ -824,6 +827,17 @@ impl Analyzer {
         st.pending_group = None;
         st.steps
             .push(ir::Step::Data(ir::DataOp::Aggregate { kind, col: agg_col }));
+        false
+    }
+
+    fn check_agg_list_op(&mut self, specs: &[AggSpec], st: &mut PipelineCheckState) -> bool {
+        let mut lowered = Vec::with_capacity(specs.len());
+        for spec in specs {
+            self.check_agg_column(&spec.col, &st.cols);
+            lowered.push((agg_kind_from_fn(spec.func), spec.col.clone()));
+        }
+        st.pending_group = None;
+        st.steps.push(ir::Step::Data(ir::DataOp::AggList(lowered)));
         false
     }
 
@@ -1445,6 +1459,20 @@ fn fill_value_ir(value: &FillNullValue) -> ir::FillValue {
     }
 }
 
+/// Maps an AST aggregate function to its IR kind.
+fn agg_kind_from_fn(func: AggFn) -> ir::AggKind {
+    match func {
+        AggFn::Sum => ir::AggKind::Sum,
+        AggFn::Mean => ir::AggKind::Mean,
+        AggFn::Min => ir::AggKind::Min,
+        AggFn::Max => ir::AggKind::Max,
+        AggFn::Count => ir::AggKind::Count,
+        AggFn::Median => ir::AggKind::Median,
+        AggFn::Variance => ir::AggKind::Variance,
+        AggFn::Std => ir::AggKind::Std,
+    }
+}
+
 /// Extracts an aggregate operator → (AggKind, column name).
 fn aggregate_kind_col(op: &PipelineOp) -> (ir::AggKind, String) {
     match op {
@@ -1628,6 +1656,70 @@ mod tests {
         );
         reset_lang();
         assert!(r.is_ok());
+        assert!(
+            r.warnings.iter().any(|w| w.message.contains("숫자형")),
+            "문자열 집계 경고 없음: {:?}",
+            r.warnings
+        );
+    }
+
+    // ── v0.23 agg([...]) multi-aggregation ─────────────────────────────────────
+    #[test]
+    fn agg_list_lowers_to_agglist_step() {
+        let (check, ir) = analyze(
+            "type X = { g: string, val: float };
+             v p = load(\"x.csv\") :: X
+               |> groupBy(\"g\")
+               |> agg([min(\"val\"), mean(\"val\"), max(\"val\")]);",
+        );
+        assert!(check.is_ok(), "오류: {:?}", check.errors);
+        let p = &ir.pipelines[0];
+        assert_eq!(p.steps[0], ir::Step::Data(ir::DataOp::GroupBy("g".into())));
+        assert_eq!(
+            p.steps[1],
+            ir::Step::Data(ir::DataOp::AggList(vec![
+                (ir::AggKind::Min, "val".into()),
+                (ir::AggKind::Mean, "val".into()),
+                (ir::AggKind::Max, "val".into()),
+            ]))
+        );
+    }
+
+    #[test]
+    fn agg_list_satisfies_group_by_aggregation_requirement() {
+        // A groupBy followed by agg([...]) must not raise the "groupBy 후 집계" error.
+        let r = check(
+            "type X = { g: string, val: float };
+             v p = load(\"x.csv\") :: X |> groupBy(\"g\") |> agg([count(\"val\")]);",
+        );
+        assert!(r.is_ok(), "오류: {:?}", r.errors);
+    }
+
+    #[test]
+    fn agg_list_missing_column_is_error() {
+        let r = check(
+            "type X = { g: string, val: float };
+             v p = load(\"x.csv\") :: X |> groupBy(\"g\") |> agg([mean(\"nope\")]);",
+        );
+        assert!(r.is_err());
+        assert!(
+            err_kinds(&r)
+                .iter()
+                .any(|k| k.contains("SafeLoadViolation")),
+            "누락 컬럼 진단: {:?}",
+            err_kinds(&r)
+        );
+    }
+
+    #[test]
+    fn agg_list_on_string_warns() {
+        set_lang(Lang::Ko);
+        let r = check(
+            "type X = { g: string, val: float };
+             v p = load(\"x.csv\") :: X |> groupBy(\"g\") |> agg([min(\"g\"), mean(\"val\")]);",
+        );
+        reset_lang();
+        assert!(r.is_ok(), "오류: {:?}", r.errors);
         assert!(
             r.warnings.iter().any(|w| w.message.contains("숫자형")),
             "문자열 집계 경고 없음: {:?}",

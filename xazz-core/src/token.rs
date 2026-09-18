@@ -138,6 +138,8 @@ pub enum TokenKind {
     Variance,
     /// std  (standard deviation aggregation)
     Std,
+    /// agg  (multi-aggregate operation — agg([min("c"), mean("c"), max("c")]))
+    Agg,
     /// seed  (named argument of sample)
     Seed,
 

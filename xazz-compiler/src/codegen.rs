@@ -15,7 +15,8 @@
 ///     `crate::polars_text` (shared by this module and emitter.rs).
 ///   - The runtime op→Polars mapping exists in only one place: xazz-exec/src/lower.rs (Typed IR).
 use crate::ast::{
-    BinOpKind, Expr, LayerKind, PipelineOp, PipelineSource, Program, Stmt, TrainConfig,
+    AggFn, BinOpKind, Expr, LayerKind, LoadOptions, PipelineOp, PipelineSource, Program, Stmt,
+    TrainConfig,
 };
 
 /// Code generator — unit struct
@@ -25,6 +26,48 @@ pub struct Codegen;
 /// (escapes `"` and `\` to prevent generated code injection)
 fn esc(s: &str) -> String {
     crate::policy::printer::escape(s)
+}
+
+/// Human-readable `load()` option suffix for comments, e.g. `, sep: ";", header: false`.
+fn load_options_comment(options: &LoadOptions) -> String {
+    let mut parts = Vec::new();
+    if let Some(sep) = options.separator {
+        parts.push(format!("sep: \"{}\"", sep as char));
+    }
+    if let Some(header) = options.has_header {
+        parts.push(format!("header: {}", header));
+    }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!(", {}", parts.join(", "))
+    }
+}
+
+/// DSL name of an aggregate function (for comments / round-trip text).
+fn agg_fn_name(func: AggFn) -> &'static str {
+    match func {
+        AggFn::Sum => "sum",
+        AggFn::Mean => "mean",
+        AggFn::Min => "min",
+        AggFn::Max => "max",
+        AggFn::Count => "count",
+        AggFn::Median => "median",
+        AggFn::Variance => "variance",
+        AggFn::Std => "std",
+    }
+}
+
+/// Emits `.with_has_header(...)` / `.with_separator(...)` calls for generated Rust.
+fn load_reader_options(options: &LoadOptions) -> String {
+    let mut out = format!(
+        "\n  .with_has_header({})",
+        options.has_header.unwrap_or(true)
+    );
+    if let Some(sep) = options.separator {
+        out.push_str(&format!("\n  .with_separator(b'\\x{:02x}')", sep));
+    }
+    out
 }
 
 impl Codegen {
@@ -95,8 +138,14 @@ impl Codegen {
             PipelineSource::Load {
                 file_path,
                 schema_name,
+                options,
             } => {
-                format!("load(\"{}\") :: {}", file_path, schema_name)
+                format!(
+                    "load(\"{}\"{}) :: {}",
+                    file_path,
+                    load_options_comment(options),
+                    schema_name
+                )
             }
             PipelineSource::VarRef(name) => {
                 format!("{} (varref)", name)
@@ -113,6 +162,7 @@ impl Codegen {
             PipelineSource::Load {
                 file_path,
                 schema_name,
+                options,
             } => {
                 lines.push(format!(
                     "let {} = LazyCsvReader::new(\"{}\")  // :: {}",
@@ -120,7 +170,7 @@ impl Codegen {
                     esc(file_path),
                     schema_name
                 ));
-                lines.push("  .with_has_header(true)".into());
+                lines.push(load_reader_options(options));
                 lines.push("  .finish()?".into());
             }
             PipelineSource::VarRef(src_var) => {
@@ -151,8 +201,14 @@ impl Codegen {
             PipelineSource::Load {
                 file_path,
                 schema_name,
+                options,
             } => {
-                format!("load(\"{}\") :: {}", file_path, schema_name)
+                format!(
+                    "load(\"{}\"{}) :: {}",
+                    file_path,
+                    load_options_comment(options),
+                    schema_name
+                )
             }
             PipelineSource::VarRef(name) => {
                 format!("{} (varref)", name)
@@ -164,13 +220,14 @@ impl Codegen {
             PipelineSource::Load {
                 file_path,
                 schema_name,
+                options,
             } => {
                 lines.push(format!(
                     "let _expr_result = LazyCsvReader::new(\"{}\")  // :: {}",
                     esc(file_path),
                     schema_name
                 ));
-                lines.push("  .with_has_header(true)".into());
+                lines.push(load_reader_options(options));
                 lines.push("  .finish()?".into());
             }
             PipelineSource::VarRef(src_var) => {
@@ -467,6 +524,26 @@ impl Codegen {
                     agg_col
                 )
             }
+            PipelineOp::Agg(specs) => {
+                let exprs: Vec<String> = specs
+                    .iter()
+                    .map(|s| {
+                        crate::polars_text::agg_expr_to_polars_aliased(
+                            crate::ir::AggKind::from(s.func),
+                            &s.col,
+                        )
+                    })
+                    .collect();
+                let dsl_args: Vec<String> = specs
+                    .iter()
+                    .map(|s| format!("{}(\"{}\")", agg_fn_name(s.func), s.col))
+                    .collect();
+                format!(
+                    "  .agg([{}])  // |> agg([{}])",
+                    exprs.join(", "),
+                    dsl_args.join(", ")
+                )
+            }
             PipelineOp::Train { model_name, config } => format!(
                 "  // |> train({}, target: \"{}\", epochs: {}, lr: {})  → trained model variable",
                 model_name, config.target, config.epochs, config.learning_rate
@@ -552,8 +629,8 @@ impl Default for Codegen {
 mod tests {
     use super::*;
     use crate::ast::{
-        BinOpKind, ChartConfig, ChartType, Expr, FillNullValue, JoinHow, PipelineOp,
-        PipelineSource, Program, Stmt, StructField,
+        AggFn, AggSpec, BinOpKind, ChartConfig, ChartType, Expr, FillNullValue, JoinHow,
+        PipelineOp, PipelineSource, Program, Stmt, StructField,
     };
 
     /// Helper that builds a Program with a single VarDecl (Load source)
@@ -565,6 +642,7 @@ mod tests {
             source: PipelineSource::Load {
                 file_path: "data.csv".into(),
                 schema_name: "MySchema".into(),
+                options: Default::default(),
             },
             ops,
         });
@@ -790,6 +868,7 @@ mod tests {
             source: PipelineSource::Load {
                 file_path: "f.csv".into(),
                 schema_name: "S".into(),
+                options: Default::default(),
             },
             ops: vec![],
         });
@@ -1098,5 +1177,75 @@ mod tests {
         let program = make_load_program(vec![PipelineOp::Std("score".into())]);
         let output = Codegen::generate(&program);
         assert!(output.contains(".std(1)"), ".std(1) 없음: {}", output);
+    }
+
+    /// v0.23 agg([...]) → single `.agg([...])` with aliased expressions
+    #[test]
+    fn test_generate_agg_list_op() {
+        let program = make_load_program(vec![PipelineOp::Agg(vec![
+            AggSpec {
+                func: AggFn::Min,
+                col: "score".into(),
+            },
+            AggSpec {
+                func: AggFn::Mean,
+                col: "score".into(),
+            },
+            AggSpec {
+                func: AggFn::Max,
+                col: "score".into(),
+            },
+        ])]);
+        let output = Codegen::generate(&program);
+        assert!(output.contains(".agg(["), ".agg([ 없음: {}", output);
+        assert!(output.contains(".min()"), ".min() 없음: {}", output);
+        assert!(output.contains(".mean()"), ".mean() 없음: {}", output);
+        assert!(output.contains(".max()"), ".max() 없음: {}", output);
+        // Aliased so repeated aggregations of the same column don't collide.
+        assert!(
+            output.contains(".alias(\"score_min\")"),
+            "alias 없음: {}",
+            output
+        );
+        assert!(
+            output.contains(".alias(\"score_max\")"),
+            "alias 없음: {}",
+            output
+        );
+    }
+
+    /// load(sep, header) → options reflected in the emitted comment
+    #[test]
+    fn test_generate_load_options_comment() {
+        let mut program = Program::new();
+        program.stmts.push(Stmt::VarDecl {
+            var_name: "r".into(),
+            is_mut: false,
+            source: PipelineSource::Load {
+                file_path: "data.csv".into(),
+                schema_name: "MySchema".into(),
+                options: crate::ast::LoadOptions {
+                    separator: Some(b';'),
+                    has_header: Some(false),
+                },
+            },
+            ops: vec![],
+        });
+        let output = Codegen::generate(&program);
+        assert!(
+            output.contains("sep: \";\"") && output.contains("header: false"),
+            "load 옵션 주석 없음: {}",
+            output
+        );
+        assert!(
+            output.contains(".with_separator(b'\\x3b')"),
+            "with_separator 없음: {}",
+            output
+        );
+        assert!(
+            output.contains(".with_has_header(false)"),
+            "with_has_header 없음: {}",
+            output
+        );
     }
 }

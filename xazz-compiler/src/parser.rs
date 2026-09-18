@@ -44,8 +44,9 @@
 ///   - withColumn() operator parsing
 ///   - arithmetic precedence: * / > + - > comparison operators
 use crate::ast::{
-    BinOpKind, ChartConfig, ChartType, DpArgs, DpMechanism, Expr, FillNullValue, JoinHow,
-    LayerKind, PipelineOp, PipelineSource, Program, SaveFormat, Stmt, StructField, TrainConfig,
+    AggFn, AggSpec, BinOpKind, ChartConfig, ChartType, DpArgs, DpMechanism, Expr, FillNullValue,
+    JoinHow, LayerKind, LoadOptions, PipelineOp, PipelineSource, Program, SaveFormat, Stmt,
+    StructField, TrainConfig,
 };
 use crate::error::{CompileError, CompileResult, ErrorKind};
 use crate::token::{Span, Token, TokenKind};
@@ -666,6 +667,8 @@ impl Parser {
             }
         };
 
+        let options = self.parse_load_options()?;
+
         self.expect(&TokenKind::RParen)?;
 
         // schema name after ::
@@ -683,7 +686,70 @@ impl Parser {
         Ok(PipelineSource::Load {
             file_path,
             schema_name,
+            options,
         })
+    }
+
+    // load(...) named options: sep: ";" | separator: ";" | header: false | hasHeader: false
+    fn parse_load_options(&mut self) -> CompileResult<LoadOptions> {
+        let mut options = LoadOptions::default();
+
+        while self.eat(&TokenKind::Comma) {
+            let key = self.expect_ident()?;
+            self.expect(&TokenKind::Colon)?;
+
+            match key.as_str() {
+                "sep" | "separator" => {
+                    let value = self.expect_string_lit()?;
+                    let mut bytes = value.bytes();
+                    match (bytes.next(), bytes.next()) {
+                        (Some(b), None) => options.separator = Some(b),
+                        _ => {
+                            return Err(CompileError::new(
+                                ErrorKind::ExpectedToken("single-byte string".into()),
+                                self.current_span(),
+                                format!(
+                                    "load() 의 sep 는 1바이트 문자 하나여야 합니다. 실제: {:?}",
+                                    value
+                                ),
+                            ));
+                        }
+                    }
+                }
+                "header" | "hasHeader" => match self.current_kind() {
+                    TokenKind::True => {
+                        self.advance();
+                        options.has_header = Some(true);
+                    }
+                    TokenKind::False => {
+                        self.advance();
+                        options.has_header = Some(false);
+                    }
+                    other => {
+                        return Err(CompileError::new(
+                            ErrorKind::ExpectedToken("true or false".into()),
+                            self.current_span(),
+                            format!(
+                                "load() 의 header: 뒤에는 true 또는 false 가 와야 합니다. 실제: {:?}",
+                                other
+                            ),
+                        ));
+                    }
+                },
+                other => {
+                    return Err(CompileError::new(
+                        ErrorKind::ExpectedToken("sep or header".into()),
+                        self.current_span(),
+                        format!(
+                            "load() 의 옵션은 sep: \"<char>\" 또는 header: true/false 입니다. 실제: {:?}",
+                            other
+                        ),
+                    ));
+                }
+            }
+        }
+
+        Ok(options)
     }
 
     // ── PipelineOp ────────────────────────────────────────────────────────────
@@ -1180,6 +1246,60 @@ impl Parser {
                 let col_name = self.expect_string_lit()?;
                 self.expect(&TokenKind::RParen)?;
                 Ok(PipelineOp::Std(col_name))
+            }
+
+            // ── v0.23 agg([min("c"), mean("c"), max("c")]) — multi-aggregation ────────
+            TokenKind::Agg => {
+                self.advance();
+                self.expect(&TokenKind::LParen)?;
+                self.expect(&TokenKind::LBracket)?;
+                let mut specs: Vec<AggSpec> = Vec::new();
+                if !matches!(self.current_kind(), TokenKind::RBracket) {
+                    loop {
+                        let func = match self.current_kind() {
+                            TokenKind::Sum => AggFn::Sum,
+                            TokenKind::Mean => AggFn::Mean,
+                            TokenKind::Min => AggFn::Min,
+                            TokenKind::Max => AggFn::Max,
+                            TokenKind::Count => AggFn::Count,
+                            TokenKind::Median => AggFn::Median,
+                            TokenKind::Variance => AggFn::Variance,
+                            TokenKind::Std => AggFn::Std,
+                            other => {
+                                return Err(CompileError::new(
+                                    ErrorKind::ExpectedToken("aggregate function".into()),
+                                    self.current_span(),
+                                    format!(
+                                        "agg([...]) 안에는 sum/mean/min/max/count/median/variance/std 만 올 수 있습니다. 실제: {:?}",
+                                        other
+                                    ),
+                                ));
+                            }
+                        };
+                        self.advance();
+                        self.expect(&TokenKind::LParen)?;
+                        let col = self.expect_string_lit()?;
+                        self.expect(&TokenKind::RParen)?;
+                        specs.push(AggSpec { func, col });
+                        if !self.eat(&TokenKind::Comma) {
+                            break;
+                        }
+                        // Allow a trailing comma before the closing `]`.
+                        if matches!(self.current_kind(), TokenKind::RBracket) {
+                            break;
+                        }
+                    }
+                }
+                self.expect(&TokenKind::RBracket)?;
+                self.expect(&TokenKind::RParen)?;
+                if specs.is_empty() {
+                    return Err(CompileError::new(
+                        ErrorKind::Other("empty agg([...])".into()),
+                        self.current_span(),
+                        "agg([...]) 에는 최소 하나의 집계가 필요합니다.",
+                    ));
+                }
+                Ok(PipelineOp::Agg(specs))
             }
 
             // ── v0.5 train(Model, ...) — Burn deep-learning training pipeline operator ──
@@ -1700,11 +1820,69 @@ mod tests {
                     &PipelineSource::Load {
                         file_path: "data.csv".into(),
                         schema_name: "AirQuality".into(),
+                        options: LoadOptions::default(),
                     }
                 );
                 assert_eq!(ops.len(), 1);
                 assert_eq!(ops[0], PipelineOp::Count(None));
             }
+            other => panic!("VarDecl 예상, 실제: {:?}", other),
+        }
+    }
+
+    // ── test 1b: load() named options (sep / header) ────────────────────────────────
+    #[test]
+    fn test_load_options_ast() {
+        let src = r#"v air = load("m.csv", sep: ";", header: false) :: AirQuality |> count;"#;
+        let program = parse_src(src).expect("파싱 실패");
+
+        match &program.stmts[0] {
+            Stmt::VarDecl { source, .. } => match source {
+                PipelineSource::Load {
+                    file_path, options, ..
+                } => {
+                    assert_eq!(file_path, "m.csv");
+                    assert_eq!(options.separator, Some(b';'));
+                    assert_eq!(options.has_header, Some(false));
+                }
+                other => panic!("Load 예상, 실제: {:?}", other),
+            },
+            other => panic!("VarDecl 예상, 실제: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_load_options_separator_alias() {
+        let src =
+            r#"v air = load("m.csv", separator: "|", hasHeader: true) :: AirQuality |> count;"#;
+        let program = parse_src(src).expect("파싱 실패");
+        match &program.stmts[0] {
+            Stmt::VarDecl { source, .. } => match source {
+                PipelineSource::Load { options, .. } => {
+                    assert_eq!(options.separator, Some(b'|'));
+                    assert_eq!(options.has_header, Some(true));
+                }
+                other => panic!("Load 예상, 실제: {:?}", other),
+            },
+            other => panic!("VarDecl 예상, 실제: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_load_options_multibyte_sep_rejected() {
+        let src = r#"v air = load("m.csv", sep: "ab") :: AirQuality |> count;"#;
+        assert!(parse_src(src).is_err(), "1바이트 초과 sep 는 거부되어야 함");
+    }
+
+    #[test]
+    fn test_agg_trailing_comma() {
+        let src = r#"v s = load("m.csv", sep: ";", header: false) :: AirQuality |> groupBy("station") |> agg([min("x"), max("x"),]);"#;
+        let program = parse_src(src).expect("trailing comma 파싱 실패");
+        match &program.stmts[0] {
+            Stmt::VarDecl { ops, .. } => match ops.last() {
+                Some(PipelineOp::Agg(specs)) => assert_eq!(specs.len(), 2),
+                other => panic!("Agg 예상, 실제: {:?}", other),
+            },
             other => panic!("VarDecl 예상, 실제: {:?}", other),
         }
     }
@@ -1729,6 +1907,7 @@ mod tests {
                     &PipelineSource::Load {
                         file_path: "seoul.csv".into(),
                         schema_name: "AirQuality".into(),
+                        options: LoadOptions::default(),
                     }
                 );
                 assert_eq!(ops.len(), 2);
