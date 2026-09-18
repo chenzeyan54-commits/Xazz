@@ -81,6 +81,13 @@ impl PolicyHistoryQuery {
     }
 }
 
+/// Per-tenant execution locks. Values are held weakly so locks whose owners have
+/// finished can be pruned; otherwise a long-lived server would retain one entry
+/// per tenant ever seen (issue C2).
+type TenantLocks = Arc<
+    std::sync::Mutex<std::collections::HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>>,
+>;
+
 /// AppState shared across requests.
 #[derive(Clone)]
 struct AppState {
@@ -89,17 +96,23 @@ struct AppState {
     store: Arc<store::Store>,
     /// Per-tenant execution locks (issue C2) — serialize a tenant's
     /// precheck → run → accrue so its DP budget check is atomic across runs.
-    tenant_locks:
-        Arc<std::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+    tenant_locks: TenantLocks,
 }
 
 impl AppState {
     /// Returns the (shared) execution lock for a tenant, creating it on first use.
+    ///
+    /// The map stores `Weak` refs and is pruned whenever a new tenant appears, so
+    /// it stays bounded by the number of tenants with in-flight executions.
     fn tenant_lock(&self, tenant: &str) -> Arc<tokio::sync::Mutex<()>> {
         let mut map = self.tenant_locks.lock().expect("tenant lock map poisoned");
-        map.entry(tenant.to_string())
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-            .clone()
+        if let Some(existing) = map.get(tenant).and_then(std::sync::Weak::upgrade) {
+            return existing;
+        }
+        map.retain(|_, lock| lock.strong_count() > 0);
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        map.insert(tenant.to_string(), Arc::downgrade(&lock));
+        lock
     }
 }
 
@@ -1964,6 +1977,23 @@ v out = load(\"data/p.csv\") :: Patient |> select([name, patient_id, age_band]);
             "a different tenant must not be blocked"
         );
         drop(guard);
+    }
+
+    /// Idle tenants are pruned from the lock map so it cannot grow unbounded.
+    #[tokio::test]
+    async fn tenant_lock_map_prunes_idle_tenants() {
+        let state = test_state();
+        {
+            let _a = state.tenant_lock("idle-a");
+            let _b = state.tenant_lock("idle-b");
+            assert_eq!(state.tenant_locks.lock().unwrap().len(), 2);
+        }
+
+        // Both locks are dropped; the next new tenant prunes them before inserting.
+        let _c = state.tenant_lock("active-c");
+        let map = state.tenant_locks.lock().unwrap();
+        assert_eq!(map.len(), 1, "idle tenants must be pruned");
+        assert!(map.contains_key("active-c"));
     }
 
     /// Safe code passes the gate (false-positive regression prevention).
