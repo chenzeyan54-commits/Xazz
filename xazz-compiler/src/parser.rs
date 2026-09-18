@@ -208,12 +208,21 @@ impl Parser {
                     kernel_size,
                 }
             }
+            "Embedding" => {
+                let vocab_size = self.expect_number()? as usize;
+                self.expect(&TokenKind::Comma)?;
+                let embed_dim = self.expect_number()? as usize;
+                LayerKind::Embedding {
+                    vocab_size,
+                    embed_dim,
+                }
+            }
             other => {
                 return Err(CompileError::new(
                     ErrorKind::UnexpectedToken(other.into()),
                     self.current_span(),
                     format!(
-                        "알 수 없는 레이어 타입: '{}'. 지원: Dense, ReLU, Sigmoid, Tanh, Softmax, Dropout, BatchNorm, Conv1d",
+                        "알 수 없는 레이어 타입: '{}'. 지원: Dense, ReLU, Sigmoid, Tanh, Softmax, Dropout, BatchNorm, Conv1d, Embedding",
                         other
                     ),
                 ));
@@ -1994,7 +2003,28 @@ type AirQuality = {
         }
     }
 
-    // ── test 4: VarRef (variable reference) parsing ────────────────────────────────────
+    // ── model Embedding layer parsing (D3) ────────────────────────────────────
+    #[test]
+    fn test_model_embedding_parse() {
+        let src = r#"model Rec { Embedding(10, 4) -> ReLU() -> Dense(1) }"#;
+        let program = parse_src(src).expect("파싱 실패");
+        match &program.stmts[0] {
+            Stmt::ModelDecl { name, layers } => {
+                assert_eq!(name, "Rec");
+                assert_eq!(
+                    layers[0],
+                    LayerKind::Embedding {
+                        vocab_size: 10,
+                        embed_dim: 4
+                    }
+                );
+                assert_eq!(layers[1], LayerKind::ReLU);
+                assert_eq!(layers[2], LayerKind::Dense(1));
+            }
+            other => panic!("ModelDecl 예상, 실제: {:?}", other),
+        }
+    }
+
     #[test]
     fn test_var_ref_pipeline() {
         let src = r#"v filtered = air |> filter(pm25 > 10);"#;

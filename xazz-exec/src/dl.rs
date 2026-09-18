@@ -15,7 +15,7 @@ use burn::{
     backend::Autodiff,
     module::{AutodiffModule, Module},
     nn::{
-        DropoutConfig, Linear, LinearConfig, PaddingConfig1d,
+        DropoutConfig, Embedding, EmbeddingConfig, Linear, LinearConfig, PaddingConfig1d,
         conv::{Conv1d, Conv1dConfig},
     },
     optim::{AdamConfig, GradientsParams, Optimizer},
@@ -83,6 +83,8 @@ enum LayerOp {
     Dense(usize),
     /// Conv1d layer (1D convolution over the feature axis).
     Conv1d(usize),
+    /// Embedding layer (categorical index → vector), always the first op.
+    Embedding(usize),
 }
 
 /// Burn module expressing the DSL `model { Dense -> ReLU -> ... }` as a dynamic
@@ -95,12 +97,20 @@ pub struct Mlp<B: Backend> {
     linears: Vec<Linear<B>>,
     /// Sequence of Conv1d(out_channels, kernel_size) layers.
     convs: Vec<Conv1d<B>>,
+    /// Sequence of Embedding(vocab_size, embed_dim) layers.
+    embeddings: Vec<Embedding<B>>,
+    /// Per-embedding vocabulary size (for index clamping); parallel to `embeddings`.
+    #[module(skip)]
+    embed_vocab: Vec<usize>,
     /// Forward order: each entry pairs an op with the activation applied after it.
     #[module(skip)]
     ops: Vec<(LayerOp, Activation)>,
     /// Output feature dimension (result of the declared graph) — reported in the train report.
     #[module(skip)]
     out_dim: usize,
+    /// Whether the graph consumes raw category indices (first layer is Embedding).
+    #[module(skip)]
+    raw_input: bool,
     /// Whether in training mode — determines Dropout application (false during inference).
     #[module(skip)]
     training: bool,
@@ -122,6 +132,14 @@ impl<B: Backend> Mlp<B> {
                     let [b, c, l] = y.dims();
                     apply_activation(act, y.reshape([b, c * l]), self.training)
                 }
+                LayerOp::Embedding(i) => {
+                    // [batch, len] category indices → [batch, len, embed_dim] → [batch, len * embed_dim]
+                    let vmax = self.embed_vocab[*i].saturating_sub(1) as f32;
+                    let idx = x.clamp(0.0, vmax).int();
+                    let y = self.embeddings[*i].forward(idx);
+                    let [b, l, d] = y.dims();
+                    apply_activation(act, y.reshape([b, l * d]), self.training)
+                }
             };
         }
         x
@@ -136,6 +154,8 @@ fn build_mlp<B: Backend>(
 ) -> Result<Mlp<B>, String> {
     let mut linears: Vec<Linear<B>> = Vec::new();
     let mut convs: Vec<Conv1d<B>> = Vec::new();
+    let mut embeddings: Vec<Embedding<B>> = Vec::new();
+    let mut embed_vocab: Vec<usize> = Vec::new();
     let mut ops: Vec<(LayerOp, Activation)> = Vec::new();
     let mut cur = input_dim;
 
@@ -171,6 +191,23 @@ fn build_mlp<B: Backend>(
                 )
                 .into());
             }
+            LayerKind::Embedding {
+                vocab_size,
+                embed_dim,
+            } if *vocab_size > 0 && *embed_dim > 0 => {
+                embeddings.push(EmbeddingConfig::new(*vocab_size, *embed_dim).init(device));
+                ops.push((LayerOp::Embedding(embeddings.len() - 1), Activation::None));
+                embed_vocab.push(*vocab_size);
+                // Each of the `cur` input positions is embedded into `embed_dim` features.
+                cur *= *embed_dim;
+            }
+            LayerKind::Embedding { .. } => {
+                return Err(tr(
+                    "Embedding vocab_size and embed_dim must be >= 1.",
+                    "Embedding 의 vocab_size 와 embed_dim 은 1 이상이어야 합니다.",
+                )
+                .into());
+            }
             LayerKind::ReLU => set_activation(&mut ops, Activation::ReLU),
             LayerKind::Sigmoid => set_activation(&mut ops, Activation::Sigmoid),
             LayerKind::Tanh => set_activation(&mut ops, Activation::Tanh),
@@ -191,8 +228,11 @@ fn build_mlp<B: Backend>(
     Ok(Mlp {
         linears,
         convs,
+        embeddings,
+        embed_vocab,
         ops,
         out_dim: cur,
+        raw_input: matches!(layers.first(), Some(LayerKind::Embedding { .. })),
         training: true,
     })
 }
@@ -263,6 +303,9 @@ pub fn train(
     let (feature_names, features, targets) = extract_data(df, &config.target)?;
     let n = features.len();
     let input_dim = feature_names.len();
+    // Embedding-first models consume raw category indices — z-score normalization
+    // would destroy category identity, so keep raw values (NaN → 0).
+    let raw_input = matches!(layers.first(), Some(LayerKind::Embedding { .. }));
     if input_dim == 0 {
         return Err(tr(
             "No numeric feature columns available for training.",
@@ -311,11 +354,13 @@ pub fn train(
     let mut xs = Vec::with_capacity(n * input_dim);
     for row in features.iter().take(n) {
         for j in 0..input_dim {
-            let mut v = row[j] as f64;
-            if !v.is_finite() {
-                v = fmean[j];
+            let v = row[j] as f64;
+            if raw_input {
+                xs.push(if v.is_finite() { v as f32 } else { 0.0 });
+            } else {
+                let v = if v.is_finite() { v } else { fmean[j] };
+                xs.push(((v - fmean[j]) / fstd[j]) as f32);
             }
-            xs.push(((v - fmean[j]) / fstd[j]) as f32);
         }
     }
 
@@ -569,11 +614,13 @@ pub fn predict(
     let mut xs = Vec::with_capacity(n * feature_count);
     for i in 0..n {
         for (j, col) in col_vecs.iter().enumerate().take(feature_count) {
-            let mut v = col[i] as f64;
-            if !v.is_finite() {
-                v = trained.fmean[j];
+            let v = col[i] as f64;
+            if trained.model.raw_input {
+                xs.push(if v.is_finite() { v as f32 } else { 0.0 });
+            } else {
+                let v = if v.is_finite() { v } else { trained.fmean[j] };
+                xs.push(((v - trained.fmean[j]) / trained.fstd[j]) as f32);
             }
-            xs.push(((v - trained.fmean[j]) / trained.fstd[j]) as f32);
         }
     }
 

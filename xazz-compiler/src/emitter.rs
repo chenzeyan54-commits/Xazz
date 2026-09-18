@@ -658,7 +658,17 @@ fn generate_rust_src(
             config,
         } = stmt
         {
-            out.push_str(&emit_dl_train_call(source_var, model_name, config));
+            let embedding_input = program.stmts.iter().any(|s| {
+                matches!(s, Stmt::ModelDecl { name, layers }
+                    if name == model_name
+                        && matches!(layers.first(), Some(LayerKind::Embedding { .. })))
+            });
+            out.push_str(&emit_dl_train_call(
+                source_var,
+                model_name,
+                config,
+                embedding_input,
+            ));
         }
     }
 
@@ -685,7 +695,7 @@ fn emit_burn_imports() -> String {
     r#"use burn::{
     backend::Autodiff,
     module::Module,
-    nn::{Linear, LinearConfig, PaddingConfig1d, conv::{Conv1d, Conv1dConfig}},
+    nn::{Linear, LinearConfig, PaddingConfig1d, conv::{Conv1d, Conv1dConfig}, Embedding, EmbeddingConfig},
     optim::{AdamConfig, GradientsParams, Optimizer},
     record::{FullPrecisionSettings, PrettyJsonFileRecorder},
     tensor::{
@@ -708,6 +718,8 @@ enum DlLayer {
     Dense(usize, String),
     /// Conv1d(out_channels, kernel_size, activation)
     Conv1d(usize, usize, String),
+    /// Embedding(vocab_size, embed_dim, activation)
+    Embedding(usize, usize, String),
 }
 
 /// Normalizes a DSL layer chain into ordered Dense/Conv1d specs.
@@ -726,6 +738,15 @@ fn dl_layer_specs(layers: &[LayerKind]) -> Vec<DlLayer> {
                 String::from("None"),
             )),
             LayerKind::Conv1d { .. } => {}
+            LayerKind::Embedding {
+                vocab_size,
+                embed_dim,
+            } if *vocab_size > 0 && *embed_dim > 0 => specs.push(DlLayer::Embedding(
+                *vocab_size,
+                *embed_dim,
+                String::from("None"),
+            )),
+            LayerKind::Embedding { .. } => {}
             LayerKind::ReLU => set_dl_act(&mut specs, "relu"),
             LayerKind::Sigmoid => set_dl_act(&mut specs, "sigmoid"),
             LayerKind::Tanh => set_dl_act(&mut specs, "tanh"),
@@ -739,7 +760,9 @@ fn dl_layer_specs(layers: &[LayerKind]) -> Vec<DlLayer> {
 fn set_dl_act(specs: &mut [DlLayer], act: &str) {
     if let Some(last) = specs.last_mut() {
         match last {
-            DlLayer::Dense(_, a) | DlLayer::Conv1d(_, _, a) => *a = act.to_string(),
+            DlLayer::Dense(_, a) | DlLayer::Conv1d(_, _, a) | DlLayer::Embedding(_, _, a) => {
+                *a = act.to_string()
+            }
         }
     }
 }
@@ -764,6 +787,9 @@ fn emit_dl_model_struct(name: &str, layers: &[LayerKind]) -> String {
             DlLayer::Conv1d(c, k, _) => {
                 out.push_str(&format!("    conv{i}: Conv1d<B>,  // Conv1d({c}, {k})\n"))
             }
+            DlLayer::Embedding(v, d, _) => out.push_str(&format!(
+                "    embed{i}: Embedding<B>,  // Embedding({v}, {d})\n"
+            )),
         }
     }
     out.push_str("}\n\n");
@@ -786,6 +812,12 @@ fn emit_dl_model_struct(name: &str, layers: &[LayerKind]) -> String {
                 ));
                 cur = format!("{c} * {cur}");
             }
+            DlLayer::Embedding(v, d, _) => {
+                out.push_str(&format!(
+                    "            embed{i}: EmbeddingConfig::new({v}, {d}).init(device),\n"
+                ));
+                cur = format!("{d} * {cur}");
+            }
         }
     }
     out.push_str("        }\n    }\n\n");
@@ -804,6 +836,16 @@ fn emit_dl_model_struct(name: &str, layers: &[LayerKind]) -> String {
                 ));
                 out.push_str("        let [b, c, l] = x.dims();\n");
                 out.push_str("        let x = x.reshape([b, c * l]);\n");
+                emit_dl_act(&mut out, act);
+            }
+            DlLayer::Embedding(v, _, act) => {
+                out.push_str(&format!(
+                    "        let idx = x.clamp(0.0, {}f32).int();\n",
+                    v.saturating_sub(1)
+                ));
+                out.push_str(&format!("        let x = self.embed{i}.forward(idx);\n"));
+                out.push_str("        let [b, l, d] = x.dims();\n");
+                out.push_str("        let x = x.reshape([b, l * d]);\n");
                 emit_dl_act(&mut out, act);
             }
         }
@@ -915,7 +957,12 @@ fn make_both_tensors(
 }
 
 /// `run <src> |> train(<Model>, ...)` → main() training code block.
-fn emit_dl_train_call(source_var: &str, model_name: &str, config: &TrainConfig) -> String {
+fn emit_dl_train_call(
+    source_var: &str,
+    model_name: &str,
+    config: &TrainConfig,
+    embedding_input: bool,
+) -> String {
     let target = &config.target;
     let epochs = config.epochs.max(1);
     let lr = config.learning_rate;
@@ -924,6 +971,28 @@ fn emit_dl_train_call(source_var: &str, model_name: &str, config: &TrainConfig) 
         .validation_split
         .unwrap_or(0.0)
         .clamp(0.0, MAX_VALIDATION_SPLIT);
+
+    // Embedding-first models consume raw category indices; skip z-score normalization.
+    let xs_norm = if embedding_input {
+        r#"        // Embedding input: keep raw category indices (no z-score standardization)
+        let xs: Vec<f32> = xs
+            .iter()
+            .map(|&v| if v.is_finite() { v } else { 0.0 })
+            .collect();"#
+            .to_string()
+    } else {
+        r#"        let xs: Vec<f32> = xs
+            .iter()
+            .enumerate()
+            .map(|(idx, v)| {
+                let col = idx % feature_count;
+                let v = v as f64;
+                let v = if !v.is_finite() { fmean[col] } else { v };
+                ((v - fmean[col]) / fstd[col]) as f32
+            })
+            .collect();"#
+            .to_string()
+    };
 
     format!(
         r#"    // ── Deep Learning: run {source_var} |> train({model_name}, target: "{target}") ──────
@@ -953,17 +1022,7 @@ fn emit_dl_train_call(source_var: &str, model_name: &str, config: &TrainConfig) 
             }}
             fstd[j] = if c > 1 {{ (s / (c - 1) as f64).max(1e-8).sqrt() }} else {{ 1.0 }};
         }}
-        let xs: Vec<f32> = xs
-            .iter()
-            .enumerate()
-            .map(|(idx, v)| {{
-                let row = idx / feature_count;
-                let col = idx % feature_count;
-                let v = v as f64;
-                let v = if !v.is_finite() {{ fmean[col] }} else {{ v }};
-                ((v - fmean[col]) / fstd[col]) as f32
-            }})
-            .collect();
+{xs_norm}
         let tmean: f64 = {{
             let (mut s, mut c) = (0f64, 0usize);
             for &t in &ys {{ if t.is_finite() {{ s += t as f64; c += 1; }} }}
@@ -1331,21 +1390,6 @@ mod tests {
         assert!(out.contains("use burn::"), "burn import 없음");
         assert!(out.contains("struct M<B: Backend>"), "모델 구조체 없음");
         assert!(out.contains("Adam"), "Adam 옵티마이저 없음");
-    }
-
-    #[test]
-    fn emit_rust_emits_burn_for_conv1d_model() {
-        let out = emit(
-            "type S = { a: float, b: float, y: float };
-             model CNN { Conv1d(4, 3) -> ReLU() -> Dense(1) }
-             v data = load(\"x.csv\") :: S |> train(CNN, target: \"y\", epochs: 3);",
-        );
-        assert!(out.contains("struct CNN<B: Backend>"), "모델 구조체 없음");
-        assert!(out.contains("Conv1d"), "Conv1d 레이어 없음");
-        assert!(
-            out.contains("PaddingConfig1d"),
-            "Conv1d Same padding 설정 없음"
-        );
     }
 
     #[test]

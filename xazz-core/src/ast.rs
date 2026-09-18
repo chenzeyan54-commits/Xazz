@@ -375,6 +375,9 @@ pub enum LayerKind {
         out_channels: usize,
         kernel_size: usize,
     },
+    /// Embedding(vocab_size, embed_dim) — categorical input embedding (D3).
+    /// Must be the first layer; input feature values are treated as category indices.
+    Embedding { vocab_size: usize, embed_dim: usize },
 }
 
 impl LayerKind {
@@ -394,6 +397,10 @@ impl LayerKind {
             } => format!(
                 "nn::Conv1dConfig::new(1, {out_channels}, {kernel_size}).with_padding(PaddingConfig1d::Same)"
             ),
+            LayerKind::Embedding {
+                vocab_size,
+                embed_dim,
+            } => format!("nn::EmbeddingConfig::new({vocab_size}, {embed_dim})"),
         }
     }
 }

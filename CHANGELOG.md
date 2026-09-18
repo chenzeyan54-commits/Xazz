@@ -36,6 +36,19 @@ Versioning: [Semantic Versioning](https://semver.org/)
 - 테스트: 파서 AST, 체커 유효/오류, emitter(`PaddingConfig1d`), CPU E2E train/predict
 - 임베딩 레이어와 하이퍼파라미터 스윕은 후속(백로그)
 
+### Added — D3 Embedding 레이어 (범주 입력, issue #64)
+
+- **`Embedding(vocab_size, embed_dim)`** — `model {}` 선언의 범주형 입력 임베딩.
+  반드시 첫 번째 레이어여야 하며, 입력 특성값을 범주 인덱스로 해석해
+  `[batch, input_dim, embed_dim]` 으로 매핑한 뒤 `[batch, input_dim * embed_dim]`
+  으로 펼친다. 파서 / 정적 체커 / emitter / runtime / dl 전체 파이프라인에 반영
+- 첫 레이어가 Embedding 이면 z-score 표준화를 건너뛰고 원본 범주 인덱스를 그대로
+  사용(결측 → 0). 인덱스는 `[0, vocab_size-1]` 로 clamp
+- 체커: `vocab_size`/`embed_dim` < 1 은 오류, Embedding 이 첫 레이어가 아니면 오류
+- 테스트: 파서 AST, 체커 유효/파라미터·위치 오류, emitter(`EmbeddingConfig`·정규화 생략),
+  CPU E2E train/predict
+- 하이퍼파라미터 스윕은 후속(백로그)
+
 ### Added — 오픈소스 거버넌스·라이선스 정책 (커뮤니티 확장)
 
 - **`deny.toml`** — `cargo deny` 기반 의존성 정책: permissive 라이선스 allow 목록,

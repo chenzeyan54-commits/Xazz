@@ -98,6 +98,10 @@ fn print_layer(layer: &LayerKind) -> String {
             out_channels,
             kernel_size,
         } => format!("Conv1d({}, {})", out_channels, kernel_size),
+        LayerKind::Embedding {
+            vocab_size,
+            embed_dim,
+        } => format!("Embedding({}, {})", vocab_size, embed_dim),
     }
 }
 

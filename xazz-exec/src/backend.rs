@@ -514,6 +514,53 @@ mod tests {
 
         cleanup(&trained.report.checkpoint_path);
     }
+
+    /// D3 Embedding: an Embedding -> ReLU -> Dense model trains and predicts end-to-end on CPU.
+    #[test]
+    fn cpu_backend_trains_embedding_model() {
+        use polars::prelude::*;
+
+        let df = df!(
+            "cat1" => [0i64, 1, 2, 3, 0, 1, 2, 3],
+            "cat2" => [1i64, 0, 1, 0, 1, 0, 1, 0],
+            "y"    => [0.0f64, 1.0, 2.0, 3.0, 0.0, 1.0, 2.0, 3.0],
+        )
+        .expect("embedding dataset");
+
+        let layers = vec![
+            LayerKind::Embedding {
+                vocab_size: 4,
+                embed_dim: 3,
+            },
+            LayerKind::ReLU,
+            LayerKind::Dense(1),
+        ];
+        let config = TrainConfig {
+            target: "y".to_string(),
+            epochs: 3,
+            learning_rate: 0.05,
+            batch_size: Some(4),
+            validation_split: None,
+            early_stopping_patience: None,
+        };
+
+        let (backend, warning) = resolve(None);
+        assert!(warning.is_none());
+
+        let trained = backend
+            .train(&df, "backend_unit_embedding", &layers, &config)
+            .expect("cpu embedding train");
+        assert_eq!(trained.report.input_dim, 2);
+        assert_eq!(trained.report.output_dim, 1);
+
+        let out = backend
+            .predict(&trained, &df, Some("pred"))
+            .expect("cpu embedding predict");
+        assert_eq!(out.height(), df.height());
+        assert!(out.column("pred").is_ok());
+
+        cleanup(&trained.report.checkpoint_path);
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

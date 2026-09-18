@@ -353,28 +353,68 @@ impl Analyzer {
                 },
             );
         }
-        for layer in layers {
-            if let LayerKind::Conv1d {
-                out_channels,
-                kernel_size,
-            } = layer
-                && (*out_channels == 0 || *kernel_size == 0)
-            {
-                self.error(
-                    ErrorKind::Other("Conv1d 파라미터 오류".to_string()),
-                    Some(name),
-                    if is_korean() {
-                        format!(
-                            "모델 '{}' 의 Conv1d(out_channels, kernel_size) 는 둘 다 1 이상이어야 합니다.",
-                            name
-                        )
-                    } else {
-                        format!(
-                            "Model '{}': Conv1d(out_channels, kernel_size) requires both values >= 1.",
-                            name
-                        )
-                    },
-                );
+        for (i, layer) in layers.iter().enumerate() {
+            match layer {
+                LayerKind::Conv1d {
+                    out_channels,
+                    kernel_size,
+                } if *out_channels == 0 || *kernel_size == 0 => {
+                    self.error(
+                        ErrorKind::Other("Conv1d 파라미터 오류".to_string()),
+                        Some(name),
+                        if is_korean() {
+                            format!(
+                                "모델 '{}' 의 Conv1d(out_channels, kernel_size) 는 둘 다 1 이상이어야 합니다.",
+                                name
+                            )
+                        } else {
+                            format!(
+                                "Model '{}': Conv1d(out_channels, kernel_size) requires both values >= 1.",
+                                name
+                            )
+                        },
+                    );
+                }
+                LayerKind::Embedding {
+                    vocab_size,
+                    embed_dim,
+                } => {
+                    if *vocab_size == 0 || *embed_dim == 0 {
+                        self.error(
+                            ErrorKind::Other("Embedding 파라미터 오류".to_string()),
+                            Some(name),
+                            if is_korean() {
+                                format!(
+                                    "모델 '{}' 의 Embedding(vocab_size, embed_dim) 는 둘 다 1 이상이어야 합니다.",
+                                    name
+                                )
+                            } else {
+                                format!(
+                                    "Model '{}': Embedding(vocab_size, embed_dim) requires both values >= 1.",
+                                    name
+                                )
+                            },
+                        );
+                    }
+                    if i != 0 {
+                        self.error(
+                            ErrorKind::Other("Embedding 레이어 위치 오류".to_string()),
+                            Some(name),
+                            if is_korean() {
+                                format!(
+                                    "모델 '{}' 의 Embedding 레이어는 입력을 범주 인덱스로 받으므로 첫 번째 레이어여야 합니다.",
+                                    name
+                                )
+                            } else {
+                                format!(
+                                    "Model '{}': an Embedding layer must be the first layer (it consumes categorical indices).",
+                                    name
+                                )
+                            },
+                        );
+                    }
+                }
+                _ => {}
             }
         }
         if layers.iter().any(|l| matches!(l, LayerKind::BatchNorm)) {
@@ -1785,6 +1825,39 @@ mod tests {
         assert!(
             err_kinds(&r).iter().any(|k| k.contains("Conv1d")),
             "Conv1d 오류 없음: {:?}",
+            err_kinds(&r)
+        );
+    }
+
+    #[test]
+    fn embedding_model_is_valid() {
+        let r = check(
+            "type X = { a: float, b: float, y: float };
+             model Rec { Embedding(10, 4) -> ReLU() -> Dense(1) }
+             v data = load(\"x.csv\") :: X;
+             v trained = data |> train(Rec, target: \"y\", epochs: 3);",
+        );
+        assert!(r.is_ok(), "오류: {:?}", r.errors);
+    }
+
+    #[test]
+    fn embedding_zero_params_error() {
+        let r = check("model M { Embedding(0, 4) -> Dense(1) }");
+        assert!(r.is_err());
+        assert!(
+            err_kinds(&r).iter().any(|k| k.contains("Embedding")),
+            "Embedding 오류 없음: {:?}",
+            err_kinds(&r)
+        );
+    }
+
+    #[test]
+    fn embedding_must_be_first_layer() {
+        let r = check("model M { Dense(4) -> Embedding(10, 4) -> Dense(1) }");
+        assert!(r.is_err());
+        assert!(
+            err_kinds(&r).iter().any(|k| k.contains("Embedding")),
+            "Embedding 위치 오류 없음: {:?}",
             err_kinds(&r)
         );
     }
