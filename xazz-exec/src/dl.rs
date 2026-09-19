@@ -247,6 +247,52 @@ fn set_activation(ops: &mut [(LayerOp, Activation)], act: Activation) {
     }
 }
 
+/// Vocabulary size of the leading Embedding layer, if the model consumes raw
+/// category indices. The checker enforces Embedding-first, so there is at most one.
+fn first_embedding_vocab(layers: &[LayerKind]) -> Option<usize> {
+    match layers.first() {
+        Some(LayerKind::Embedding { vocab_size, .. }) if *vocab_size > 0 => Some(*vocab_size),
+        _ => None,
+    }
+}
+
+/// Counts raw embedding indices outside `[0, vocab_size - 1]`. The forward pass
+/// clamps them silently, so this feeds the runtime diagnostic below (issue D3).
+/// Non-finite values are excluded: the forward pass maps them to index 0.
+fn count_out_of_range_indices(values: &[f32], vocab_size: usize) -> usize {
+    let max = vocab_size.saturating_sub(1) as f32;
+    values
+        .iter()
+        .filter(|v| v.is_finite() && (**v < 0.0 || **v > max))
+        .count()
+}
+
+/// Emits the out-of-range embedding diagnostic to stderr. Non-fatal — the value
+/// is clamped, matching the documented forward-pass behaviour.
+fn warn_embedding_out_of_range(count: usize, vocab_size: usize) {
+    let max = vocab_size.saturating_sub(1);
+    let msg = if is_korean() {
+        format!(
+            "Embedding 입력 범주 인덱스 {count}개가 범위를 벗어났습니다 (vocab_size={vocab_size}). forward 에서 [0, {max}] 로 clamp 됩니다. 범주형 컬럼 값/스키마를 확인하세요."
+        )
+    } else {
+        format!(
+            "{count} embedding input index/indices are out of range (vocab_size={vocab_size}); they are clamped to [0, {max}] in the forward pass. Check the categorical column values/schema."
+        )
+    };
+    eprintln!("[xazz] {msg}");
+}
+
+/// Runs the out-of-range embedding diagnostic when the model consumes raw indices.
+fn check_embedding_indices(layers: &[LayerKind], values: &[f32]) {
+    if let Some(vocab_size) = first_embedding_vocab(layers) {
+        let count = count_out_of_range_indices(values, vocab_size);
+        if count > 0 {
+            warn_embedding_out_of_range(count, vocab_size);
+        }
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Training result report
 // ─────────────────────────────────────────────────────────────────────────────
@@ -490,6 +536,9 @@ where
                 xs.push(((v - fmean[j]) / fstd[j]) as f32);
             }
         }
+    }
+    if raw_input {
+        check_embedding_indices(layers, &xs);
     }
 
     let tmean: f64 = {
@@ -767,6 +816,9 @@ fn prepare_inference_input(
             }
         }
     }
+    if trained.model.raw_input {
+        check_embedding_indices(&trained.layers, &xs);
+    }
     Ok((xs, n, feature_count))
 }
 
@@ -853,3 +905,38 @@ where
 
 /// Layered model registry helper: <model name, LayerKind list>.
 pub type ModelRegistry = HashMap<String, Vec<LayerKind>>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn embedding_layer(vocab_size: usize) -> LayerKind {
+        LayerKind::Embedding {
+            vocab_size,
+            embed_dim: 2,
+        }
+    }
+
+    #[test]
+    fn first_embedding_vocab_reads_only_leading_embedding() {
+        assert_eq!(first_embedding_vocab(&[embedding_layer(5)]), Some(5));
+        assert_eq!(first_embedding_vocab(&[LayerKind::Dense(4)]), None);
+        assert_eq!(
+            first_embedding_vocab(&[LayerKind::Dense(4), embedding_layer(5)]),
+            None,
+            "Embedding 은 첫 레이어여야 한다"
+        );
+    }
+
+    #[test]
+    fn counts_only_out_of_range_finite_indices() {
+        // [0, vocab-1] 안쪽은 세지 않는다.
+        assert_eq!(count_out_of_range_indices(&[0.0, 1.0, 4.0], 5), 0);
+        // vocab-1 초과
+        assert_eq!(count_out_of_range_indices(&[0.0, 3.0, 4.0], 3), 2);
+        // 음수 인덱스
+        assert_eq!(count_out_of_range_indices(&[-1.0, 0.0], 5), 1);
+        // non-finite 는 forward 에서 0 으로 매핑되므로 세지 않는다.
+        assert_eq!(count_out_of_range_indices(&[f32::NAN, f32::INFINITY], 5), 0);
+    }
+}
