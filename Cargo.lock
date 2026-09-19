@@ -1072,6 +1072,7 @@ checksum = "6eb009254af15922cb37814f3b3b61043046193ba2fde97c3879a25fbd51a92e"
 dependencies = [
  "burn-backend",
  "burn-cubecl",
+ "burn-fusion",
  "cubecl",
 ]
 
@@ -8260,6 +8261,7 @@ version = "0.3.1"
 dependencies = [
  "burn",
  "burn-ndarray",
+ "burn-wgpu",
  "duckdb",
  "encoding_rs",
  "polars",

@@ -22,7 +22,7 @@ path = "src/main.rs"
 [features]
 default = []
 cuda = []
-wgpu = []
+wgpu = ["dep:burn-wgpu"]
 onnx = []
 
 [dependencies]
@@ -48,6 +48,12 @@ serde_json = "1"
 #   burn-wgpu  = { version = "0.21" }   (WebGPU/GPU 필요)
 burn = { version = "0.21", default-features = false, features = ["std", "autodiff"] }
 burn-ndarray = { version = "0.21", default-features = false, features = ["std", "burn-autodiff"] }
+
+# WebGPU provider (D1 #62) — pure-Rust GPU backend, enabled by the `wgpu` feature.
+# It needs no external SDK (unlike libtorch/onnxruntime); a Vulkan/Metal/DX12
+# device is probed at runtime, and a missing device falls back to CPU through the
+# resolver's warning path.
+burn-wgpu = { version = "0.21", optional = true }
 
 # ── DuckDB 외부 소스 커넥터 (issue #56, Track A3) ─────────────────────────────
 # bundled: embeds DuckDB (no system install needed).

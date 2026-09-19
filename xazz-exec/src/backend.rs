@@ -266,9 +266,10 @@ mod cuda {
 #[cfg(feature = "wgpu")]
 mod wgpu {
     use super::*;
-    use xazz_core::i18n::tr;
+    use burn_wgpu::Wgpu;
 
-    /// WebGPU provider (`burn-wgpu`). Scaffold — see issue D1 (#62).
+    /// WebGPU provider (`burn-wgpu`). Trains and predicts on a Vulkan/Metal/DX12
+    /// device; the portable checkpoint round-trips back to CPU for storage.
     pub struct WgpuBackend;
 
     impl ComputeBackend for WgpuBackend {
@@ -278,29 +279,21 @@ mod wgpu {
 
         fn train(
             &self,
-            _df: &DataFrame,
-            _model_name: &str,
-            _layers: &[LayerKind],
-            _config: &TrainConfig,
+            df: &DataFrame,
+            model_name: &str,
+            layers: &[LayerKind],
+            config: &TrainConfig,
         ) -> Result<TrainedModel, String> {
-            Err(tr(
-                "WGPU backend is a scaffold: add `burn-wgpu` and implement it (issue #62).",
-                "WGPU 백엔드는 스캐폴드입니다: `burn-wgpu`를 추가하고 구현하세요 (이슈 #62).",
-            )
-            .into())
+            crate::dl::train_on::<Wgpu<f32>>(df, model_name, layers, config)
         }
 
         fn predict(
             &self,
-            _trained: &TrainedModel,
-            _df: &DataFrame,
-            _as_col: Option<&str>,
+            trained: &TrainedModel,
+            df: &DataFrame,
+            as_col: Option<&str>,
         ) -> Result<DataFrame, String> {
-            Err(tr(
-                "WGPU backend is a scaffold: add `burn-wgpu` and implement it (issue #62).",
-                "WGPU 백엔드는 스캐폴드입니다: `burn-wgpu`를 추가하고 구현하세요 (이슈 #62).",
-            )
-            .into())
+            crate::dl::predict_on::<Wgpu<f32>>(trained, df, as_col)
         }
     }
 }
@@ -696,48 +689,79 @@ mod tests {
 // ─────────────────────────────────────────────────────────────────────────────
 // Hardware acceptance tests (issue D1 #62, D2 #63)
 //
-// These encode the contract the compiled provider must satisfy but require a
-// device/SDK absent in CI. They are `#[ignore]`d; on a matching host run:
+// These require a device/SDK absent in CI, so they are `#[ignore]`d; on a
+// matching host run:
 //
-//   cargo test -p xazz-exec --features cuda   -- --ignored
 //   cargo test -p xazz-exec --features wgpu   -- --ignored
+//   cargo test -p xazz-exec --features cuda   -- --ignored
 //   cargo test -p xazz-exec --features onnx   -- --ignored
 //
-// Until the provider dependency is wired they fail with the scaffold error,
-// which is why they are excluded from the default run.
+// `wgpu` is implemented: it trains on the device and evaluates the portable
+// checkpoint on the same device. The parity check compares inference from one
+// shared CPU-trained checkpoint on CPU vs the requested backend (identical
+// weights), rather than two independently-initialised training runs — random
+// initialisers differ across backends, so comparing losses from separate runs
+// would not be meaningful.
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[cfg(all(test, any(feature = "cuda", feature = "wgpu", feature = "onnx")))]
 mod acceptance {
     use super::ComputeBackend;
     use super::tests::tiny_dataset;
+    use polars::prelude::*;
 
-    /// Same data + hyperparameters on CPU and `requested`; reported training
-    /// loss must agree within tolerance, and prediction shape must match.
+    fn predictions(df: &DataFrame) -> Vec<f64> {
+        df.column("pred")
+            .expect("prediction column")
+            .f64()
+            .expect("float prediction column")
+            .into_no_null_iter()
+            .collect()
+    }
+
+    /// Trains the requested backend for real, then verifies numerical parity by
+    /// evaluating the same CPU-trained checkpoint on CPU and on `requested`.
     #[cfg(any(feature = "cuda", feature = "wgpu", feature = "onnx"))]
     fn assert_parity(requested: &str) {
         let (df, layers, config) = tiny_dataset();
         let cpu = super::CpuBackend
             .train(&df, "acc_cpu", &layers, &config)
             .expect("cpu reference train");
+
         let (backend, warning) = super::resolve(Some(requested));
         assert!(warning.is_none(), "{requested} should be compiled");
         assert_eq!(backend.id(), requested);
 
+        // Real device training must complete and produce a finite loss.
         let gpu = backend
             .train(&df, "acc_gpu", &layers, &config)
             .expect("backend train");
-        let diff = (cpu.report.final_train_loss - gpu.report.final_train_loss).abs();
         assert!(
-            diff < 1e-3,
-            "{requested} train loss diverged from CPU by {diff} (cpu={}, gpu={})",
-            cpu.report.final_train_loss,
-            gpu.report.final_train_loss
+            gpu.report.final_train_loss.is_finite(),
+            "{requested} produced a non-finite training loss"
         );
 
+        // Numerical parity: same weights (cpu checkpoint) evaluated on CPU and device.
+        let cpu_out = super::CpuBackend
+            .predict(&cpu, &df, Some("pred"))
+            .expect("cpu predict");
+        let gpu_out = backend
+            .predict(&cpu, &df, Some("pred"))
+            .expect("backend predict");
+        let max_diff = predictions(&cpu_out)
+            .into_iter()
+            .zip(predictions(&gpu_out))
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f64, f64::max);
+        assert!(
+            max_diff < 1e-3,
+            "{requested} inference diverged from CPU by {max_diff}"
+        );
+
+        // The device-trained artifact is usable for inference on the device.
         let out = backend
             .predict(&gpu, &df, Some("pred"))
-            .expect("backend predict");
+            .expect("backend predict (device-trained)");
         assert_eq!(out.height(), df.height());
 
         let _ = std::fs::remove_file(&cpu.report.checkpoint_path);

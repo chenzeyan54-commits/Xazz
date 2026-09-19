@@ -23,7 +23,7 @@ use burn::{
     tensor::{
         Device, Tensor, TensorData,
         activation::{relu, sigmoid, softmax, tanh},
-        backend::Backend,
+        backend::{AutodiffBackend, Backend},
     },
 };
 use burn_ndarray::NdArray;
@@ -37,6 +37,9 @@ use crate::tensor_bridge::{extract_data, series_to_f32};
 pub type AD = Autodiff<NdArray<f32>>;
 /// Pure backend for inference (CPU).
 pub type Plain = NdArray<f32>;
+
+/// One training batch on an autodiff backend: `(features, targets)`.
+type TrainBatch<B> = (Tensor<Autodiff<B>, 2>, Tensor<Autodiff<B>, 2>);
 
 /// Upper bound of the validation split ratio — at most this fraction of the data can be held out for validation.
 const MAX_VALIDATION_SPLIT: f64 = 0.9;
@@ -279,6 +282,9 @@ pub struct TrainedModel {
     pub model: Mlp<Plain>,
     /// Training result report (for markers/logs).
     pub report: TrainReport,
+    /// Declared layer graph, kept so a non-CPU provider can rebuild the module
+    /// structure and load the portable checkpoint onto its own device.
+    pub layers: Vec<LayerKind>,
     /// Feature column order (1:1 correspondence with standardization statistics).
     pub feature_names: Vec<String>,
     /// Per-feature mean (z-score).
@@ -340,13 +346,88 @@ pub fn save_checkpoint(model: &Mlp<Plain>, path: &str) -> Result<(), String> {
 // Public API
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Runs `dataset |> train(<model>, target: "...", ...)` and returns the trained model.
+/// Backend-agnostic training output: a plain (non-autodiff) module on backend `B`
+/// plus everything needed to build the portable [`TrainedModel`] artifact.
+struct RawTrained<B: Backend> {
+    model: Mlp<B>,
+    report: TrainReport,
+    feature_names: Vec<String>,
+    fmean: Vec<f64>,
+    fstd: Vec<f64>,
+    target: String,
+}
+
+/// Runs `dataset |> train(<model>, target: "...", ...)` on the default CPU backend.
 pub fn train(
     df: &DataFrame,
     model_name: &str,
     layers: &[LayerKind],
     config: &TrainConfig,
 ) -> Result<TrainedModel, String> {
+    let raw = train_impl::<NdArray<f32>>(df, model_name, layers, config)?;
+    Ok(TrainedModel {
+        model: raw.model,
+        report: raw.report,
+        layers: layers.to_vec(),
+        feature_names: raw.feature_names,
+        fmean: raw.fmean,
+        fstd: raw.fstd,
+        target: raw.target,
+    })
+}
+
+/// Trains on an arbitrary Burn backend `B`, then materialises the portable CPU
+/// [`TrainedModel`] artifact by round-tripping the checkpoint through Burn's
+/// backend-neutral record format. GPU providers (e.g. `burn-wgpu`) call this so
+/// the artifact they hand back is structurally identical to the CPU reference,
+/// and `predict`/`predict_on` can consume it on any device.
+pub fn train_on<B>(
+    df: &DataFrame,
+    model_name: &str,
+    layers: &[LayerKind],
+    config: &TrainConfig,
+) -> Result<TrainedModel, String>
+where
+    B: Backend,
+    Autodiff<B>: AutodiffBackend,
+    Mlp<Autodiff<B>>: AutodiffModule<Autodiff<B>, InnerModule = Mlp<B>>,
+{
+    let raw = train_impl::<B>(df, model_name, layers, config)?;
+    let device: Device<NdArray<f32>> = Default::default();
+    let template = build_mlp::<NdArray<f32>>(layers, raw.report.input_dim, &device)?;
+    let recorder = PrettyJsonFileRecorder::<FullPrecisionSettings>::new();
+    let mut model = template
+        .load_file(raw.report.checkpoint_path.as_str(), &recorder, &device)
+        .map_err(|e| {
+            format!(
+                "{}: {e}",
+                tr("checkpoint load failed", "체크포인트 로드 실패")
+            )
+        })?;
+    model.training = false;
+    Ok(TrainedModel {
+        model,
+        report: raw.report,
+        layers: layers.to_vec(),
+        feature_names: raw.feature_names,
+        fmean: raw.fmean,
+        fstd: raw.fstd,
+        target: raw.target,
+    })
+}
+
+/// Backend-agnostic training core: trains `Mlp<B>` and returns its report and stats.
+fn train_impl<B>(
+    df: &DataFrame,
+    model_name: &str,
+    layers: &[LayerKind],
+    config: &TrainConfig,
+) -> Result<RawTrained<B>, String>
+where
+    B: Backend,
+    Autodiff<B>: AutodiffBackend,
+    Mlp<Autodiff<B>>: AutodiffModule<Autodiff<B>, InnerModule = Mlp<B>>,
+{
     let (feature_names, features, targets) = extract_data(df, &config.target)?;
     let n = features.len();
     let input_dim = feature_names.len();
@@ -435,8 +516,8 @@ pub fn train(
     let train_n = n - val_n;
     let val_idx: Vec<usize> = (train_n..n).collect();
 
-    let device: Device<AD> = Default::default();
-    let mut model = build_mlp::<AD>(layers, input_dim, &device)?;
+    let device: Device<Autodiff<B>> = Default::default();
+    let mut model = build_mlp::<Autodiff<B>>(layers, input_dim, &device)?;
     // A regression target is a single scalar; a model that ends in Conv1d/Embedding
     // (or a multi-unit Dense without a final Dense(1)) produces several outputs.
     // Fail closed instead of silently broadcasting the target (which then breaks
@@ -457,9 +538,9 @@ pub fn train(
 
     let batch_size = config.batch_size.unwrap_or(train_n.max(1));
     let lr = config.learning_rate;
-    let mut optim = AdamConfig::new().init::<AD, _>();
+    let mut optim = AdamConfig::new().init::<Autodiff<B>, _>();
 
-    let make_batch = |idx: &[usize]| -> Option<(Tensor<AD, 2>, Tensor<AD, 2>)> {
+    let make_batch = |idx: &[usize]| -> Option<TrainBatch<B>> {
         if idx.is_empty() {
             return None;
         }
@@ -472,8 +553,8 @@ pub fn train(
             }
             yv.push(ys[i]);
         }
-        let x = Tensor::<AD, 2>::from_data(TensorData::new(xv, [b, input_dim]), &device);
-        let y = Tensor::<AD, 2>::from_data(TensorData::new(yv, [b, 1]), &device);
+        let x = Tensor::<Autodiff<B>, 2>::from_data(TensorData::new(xv, [b, input_dim]), &device);
+        let y = Tensor::<Autodiff<B>, 2>::from_data(TensorData::new(yv, [b, 1]), &device);
         Some((x, y))
     };
 
@@ -572,15 +653,15 @@ pub fn train(
 
     // ── Sample predictions (in-sample) ──────────────────────────────────────
     let n_pred = n.min(10);
-    let device_plain: Device<Plain> = Default::default();
+    let device_plain: Device<B> = Default::default();
     let mut xv = Vec::with_capacity(n_pred * input_dim);
     for i in 0..n_pred {
         for j in 0..input_dim {
             xv.push(xs[i * input_dim + j]);
         }
     }
-    let xp = Tensor::<Plain, 2>::from_data(TensorData::new(xv, [n_pred, input_dim]), &device_plain);
-    let mut valid_model = model.valid();
+    let xp = Tensor::<B, 2>::from_data(TensorData::new(xv, [n_pred, input_dim]), &device_plain);
+    let mut valid_model: Mlp<B> = model.valid();
     valid_model.training = false;
     let pred_t = valid_model.forward(xp);
     let preds = pred_t.into_data().to_vec::<f32>().unwrap_or_default();
@@ -632,7 +713,7 @@ pub fn train(
         best_epoch,
     };
 
-    Ok(TrainedModel {
+    Ok(RawTrained {
         model: valid_model,
         report,
         feature_names,
@@ -642,14 +723,13 @@ pub fn train(
     })
 }
 
-/// `dataset |> predict(model_var, as: "col")` — adds a prediction column using the trained model.
-///
-/// Default prediction column name: `<target>_pred`.
-pub fn predict(
+/// Shared inference preprocessing: validates the frame, reads the feature columns
+/// in training order, and applies the same standardization used during training.
+/// Returns `(xs, rows, feature_count)`.
+fn prepare_inference_input(
     trained: &TrainedModel,
     df: &DataFrame,
-    as_col: Option<&str>,
-) -> Result<DataFrame, String> {
+) -> Result<(Vec<f32>, usize, usize), String> {
     let feature_count = trained.feature_names.len();
     let n = df.height();
     if feature_count == 0 {
@@ -687,14 +767,16 @@ pub fn predict(
             }
         }
     }
+    Ok((xs, n, feature_count))
+}
 
-    let device: Device<Plain> = Default::default();
-    let x = Tensor::<Plain, 2>::from_data(TensorData::new(xs, [n, feature_count]), &device);
-    let mut infer_model = trained.model.clone();
-    infer_model.training = false;
-    let pred_t = infer_model.forward(x);
-    let preds = pred_t.into_data().to_vec::<f32>().unwrap_or_default();
-
+/// Appends the prediction column to a clone of `df`.
+fn attach_prediction(
+    trained: &TrainedModel,
+    df: &DataFrame,
+    preds: &[f32],
+    as_col: Option<&str>,
+) -> Result<DataFrame, String> {
     let out_col = match as_col {
         Some(c) => c.to_string(),
         None => format!("{}_pred", trained.target),
@@ -710,6 +792,63 @@ pub fn predict(
             )
         })?;
     Ok(out)
+}
+
+/// `dataset |> predict(model_var, as: "col")` — adds a prediction column using the trained model.
+///
+/// Default prediction column name: `<target>_pred`. Runs on the CPU reference
+/// backend using the in-memory model.
+pub fn predict(
+    trained: &TrainedModel,
+    df: &DataFrame,
+    as_col: Option<&str>,
+) -> Result<DataFrame, String> {
+    let (xs, n, feature_count) = prepare_inference_input(trained, df)?;
+
+    let device: Device<Plain> = Default::default();
+    let x = Tensor::<Plain, 2>::from_data(TensorData::new(xs, [n, feature_count]), &device);
+    let mut infer_model = trained.model.clone();
+    infer_model.training = false;
+    let pred_t = infer_model.forward(x);
+    let preds = pred_t.into_data().to_vec::<f32>().unwrap_or_default();
+
+    attach_prediction(trained, df, &preds, as_col)
+}
+
+/// `predict` on an arbitrary Burn backend `B`.
+///
+/// Rebuilds the declared module graph on `B` and loads the portable checkpoint
+/// saved during training, so a GPU provider runs the forward pass on its own
+/// device. The checkpoint is backend-neutral, so the same artifact can be
+/// evaluated on CPU and GPU with matching predictions.
+pub fn predict_on<B>(
+    trained: &TrainedModel,
+    df: &DataFrame,
+    as_col: Option<&str>,
+) -> Result<DataFrame, String>
+where
+    B: Backend,
+{
+    let (xs, n, feature_count) = prepare_inference_input(trained, df)?;
+
+    let device: Device<B> = Default::default();
+    let template = build_mlp::<B>(&trained.layers, feature_count, &device)?;
+    let recorder = PrettyJsonFileRecorder::<FullPrecisionSettings>::new();
+    let mut infer_model = template
+        .load_file(trained.report.checkpoint_path.as_str(), &recorder, &device)
+        .map_err(|e| {
+            format!(
+                "{}: {e}",
+                tr("checkpoint load failed", "체크포인트 로드 실패")
+            )
+        })?;
+    infer_model.training = false;
+
+    let x = Tensor::<B, 2>::from_data(TensorData::new(xs, [n, feature_count]), &device);
+    let pred_t = infer_model.forward(x);
+    let preds = pred_t.into_data().to_vec::<f32>().unwrap_or_default();
+
+    attach_prediction(trained, df, &preds, as_col)
 }
 
 /// Layered model registry helper: <model name, LayerKind list>.
