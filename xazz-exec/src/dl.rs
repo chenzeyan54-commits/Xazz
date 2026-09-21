@@ -100,11 +100,16 @@ pub struct Mlp<B: Backend> {
     linears: Vec<Linear<B>>,
     /// Sequence of Conv1d(out_channels, kernel_size) layers.
     convs: Vec<Conv1d<B>>,
-    /// Sequence of Embedding(vocab_size, embed_dim) layers.
+    /// Sequence of Embedding(vocab, embed_dim) layers.
     embeddings: Vec<Embedding<B>>,
-    /// Per-embedding vocabulary size (for index clamping); parallel to `embeddings`.
+    /// Per-embedding, per-column vocabulary size (for index clamping); parallel
+    /// to `embeddings`.
     #[module(skip)]
-    embed_vocab: Vec<usize>,
+    embed_vocab: Vec<Vec<usize>>,
+    /// Per-embedding, per-column row offset into the combined table; parallel to
+    /// `embeddings` and `embed_vocab`.
+    #[module(skip)]
+    embed_offsets: Vec<Vec<usize>>,
     /// Forward order: each entry pairs an op with the activation applied after it.
     #[module(skip)]
     ops: Vec<(LayerOp, Activation)>,
@@ -136,9 +141,21 @@ impl<B: Backend> Mlp<B> {
                     apply_activation(act, y.reshape([b, c * l]), self.training)
                 }
                 LayerOp::Embedding(i) => {
-                    // [batch, len] category indices → [batch, len, embed_dim] → [batch, len * embed_dim]
-                    let vmax = self.embed_vocab[*i].saturating_sub(1) as f32;
-                    let idx = x.clamp(0.0, vmax).int();
+                    // [batch, len] category indices → [batch, len, embed_dim] → [batch, len * embed_dim].
+                    // Each input column j has its own vocab and row offset in the combined table.
+                    let vocabs = &self.embed_vocab[*i];
+                    let offsets = &self.embed_offsets[*i];
+                    let [_, len] = x.dims();
+                    let mut cols: Vec<Tensor<B, 2>> = Vec::with_capacity(len);
+                    for (j, (&v, &offset)) in vocabs.iter().zip(offsets).enumerate() {
+                        let idx = x
+                            .clone()
+                            .narrow(1, j, 1)
+                            .clamp(0.0, v.saturating_sub(1) as f32)
+                            + offset as f32;
+                        cols.push(idx);
+                    }
+                    let idx = Tensor::cat(cols, 1).int();
                     let y = self.embeddings[*i].forward(idx);
                     let [b, l, d] = y.dims();
                     apply_activation(act, y.reshape([b, l * d]), self.training)
@@ -158,7 +175,8 @@ fn build_mlp<B: Backend>(
     let mut linears: Vec<Linear<B>> = Vec::new();
     let mut convs: Vec<Conv1d<B>> = Vec::new();
     let mut embeddings: Vec<Embedding<B>> = Vec::new();
-    let mut embed_vocab: Vec<usize> = Vec::new();
+    let mut embed_vocab: Vec<Vec<usize>> = Vec::new();
+    let mut embed_offsets: Vec<Vec<usize>> = Vec::new();
     let mut ops: Vec<(LayerOp, Activation)> = Vec::new();
     let mut cur = input_dim;
 
@@ -194,20 +212,35 @@ fn build_mlp<B: Backend>(
                 )
                 .into());
             }
-            LayerKind::Embedding {
-                vocab_size,
-                embed_dim,
-            } if *vocab_size > 0 && *embed_dim > 0 => {
-                embeddings.push(EmbeddingConfig::new(*vocab_size, *embed_dim).init(device));
+            LayerKind::Embedding { vocab, embed_dim } if vocab.is_valid() && *embed_dim > 0 => {
+                // One combined table per embedding layer; input column j owns the
+                // disjoint row range [offset_j, offset_j + vocab_j).
+                let sizes = vocab.expand(cur)?;
+                let total: usize = sizes.iter().sum();
+                if total == 0 {
+                    return Err(tr(
+                        "Embedding has no vocabulary entries to embed.",
+                        "Embedding 에 임베딩할 vocab 항목이 없습니다.",
+                    )
+                    .into());
+                }
+                embeddings.push(EmbeddingConfig::new(total, *embed_dim).init(device));
+                let mut offsets = Vec::with_capacity(sizes.len());
+                let mut offset = 0usize;
+                for size in &sizes {
+                    offsets.push(offset);
+                    offset += size;
+                }
                 ops.push((LayerOp::Embedding(embeddings.len() - 1), Activation::None));
-                embed_vocab.push(*vocab_size);
+                embed_vocab.push(sizes);
+                embed_offsets.push(offsets);
                 // Each of the `cur` input positions is embedded into `embed_dim` features.
                 cur *= *embed_dim;
             }
             LayerKind::Embedding { .. } => {
                 return Err(tr(
-                    "Embedding vocab_size and embed_dim must be >= 1.",
-                    "Embedding 의 vocab_size 와 embed_dim 은 1 이상이어야 합니다.",
+                    "Embedding vocab and embed_dim must be >= 1.",
+                    "Embedding 의 vocab 과 embed_dim 은 1 이상이어야 합니다.",
                 )
                 .into());
             }
@@ -233,6 +266,7 @@ fn build_mlp<B: Backend>(
         convs,
         embeddings,
         embed_vocab,
+        embed_offsets,
         ops,
         out_dim: cur,
         raw_input: matches!(layers.first(), Some(LayerKind::Embedding { .. })),
@@ -247,11 +281,14 @@ fn set_activation(ops: &mut [(LayerOp, Activation)], act: Activation) {
     }
 }
 
-/// Vocabulary size of the leading Embedding layer, if the model consumes raw
-/// category indices. The checker enforces Embedding-first, so there is at most one.
-fn first_embedding_vocab(layers: &[LayerKind]) -> Option<usize> {
+/// Per-column vocabulary sizes of the leading Embedding layer, if the model
+/// consumes raw category indices. The checker enforces Embedding-first, so there
+/// is at most one such layer.
+fn leading_embedding_vocabs(layers: &[LayerKind], feature_count: usize) -> Option<Vec<usize>> {
     match layers.first() {
-        Some(LayerKind::Embedding { vocab_size, .. }) if *vocab_size > 0 => Some(*vocab_size),
+        Some(LayerKind::Embedding { vocab, .. }) if vocab.is_valid() => {
+            vocab.expand(feature_count).ok()
+        }
         _ => None,
     }
 }
@@ -267,28 +304,61 @@ fn count_out_of_range_indices(values: &[f32], vocab_size: usize) -> usize {
         .count()
 }
 
+/// Counts out-of-range indices across all columns, each against its own vocab.
+fn count_out_of_range_per_column(values: &[f32], feature_count: usize, vocabs: &[usize]) -> usize {
+    if feature_count == 0 {
+        return 0;
+    }
+    let mut count = 0usize;
+    for (idx, v) in values.iter().enumerate() {
+        if let Some(&vocab) = vocabs.get(idx % feature_count) {
+            count += count_out_of_range_indices(std::slice::from_ref(v), vocab);
+        }
+    }
+    count
+}
+
 /// Emits the out-of-range embedding diagnostic to stderr. Non-fatal — the value
 /// is clamped, matching the documented forward-pass behaviour.
-fn warn_embedding_out_of_range(count: usize, vocab_size: usize) {
-    let max = vocab_size.saturating_sub(1);
-    let msg = if is_korean() {
-        format!(
-            "Embedding 입력 범주 인덱스 {count}개가 범위를 벗어났습니다 (vocab_size={vocab_size}). forward 에서 [0, {max}] 로 clamp 됩니다. 범주형 컬럼 값/스키마를 확인하세요."
-        )
+fn warn_embedding_out_of_range(count: usize, vocabs: &[usize]) {
+    let uniform = vocabs.windows(2).all(|w| w[0] == w[1]);
+    let msg = if uniform {
+        let vocab_size = vocabs.first().copied().unwrap_or(0);
+        let max = vocab_size.saturating_sub(1);
+        if is_korean() {
+            format!(
+                "Embedding 입력 범주 인덱스 {count}개가 범위를 벗어났습니다 (vocab_size={vocab_size}). forward 에서 [0, {max}] 로 clamp 됩니다. 범주형 컬럼 값/스키마를 확인하세요."
+            )
+        } else {
+            format!(
+                "{count} embedding input index/indices are out of range (vocab_size={vocab_size}); they are clamped to [0, {max}] in the forward pass. Check the categorical column values/schema."
+            )
+        }
     } else {
-        format!(
-            "{count} embedding input index/indices are out of range (vocab_size={vocab_size}); they are clamped to [0, {max}] in the forward pass. Check the categorical column values/schema."
-        )
+        let list = vocabs
+            .iter()
+            .map(|v| v.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        if is_korean() {
+            format!(
+                "Embedding 입력 범주 인덱스 {count}개가 범위를 벗어났습니다 (컬럼별 vocab=[{list}]). forward 에서 컬럼별 [0, vocab-1] 로 clamp 됩니다. 범주형 컬럼 값/스키마를 확인하세요."
+            )
+        } else {
+            format!(
+                "{count} embedding input index/indices are out of range (per-column vocab=[{list}]); they are clamped to each column's [0, vocab-1] in the forward pass. Check the categorical column values/schema."
+            )
+        }
     };
     eprintln!("[xazz] {msg}");
 }
 
 /// Runs the out-of-range embedding diagnostic when the model consumes raw indices.
-fn check_embedding_indices(layers: &[LayerKind], values: &[f32]) {
-    if let Some(vocab_size) = first_embedding_vocab(layers) {
-        let count = count_out_of_range_indices(values, vocab_size);
+fn check_embedding_indices(layers: &[LayerKind], values: &[f32], feature_count: usize) {
+    if let Some(vocabs) = leading_embedding_vocabs(layers, feature_count) {
+        let count = count_out_of_range_per_column(values, feature_count, &vocabs);
         if count > 0 {
-            warn_embedding_out_of_range(count, vocab_size);
+            warn_embedding_out_of_range(count, &vocabs);
         }
     }
 }
@@ -538,7 +608,7 @@ where
         }
     }
     if raw_input {
-        check_embedding_indices(layers, &xs);
+        check_embedding_indices(layers, &xs, input_dim);
     }
 
     let tmean: f64 = {
@@ -817,7 +887,7 @@ fn prepare_inference_input(
         }
     }
     if trained.model.raw_input {
-        check_embedding_indices(&trained.layers, &xs);
+        check_embedding_indices(&trained.layers, &xs, feature_count);
     }
     Ok((xs, n, feature_count))
 }
@@ -909,22 +979,55 @@ pub type ModelRegistry = HashMap<String, Vec<LayerKind>>;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use xazz_compiler::ast::EmbeddingVocab;
 
-    fn embedding_layer(vocab_size: usize) -> LayerKind {
+    fn embedding_layer(vocab: EmbeddingVocab) -> LayerKind {
         LayerKind::Embedding {
-            vocab_size,
+            vocab,
             embed_dim: 2,
         }
     }
 
     #[test]
-    fn first_embedding_vocab_reads_only_leading_embedding() {
-        assert_eq!(first_embedding_vocab(&[embedding_layer(5)]), Some(5));
-        assert_eq!(first_embedding_vocab(&[LayerKind::Dense(4)]), None);
+    fn leading_embedding_vocabs_expands_shared_and_per_column() {
+        // A shared vocab is replicated for every input column.
         assert_eq!(
-            first_embedding_vocab(&[LayerKind::Dense(4), embedding_layer(5)]),
+            leading_embedding_vocabs(&[embedding_layer(EmbeddingVocab::Shared(5))], 3),
+            Some(vec![5, 5, 5])
+        );
+        // A per-column list is returned as-is when its length matches.
+        assert_eq!(
+            leading_embedding_vocabs(&[embedding_layer(EmbeddingVocab::PerColumn(vec![4, 7]))], 2),
+            Some(vec![4, 7])
+        );
+        // A length mismatch cannot be diagnosed here (build_mlp rejects it).
+        assert_eq!(
+            leading_embedding_vocabs(&[embedding_layer(EmbeddingVocab::PerColumn(vec![4]))], 2),
+            None
+        );
+        assert_eq!(leading_embedding_vocabs(&[LayerKind::Dense(4)], 2), None);
+        assert_eq!(
+            leading_embedding_vocabs(
+                &[
+                    LayerKind::Dense(4),
+                    embedding_layer(EmbeddingVocab::Shared(5))
+                ],
+                2
+            ),
             None,
             "Embedding 은 첫 레이어여야 한다"
+        );
+    }
+
+    #[test]
+    fn counts_out_of_range_per_column_against_each_vocab() {
+        // 2 columns, row-major: col0 vocab 3, col1 vocab 5.
+        let values = vec![0.0, 0.0, 3.0, 4.0, -1.0, 9.0];
+        assert_eq!(count_out_of_range_per_column(&values, 2, &[3, 5]), 3);
+        // A uniform shared vocab still checks every column.
+        assert_eq!(
+            count_out_of_range_per_column(&[0.0, 9.0, 2.0, 1.0], 2, &[3, 3]),
+            1
         );
     }
 

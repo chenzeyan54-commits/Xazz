@@ -1587,10 +1587,9 @@ fn handle_model_decl(name: &str, layers: &[LayerKind]) {
                 out_channels,
                 kernel_size,
             } => format!("Conv1d({}, {})", out_channels, kernel_size),
-            LayerKind::Embedding {
-                vocab_size,
-                embed_dim,
-            } => format!("Embedding({}, {})", vocab_size, embed_dim),
+            LayerKind::Embedding { vocab, embed_dim } => {
+                format!("Embedding({}, {})", vocab.display(), embed_dim)
+            }
         };
         println!("    [{}] {}  →  {}", i, layer_desc, layer.to_burn_str());
     }

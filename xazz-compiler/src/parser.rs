@@ -44,9 +44,9 @@
 ///   - withColumn() operator parsing
 ///   - arithmetic precedence: * / > + - > comparison operators
 use crate::ast::{
-    AggFn, AggSpec, BinOpKind, ChartConfig, ChartType, DpArgs, DpMechanism, Expr, FillNullValue,
-    JoinHow, LayerKind, LoadOptions, PipelineOp, PipelineSource, Program, SaveFormat, Stmt,
-    StructField, TrainConfig,
+    AggFn, AggSpec, BinOpKind, ChartConfig, ChartType, DpArgs, DpMechanism, EmbeddingVocab, Expr,
+    FillNullValue, JoinHow, LayerKind, LoadOptions, PipelineOp, PipelineSource, Program,
+    SaveFormat, Stmt, StructField, TrainConfig,
 };
 use crate::error::{CompileError, CompileResult, ErrorKind};
 use crate::token::{Span, Token, TokenKind};
@@ -209,13 +209,10 @@ impl Parser {
                 }
             }
             "Embedding" => {
-                let vocab_size = self.expect_number()? as usize;
+                let vocab = self.parse_embedding_vocab()?;
                 self.expect(&TokenKind::Comma)?;
                 let embed_dim = self.expect_number()? as usize;
-                LayerKind::Embedding {
-                    vocab_size,
-                    embed_dim,
-                }
+                LayerKind::Embedding { vocab, embed_dim }
             }
             other => {
                 return Err(CompileError::new(
@@ -315,6 +312,33 @@ impl Parser {
             Ok(vals)
         } else {
             Ok(vec![self.expect_number()? as usize])
+        }
+    }
+
+    /// Parses an `Embedding` vocab argument: either a scalar (`10`, one shared
+    /// table for every input column) or a bracketed per-column list (`[4, 7]`).
+    /// An empty list is rejected.
+    fn parse_embedding_vocab(&mut self) -> CompileResult<EmbeddingVocab> {
+        if self.eat(&TokenKind::LBracket) {
+            if matches!(self.current_kind(), TokenKind::RBracket) {
+                return Err(CompileError::new(
+                    ErrorKind::UnexpectedToken("]".into()),
+                    self.current_span(),
+                    "Embedding vocab 목록은 비어 있을 수 없습니다.",
+                ));
+            }
+            let mut vals = Vec::new();
+            loop {
+                vals.push(self.expect_number()? as usize);
+                if self.eat(&TokenKind::Comma) {
+                    continue;
+                }
+                break;
+            }
+            self.expect(&TokenKind::RBracket)?;
+            Ok(EmbeddingVocab::PerColumn(vals))
+        } else {
+            Ok(EmbeddingVocab::Shared(self.expect_number()? as usize))
         }
     }
 
@@ -2081,7 +2105,7 @@ type AirQuality = {
                 assert_eq!(
                     layers[0],
                     LayerKind::Embedding {
-                        vocab_size: 10,
+                        vocab: EmbeddingVocab::Shared(10),
                         embed_dim: 4
                     }
                 );
@@ -2090,6 +2114,30 @@ type AirQuality = {
             }
             other => panic!("ModelDecl 예상, 실제: {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_model_embedding_per_column_vocab_parse() {
+        let src = r#"model Rec { Embedding([4, 7, 2], 3) -> ReLU() -> Dense(1) }"#;
+        let program = parse_src(src).expect("파싱 실패");
+        match &program.stmts[0] {
+            Stmt::ModelDecl { layers, .. } => {
+                assert_eq!(
+                    layers[0],
+                    LayerKind::Embedding {
+                        vocab: EmbeddingVocab::PerColumn(vec![4, 7, 2]),
+                        embed_dim: 3
+                    }
+                );
+            }
+            other => panic!("ModelDecl 예상, 실제: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_model_embedding_empty_vocab_list_is_error() {
+        let src = r#"model Rec { Embedding([], 3) -> Dense(1) }"#;
+        assert!(parse_src(src).is_err(), "빈 vocab 목록은 오류여야 함");
     }
 
     // ── D3 hyperparameter sweep list arguments ────────────────────────────────

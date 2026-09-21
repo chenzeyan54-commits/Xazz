@@ -24,7 +24,8 @@ use std::collections::HashMap;
 use std::fs;
 
 use crate::ast::{
-    Expr, LayerKind, LoadOptions, PipelineOp, PipelineSource, Program, Stmt, TrainConfig,
+    EmbeddingVocab, Expr, LayerKind, LoadOptions, PipelineOp, PipelineSource, Program, Stmt,
+    TrainConfig,
 };
 use crate::policy::printer::escape;
 use crate::{Codegen, Lexer, Parser, StructField};
@@ -718,8 +719,8 @@ enum DlLayer {
     Dense(usize, String),
     /// Conv1d(out_channels, kernel_size, activation)
     Conv1d(usize, usize, String),
-    /// Embedding(vocab_size, embed_dim, activation)
-    Embedding(usize, usize, String),
+    /// Embedding(vocab, embed_dim, activation)
+    Embedding(EmbeddingVocab, usize, String),
 }
 
 /// Normalizes a DSL layer chain into ordered Dense/Conv1d specs.
@@ -738,14 +739,13 @@ fn dl_layer_specs(layers: &[LayerKind]) -> Vec<DlLayer> {
                 String::from("None"),
             )),
             LayerKind::Conv1d { .. } => {}
-            LayerKind::Embedding {
-                vocab_size,
-                embed_dim,
-            } if *vocab_size > 0 && *embed_dim > 0 => specs.push(DlLayer::Embedding(
-                *vocab_size,
-                *embed_dim,
-                String::from("None"),
-            )),
+            LayerKind::Embedding { vocab, embed_dim } if vocab.is_valid() && *embed_dim > 0 => {
+                specs.push(DlLayer::Embedding(
+                    vocab.clone(),
+                    *embed_dim,
+                    String::from("None"),
+                ))
+            }
             LayerKind::Embedding { .. } => {}
             LayerKind::ReLU => set_dl_act(&mut specs, "relu"),
             LayerKind::Sigmoid => set_dl_act(&mut specs, "sigmoid"),
@@ -788,15 +788,39 @@ fn emit_dl_model_struct(name: &str, layers: &[LayerKind]) -> String {
                 out.push_str(&format!("    conv{i}: Conv1d<B>,  // Conv1d({c}, {k})\n"))
             }
             DlLayer::Embedding(v, d, _) => out.push_str(&format!(
-                "    embed{i}: Embedding<B>,  // Embedding({v}, {d})\n"
+                "    embed{i}: Embedding<B>,  // Embedding({}, {d})\n    #[module(skip)]\n    embed_vocab{i}: Vec<usize>,\n",
+                v.display()
             )),
         }
     }
     out.push_str("}\n\n");
 
     out.push_str(&format!(
-        "impl<B: Backend> {name}<B> {{\n    fn new(device: &Device<B>, input_dim: usize) -> Self {{\n        Self {{\n"
+        "impl<B: Backend> {name}<B> {{\n    fn new(device: &Device<B>, input_dim: usize) -> Self {{\n"
     ));
+    // Per-column vocabularies need `input_dim` to replicate a shared vocab; the
+    // generated module keeps the expanded per-column list alongside the single
+    // combined embedding table (disjoint row ranges, one per column).
+    for (i, spec) in specs.iter().enumerate() {
+        if let DlLayer::Embedding(v, _, _) = spec {
+            match v {
+                EmbeddingVocab::Shared(size) => out.push_str(&format!(
+                    "        let embed_vocab{i}: Vec<usize> = vec![{size}; input_dim];\n"
+                )),
+                EmbeddingVocab::PerColumn(sizes) => {
+                    let list = sizes
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    out.push_str(&format!(
+                        "        let embed_vocab{i}: Vec<usize> = vec![{list}];\n        assert_eq!(embed_vocab{i}.len(), input_dim, \"Embedding per-column vocab length must match the feature count\");\n"
+                    ));
+                }
+            }
+        }
+    }
+    out.push_str("        Self {\n");
     let mut cur = "input_dim".to_string();
     for (i, spec) in specs.iter().enumerate() {
         match spec {
@@ -812,9 +836,9 @@ fn emit_dl_model_struct(name: &str, layers: &[LayerKind]) -> String {
                 ));
                 cur = format!("{c} * {cur}");
             }
-            DlLayer::Embedding(v, d, _) => {
+            DlLayer::Embedding(_, d, _) => {
                 out.push_str(&format!(
-                    "            embed{i}: EmbeddingConfig::new({v}, {d}).init(device),\n"
+                    "            embed{i}: EmbeddingConfig::new(embed_vocab{i}.iter().sum::<usize>(), {d}).init(device),\n            embed_vocab{i},\n"
                 ));
                 cur = format!("{d} * {cur}");
             }
@@ -838,11 +862,21 @@ fn emit_dl_model_struct(name: &str, layers: &[LayerKind]) -> String {
                 out.push_str("        let x = x.reshape([b, c * l]);\n");
                 emit_dl_act(&mut out, act);
             }
-            DlLayer::Embedding(v, _, act) => {
-                out.push_str(&format!(
-                    "        let idx = x.clamp(0.0, {}f32).int();\n",
-                    v.saturating_sub(1)
-                ));
+            DlLayer::Embedding(_, _, act) => {
+                // Each column j uses its own row range in the combined table:
+                // index = clamp(value, 0, vocab_j - 1) + offset_j.
+                out.push_str("        let [_, len] = x.dims();\n");
+                out.push_str(&format!("        let vocabs = &self.embed_vocab{i};\n"));
+                out.push_str("        let mut offset = 0usize;\n");
+                out.push_str(
+                    "        let mut cols: Vec<Tensor<B, 2>> = Vec::with_capacity(len);\n",
+                );
+                out.push_str("        for (j, &v) in vocabs.iter().enumerate() {\n");
+                out.push_str("            let idx = x.clone().narrow(1, j, 1).clamp(0.0, v.saturating_sub(1) as f32) + offset as f32;\n");
+                out.push_str("            cols.push(idx);\n");
+                out.push_str("            offset += v;\n");
+                out.push_str("        }\n");
+                out.push_str("        let idx = Tensor::cat(cols, 1).int();\n");
                 out.push_str(&format!("        let x = self.embed{i}.forward(idx);\n"));
                 out.push_str("        let [b, l, d] = x.dims();\n");
                 out.push_str("        let x = x.reshape([b, l * d]);\n");
@@ -1517,6 +1551,53 @@ mod tests {
         assert!(out.contains("use burn::"), "burn import 없음");
         assert!(out.contains("struct M<B: Backend>"), "모델 구조체 없음");
         assert!(out.contains("Adam"), "Adam 옵티마이저 없음");
+    }
+
+    /// D3 Embedding: a shared vocab is replicated per input column into one
+    /// combined table, and each column's index is offset into its row range.
+    #[test]
+    fn emit_rust_embedding_shared_vocab() {
+        let out = emit(
+            "type S = { a: float, b: float, y: float };
+             model M { Embedding(10, 4) -> ReLU() -> Dense(1) }
+             v data = load(\"x.csv\") :: S;
+             run data |> train(M, target: \"y\", epochs: 3);",
+        );
+        assert!(
+            out.contains("embed_vocab0: Vec<usize> = vec![10; input_dim];"),
+            "shared vocab 복제 누락: {out}"
+        );
+        assert!(
+            out.contains("EmbeddingConfig::new(embed_vocab0.iter().sum::<usize>(), 4)"),
+            "결합 임베딩 테이블 누락: {out}"
+        );
+        assert!(
+            out.contains("Tensor::cat(cols, 1).int()"),
+            "컬럼별 인덱스 결합 누락: {out}"
+        );
+        assert!(
+            out.contains("keep raw category indices"),
+            "정규화 생략 누락: {out}"
+        );
+    }
+
+    /// D3 Embedding: a per-column list is emitted verbatim with a length assert.
+    #[test]
+    fn emit_rust_embedding_per_column_vocab() {
+        let out = emit(
+            "type S = { a: float, b: float, y: float };
+             model M { Embedding([3, 5], 2) -> ReLU() -> Dense(1) }
+             v data = load(\"x.csv\") :: S;
+             run data |> train(M, target: \"y\", epochs: 3);",
+        );
+        assert!(
+            out.contains("embed_vocab0: Vec<usize> = vec![3, 5];"),
+            "per-column vocab 누락: {out}"
+        );
+        assert!(
+            out.contains("assert_eq!(embed_vocab0.len(), input_dim"),
+            "길이 검증 누락: {out}"
+        );
     }
 
     /// D3 sweep: list-valued train args emit a cartesian grid loop + best tracking.

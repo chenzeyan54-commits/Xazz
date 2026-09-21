@@ -20,9 +20,9 @@ pub use token::{Span, Token, TokenKind};
 
 // ast
 pub use ast::{
-    AggFn, AggSpec, BinOpKind, ChartConfig, ChartType, DpArgs, DpMechanism, Expr, FillNullValue,
-    JoinHow, LayerKind, LoadOptions, PipelineOp, PipelineSource, Program, Stmt, StructField,
-    TrainConfig,
+    AggFn, AggSpec, BinOpKind, ChartConfig, ChartType, DpArgs, DpMechanism, EmbeddingVocab, Expr,
+    FillNullValue, JoinHow, LayerKind, LoadOptions, PipelineOp, PipelineSource, Program, Stmt,
+    StructField, TrainConfig,
 };
 
 // error

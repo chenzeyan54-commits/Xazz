@@ -436,6 +436,7 @@ pub fn active() -> &'static dyn ComputeBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use xazz_compiler::ast::EmbeddingVocab;
 
     /// Tiny separable regression set shared by the CPU round-trip test and the
     /// hardware acceptance tests.
@@ -611,7 +612,7 @@ mod tests {
 
         let layers = vec![
             LayerKind::Embedding {
-                vocab_size: 4,
+                vocab: EmbeddingVocab::Shared(4),
                 embed_dim: 3,
             },
             LayerKind::ReLU,
@@ -643,6 +644,75 @@ mod tests {
         assert!(out.column("pred").is_ok());
 
         cleanup(&trained.report.checkpoint_path);
+    }
+
+    /// D3 Embedding: each input column can use its own vocabulary.
+    #[test]
+    fn cpu_backend_trains_per_column_embedding_model() {
+        use polars::prelude::*;
+
+        let df = df!(
+            "cat1" => [0i64, 1, 2, 0, 1, 2],
+            "cat2" => [0i64, 4, 2, 3, 1, 0],
+            "y"    => [0.0f64, 1.0, 2.0, 0.0, 1.0, 2.0],
+        )
+        .expect("per-column embedding dataset");
+
+        let layers = vec![
+            LayerKind::Embedding {
+                vocab: EmbeddingVocab::PerColumn(vec![3, 5]),
+                embed_dim: 2,
+            },
+            LayerKind::ReLU,
+            LayerKind::Dense(1),
+        ];
+        let config = TrainConfig {
+            target: "y".to_string(),
+            epochs: 3,
+            learning_rate: 0.05,
+            batch_size: Some(3),
+            validation_split: None,
+            early_stopping_patience: None,
+            sweep: Default::default(),
+        };
+
+        let (backend, warning) = resolve(None);
+        assert!(warning.is_none());
+
+        let trained = backend
+            .train(&df, "backend_unit_embedding_percol", &layers, &config)
+            .expect("per-column embedding train");
+        assert_eq!(trained.report.input_dim, 2);
+        assert_eq!(trained.report.output_dim, 1);
+
+        let out = backend
+            .predict(&trained, &df, Some("pred"))
+            .expect("per-column embedding predict");
+        assert_eq!(out.height(), df.height());
+        assert!(out.column("pred").is_ok());
+
+        cleanup(&trained.report.checkpoint_path);
+    }
+
+    /// D3 Embedding: a per-column vocab list must match the feature count.
+    #[test]
+    fn cpu_backend_rejects_per_column_vocab_mismatch() {
+        let (df, _layers, config) = tiny_dataset();
+        let layers = vec![
+            LayerKind::Embedding {
+                vocab: EmbeddingVocab::PerColumn(vec![3]),
+                embed_dim: 2,
+            },
+            LayerKind::Dense(1),
+        ];
+
+        let (backend, warning) = resolve(None);
+        assert!(warning.is_none());
+
+        let err = backend
+            .train(&df, "backend_unit_vocab_mismatch", &layers, &config)
+            .expect_err("per-column vocab length mismatch must be rejected");
+        assert!(err.contains("vocab"), "오류 안내가 없음: {err}");
     }
 
     /// D3 sweep: the grid is fully evaluated and the selected best model is usable.

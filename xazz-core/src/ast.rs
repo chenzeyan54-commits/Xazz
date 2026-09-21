@@ -353,6 +353,70 @@ pub struct StructField {
     pub field_type: String,
 }
 
+/// Vocabulary specification for an [`LayerKind::Embedding`] layer (D3).
+///
+/// `Embedding(10, 4)` uses one shared table for every input column; the list
+/// form `Embedding([4, 7, 2], 3)` gives each input column its own vocabulary,
+/// in feature order (so per-column category indices need not be re-based).
+#[derive(Debug, Clone, PartialEq)]
+pub enum EmbeddingVocab {
+    /// One table shared by every input column: `Embedding(vocab_size, embed_dim)`.
+    Shared(usize),
+    /// A distinct table per input column: `Embedding([v0, v1, ...], embed_dim)`.
+    PerColumn(Vec<usize>),
+}
+
+impl EmbeddingVocab {
+    /// Source-like rendering: `10` or `[4, 7, 2]`.
+    pub fn display(&self) -> String {
+        match self {
+            EmbeddingVocab::Shared(v) => v.to_string(),
+            EmbeddingVocab::PerColumn(vs) => {
+                let inner = vs
+                    .iter()
+                    .map(|v| v.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("[{inner}]")
+            }
+        }
+    }
+
+    /// Whether every vocabulary size is >= 1 (and a per-column list is non-empty).
+    pub fn is_valid(&self) -> bool {
+        match self {
+            EmbeddingVocab::Shared(v) => *v >= 1,
+            EmbeddingVocab::PerColumn(vs) => !vs.is_empty() && vs.iter().all(|v| *v >= 1),
+        }
+    }
+
+    /// Expands to one vocabulary per input column.
+    ///
+    /// A shared vocab is replicated `input_dim` times; a per-column list must
+    /// already have exactly `input_dim` entries (otherwise it is a mismatch and
+    /// an error is returned).
+    pub fn expand(&self, input_dim: usize) -> Result<Vec<usize>, String> {
+        match self {
+            EmbeddingVocab::Shared(v) => Ok(vec![*v; input_dim]),
+            EmbeddingVocab::PerColumn(vs) if vs.len() == input_dim => Ok(vs.clone()),
+            EmbeddingVocab::PerColumn(vs) => Err(if crate::i18n::is_korean() {
+                format!(
+                    "Embedding 의 컬럼별 vocab {}개가 입력 특성 컬럼 수 {}개와 다릅니다.",
+                    vs.len(),
+                    input_dim
+                )
+            } else {
+                format!(
+                    "Embedding declares {} per-column vocab entr{} but the input has {} feature column(s).",
+                    vs.len(),
+                    if vs.len() == 1 { "y" } else { "ies" },
+                    input_dim
+                )
+            }),
+        }
+    }
+}
+
 /// Deep-learning layer kinds (Burn mapping)
 #[derive(Debug, Clone, PartialEq)]
 pub enum LayerKind {
@@ -375,9 +439,16 @@ pub enum LayerKind {
         out_channels: usize,
         kernel_size: usize,
     },
-    /// Embedding(vocab_size, embed_dim) — categorical input embedding (D3).
-    /// Must be the first layer; input feature values are treated as category indices.
-    Embedding { vocab_size: usize, embed_dim: usize },
+    /// Embedding(vocab, embed_dim) — categorical input embedding (D3).
+    ///
+    /// The vocab argument is either a scalar (`Embedding(10, 4)` — one table
+    /// shared by every input column) or a list (`Embedding([4, 7], 3)` — one
+    /// independent table per input column, in feature order). Must be the first
+    /// layer; input feature values are treated as category indices.
+    Embedding {
+        vocab: EmbeddingVocab,
+        embed_dim: usize,
+    },
 }
 
 impl LayerKind {
@@ -397,10 +468,9 @@ impl LayerKind {
             } => format!(
                 "nn::Conv1dConfig::new(1, {out_channels}, {kernel_size}).with_padding(PaddingConfig1d::Same)"
             ),
-            LayerKind::Embedding {
-                vocab_size,
-                embed_dim,
-            } => format!("nn::EmbeddingConfig::new({vocab_size}, {embed_dim})"),
+            LayerKind::Embedding { vocab, embed_dim } => {
+                format!("nn::EmbeddingConfig::new({}, {embed_dim})", vocab.display())
+            }
         }
     }
 }

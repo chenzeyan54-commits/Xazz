@@ -9,6 +9,20 @@ Versioning: [Semantic Versioning](https://semver.org/)
 
 ## [Unreleased]
 
+### Added — D3 Embedding 컬럼별 독립 vocab (issue #64)
+
+- **`Embedding([v0, v1, ...], embed_dim)`** — 선두 Embedding 의 vocab 인자를
+  리스트로 주면 입력 특성 컬럼별로 독립된 임베딩 테이블을 쓴다. 스칼라
+  `Embedding(v, embed_dim)` 은 기존처럼 모든 컬럼이 하나의 테이블을 공유한다
+- 런타임은 컬럼별 vocab 을 하나의 결합 테이블로 만들고, 컬럼 j 의 인덱스를
+  `clamp(value, 0, vocab_j-1) + offset_j` 로 각자의 행 범위에 매핑한다(그래디언트
+  분리). 컬럼별 vocab 개수와 입력 특성 컬럼 수가 다르면 fail-closed
+- 범위 밖 인덱스 진단도 컬럼별 vocab 기준으로 계산하며, vocab 이 불균일하면
+  컬럼별 목록을 함께 안내한다
+- 파서/체커/emitter/dl/printer 전 계층 반영. 검증: 파서(AST·빈 목록 오류),
+  체커(유효·0 항목 오류), emitter(공유 복제·per-column 목록·결합 테이블),
+  CPU E2E(컬럼별 학습/예측·길이 불일치 거부)
+
 ### Added — per-tenant DP window 설정 (issue #59, Track C2)
 
 - **`tenant_dp_config` 테이블** — tenant별 DP window 길이 override 저장. `GET /dp/budget`에

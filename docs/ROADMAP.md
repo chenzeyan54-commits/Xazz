@@ -186,8 +186,10 @@ datasets. This track makes Xazz handle real workloads.
 - [x] **Conv1d layer** — `Conv1d(out_channels, kernel_size)` in the `model {}`
       declaration (`Same` padding, length-preserving), wired through
       parser/checker/emitter/dl; CPU E2E train/predict test added (2026-09-14)
-- [x] **Embedding layer** — `Embedding(vocab_size, embed_dim)` in the `model {}`
-      declaration (first layer only; raw category indices, no z-score), wired through
+- [x] **Embedding layer** — `Embedding(vocab, embed_dim)` in the `model {}`
+      declaration (first layer only; raw category indices, no z-score). A scalar
+      vocab is shared by every input column; a list `Embedding([4, 7], 3)` gives
+      each input column its own vocabulary (per-column, 2026-09-21). wired through
       parser/checker/emitter/dl; CPU E2E train/predict test added (2026-09-18)
 - [x] **Hyperparameter sweep** — list-valued `epochs`/`lr`/`batch_size` in `train()`
       run a cartesian grid search; the best combination (validation loss when a

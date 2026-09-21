@@ -375,22 +375,19 @@ impl Analyzer {
                         },
                     );
                 }
-                LayerKind::Embedding {
-                    vocab_size,
-                    embed_dim,
-                } => {
-                    if *vocab_size == 0 || *embed_dim == 0 {
+                LayerKind::Embedding { vocab, embed_dim } => {
+                    if !vocab.is_valid() || *embed_dim == 0 {
                         self.error(
                             ErrorKind::Other("Embedding 파라미터 오류".to_string()),
                             Some(name),
                             if is_korean() {
                                 format!(
-                                    "모델 '{}' 의 Embedding(vocab_size, embed_dim) 는 둘 다 1 이상이어야 합니다.",
+                                    "모델 '{}' 의 Embedding(vocab, embed_dim) 는 vocab/embed_dim 이 모두 1 이상이어야 합니다 (컬럼별 목록은 비어 있을 수 없음).",
                                     name
                                 )
                             } else {
                                 format!(
-                                    "Model '{}': Embedding(vocab_size, embed_dim) requires both values >= 1.",
+                                    "Model '{}': Embedding(vocab, embed_dim) requires every vocab and embed_dim >= 1 (a per-column list cannot be empty).",
                                     name
                                 )
                             },
@@ -2077,6 +2074,28 @@ mod tests {
         assert!(
             err_kinds(&r).iter().any(|k| k.contains("Embedding")),
             "Embedding 위치 오류 없음: {:?}",
+            err_kinds(&r)
+        );
+    }
+
+    #[test]
+    fn embedding_per_column_vocab_is_valid() {
+        let r = check(
+            "type X = { a: float, b: float, y: float };
+             model Rec { Embedding([3, 5], 2) -> ReLU() -> Dense(1) }
+             v data = load(\"x.csv\") :: X;
+             v trained = data |> train(Rec, target: \"y\", epochs: 3);",
+        );
+        assert!(r.is_ok(), "오류: {:?}", r.errors);
+    }
+
+    #[test]
+    fn embedding_per_column_zero_entry_error() {
+        let r = check("model M { Embedding([3, 0], 2) -> Dense(1) }");
+        assert!(r.is_err());
+        assert!(
+            err_kinds(&r).iter().any(|k| k.contains("Embedding")),
+            "Embedding 오류 없음: {:?}",
             err_kinds(&r)
         );
     }
