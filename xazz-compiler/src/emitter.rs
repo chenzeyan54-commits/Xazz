@@ -268,6 +268,10 @@ fn generate_rust_src(
             // GroupBy+agg pattern: save GroupBy, then merge with the next aggregate operator for output
             let mut has_count = false;
             let mut pending_group_col: Option<String> = None;
+            // `v m = ... |> train(...)` — train is terminal (runtime returns the
+            // trained model and ignores later ops), so capture it and emit the
+            // real Burn training block instead of a placeholder comment.
+            let mut train_terminal: Option<(&str, &TrainConfig)> = None;
 
             for op in ops {
                 match op {
@@ -593,12 +597,10 @@ fn generate_rust_src(
                             ));
                         }
                     }
-                    // ── v0.5 deep-learning operators: in emit rust, delegate to runtime train/predict ──
+                    // ── v0.5 deep-learning operator: terminal train() emits a real Burn block ──
                     PipelineOp::Train { model_name, config } => {
-                        out.push_str(&format!(
-                            "        // |> train({}, target: \"{}\", epochs: {})  → Burn training runs at xazz execution\n",
-                            model_name, config.target, config.epochs
-                        ));
+                        train_terminal = Some((model_name.as_str(), config));
+                        break;
                     }
                     PipelineOp::Predict { model_var, as_col } => {
                         let as_str = as_col
@@ -630,6 +632,24 @@ fn generate_rust_src(
 
             // collect
             out.push_str("        .collect()?;\n");
+
+            // terminal train(): the collected frame is the training data and the
+            // variable itself denotes the trained model (mirrors the runtime).
+            if let Some((model_name, config)) = train_terminal {
+                let embedding_input = program.stmts.iter().any(|s| {
+                    matches!(s, Stmt::ModelDecl { name, layers }
+                        if name == model_name
+                            && matches!(layers.first(), Some(LayerKind::Embedding { .. })))
+                });
+                out.push_str(&emit_dl_train_call(
+                    var_name,
+                    model_name,
+                    config,
+                    embedding_input,
+                ));
+                out.push('\n');
+                continue;
+            }
 
             // result output
             if has_count {
@@ -683,12 +703,14 @@ fn generate_rust_src(
 // ── deep-learning (Burn) code generation (v0.4) ─────────────────────────────
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Returns whether the script contains DL statements (ModelDecl / TrainStmt).
+/// Returns whether the script contains DL statements (ModelDecl / TrainStmt /
+/// a `v m = ... |> train(...)` VarDecl whose ops include a train op).
 fn program_has_dl(program: &Program) -> bool {
-    program
-        .stmts
-        .iter()
-        .any(|s| matches!(s, Stmt::ModelDecl { .. } | Stmt::TrainStmt { .. }))
+    program.stmts.iter().any(|s| match s {
+        Stmt::ModelDecl { .. } | Stmt::TrainStmt { .. } => true,
+        Stmt::VarDecl { ops, .. } => ops.iter().any(|op| matches!(op, PipelineOp::Train { .. })),
+        _ => false,
+    })
 }
 
 /// Burn import block.
@@ -1551,6 +1573,52 @@ mod tests {
         assert!(out.contains("use burn::"), "burn import 없음");
         assert!(out.contains("struct M<B: Backend>"), "모델 구조체 없음");
         assert!(out.contains("Adam"), "Adam 옵티마이저 없음");
+    }
+
+    /// VarDecl form `v m = ... |> train(...)` must emit the real Burn training
+    /// block (not the old placeholder comment).
+    #[test]
+    fn emit_rust_vardecl_train_emits_training_block() {
+        let out = emit(
+            "type S = { a: float, y: float };
+             model M { Dense(4) -> Dense(1) }
+             v data = load(\"x.csv\") :: S |> train(M, target: \"y\", epochs: 3);",
+        );
+        assert!(
+            out.contains("extract_xy(&data, \"y\")"),
+            "VarDecl train 학습 블록 누락: {out}"
+        );
+        assert!(
+            out.contains("AdamConfig::new().init::<TrainBackend, _>()"),
+            "VarDecl train 옵티마이저 누락: {out}"
+        );
+        assert!(
+            out.contains("checkpoints/M"),
+            "VarDecl train 체크포인트 저장 누락: {out}"
+        );
+        assert!(
+            !out.contains("Burn training runs at xazz execution"),
+            "구 placeholder 주석이 남음: {out}"
+        );
+    }
+
+    /// VarDecl form with list-valued args still emits the grid-search block.
+    #[test]
+    fn emit_rust_vardecl_sweep_emits_combo_loop() {
+        let out = emit(
+            "type S = { a: float, y: float };
+             model M { Dense(4) -> Dense(1) }
+             v data = load(\"x.csv\") :: S
+                 |> train(M, target: \"y\", epochs: [3, 5], lr: [0.01, 0.001]);",
+        );
+        assert!(
+            out.contains("let combos: Vec<(usize, f64, usize)> = vec![(3,"),
+            "VarDecl 스윕 조합 목록 누락: {out}"
+        );
+        assert!(
+            out.contains("best combo"),
+            "VarDecl 스윕 최적 조합 출력 누락: {out}"
+        );
     }
 
     /// D3 Embedding: a shared vocab is replicated per input column into one

@@ -9,6 +9,16 @@ Versioning: [Semantic Versioning](https://semver.org/)
 
 ## [Unreleased]
 
+### Fixed — `emit rust` VarDecl 종단 train 블록 (issue #64)
+
+- **`v m = ... |> train(...)` 형태도 실제 Burn 학습 코드를 생성** — 기존에는 VarDecl의
+  train op이 주석만 emit되고 학습이 생성 코드에서 누락됐다(런타임에는 반영). 이제
+  train이 종단 op이면 파이프라인 데이터를 `collect()`한 뒤 `emit_dl_train_call`로
+  단일/스윕 학습 블록을 emit하고 결과 println을 생략한다(런타임과 동일 의미)
+- `program_has_dl`이 VarDecl의 train op도 DL로 감지해 burn import/헬퍼를 포함한다
+- 검증: VarDecl train 실제 블록·체크포인트 저장·구 placeholder 부재, VarDecl 스윕
+  조합 루프 회귀 테스트 2종
+
 ### Added — D3 체크포인트 버저닝 (issue #64)
 
 - **`CheckpointManifest` + 사이드카** — Burn 체크포인트(`<model>.json`) 옆에
