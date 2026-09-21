@@ -9,6 +9,23 @@ Versioning: [Semantic Versioning](https://semver.org/)
 
 ## [Unreleased]
 
+### Added — `emit rust` predict 추론 코드 (issue #64)
+
+- **`data |> predict(model_var, as: "...")`가 실제 Burn 추론 블록을 생성** — 기존에는
+  predict op이 주석만 emit됐다(런타임에는 반영). 이제 같은 프로그램에서
+  `v m = ... |> train(...)`로 학습된 모델 변수를 해석해, 체크포인트
+  (`checkpoints/<Model>.json`)를 로드하고 forward를 실행해 예측 컬럼을 부착한다
+- **정규화 사이드카** — 학습 emit이 특성 순서와 z-score 통계를
+  `checkpoints/<Model>.stats.json`에 기록한다. `extract_xy`가 특성 이름을 함께
+  반환하고, predict가 이를 읽어 학습과 동일한 전처리(z-score, Embedding-first는
+  raw 인덱스)를 재현한다. `emit` 산출물 Cargo.toml에 `serde_json` 의존성 추가
+- predict가 파이프라인 중간에 오면 lazy 체인을 `collect()`로 끊어 추론한 뒤
+  이후 op부터 새 lazy 체인을 시작한다. 예측 기본 컬럼명은 `<target>_pred`
+- 스윕 학습 모델은 예측 대상 체크포인트가 모호해 주석 폴백 처리
+- 검증: 사이드카 기록/extract_xy 특성 이름, 추론 블록(체크포인트 로드·forward·
+  컬럼 부착), 중간 predict 후 relazy 체인, 기본 컬럼명, 스윕 폴백 회귀 테스트 5종.
+  xazz-compiler 301 tests
+
 ### Fixed — `emit rust` VarDecl 종단 train 블록 (issue #64)
 
 - **`v m = ... |> train(...)` 형태도 실제 Burn 학습 코드를 생성** — 기존에는 VarDecl의

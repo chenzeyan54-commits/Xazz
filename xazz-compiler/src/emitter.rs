@@ -130,6 +130,7 @@ fn generate_rust_src(
     if program_has_dl(program) {
         out.push_str("//   burn        = { version = \"0.21\", default-features = false, features = [\"std\", \"autodiff\"] }\n");
         out.push_str("//   burn-ndarray = { version = \"0.21\", default-features = false, features = [\"std\", \"burn-autodiff\"] }\n");
+        out.push_str("//   serde_json   = \"1.0\"\n");
     }
     out.push_str("// ═══════════════════════════════════════════════════════════════\n\n");
 
@@ -272,8 +273,22 @@ fn generate_rust_src(
             // trained model and ignores later ops), so capture it and emit the
             // real Burn training block instead of a placeholder comment.
             let mut train_terminal: Option<(&str, &TrainConfig)> = None;
+            // Whether the lazy chain for this variable is currently open (i.e. the
+            // last emitted line is a `.lazy()`/method call awaiting `.collect()?;`).
+            // `predict()` must break the lazy chain to run Burn inference eagerly,
+            // then the following ops restart a fresh lazy chain (`needs_relazy`).
+            let mut chain_open = true;
+            let mut needs_relazy = false;
 
             for op in ops {
+                if needs_relazy {
+                    out.push_str(&format!(
+                        "    let {}{} = {}.clone().lazy()\n",
+                        mut_kw, var_name, var_name
+                    ));
+                    chain_open = true;
+                    needs_relazy = false;
+                }
                 match op {
                     PipelineOp::Filter(expr) => {
                         let polars_expr = to_typed_polars_expr(expr, &col_types);
@@ -603,14 +618,34 @@ fn generate_rust_src(
                         break;
                     }
                     PipelineOp::Predict { model_var, as_col } => {
-                        let as_str = as_col
-                            .as_deref()
-                            .map(|c| format!(", as: \"{}\"", c))
-                            .unwrap_or_default();
-                        out.push_str(&format!(
-                            "        // |> predict({}{})  → prediction column added (at xazz execution)\n",
-                            model_var, as_str
-                        ));
+                        // Break the pending lazy chain so the frame is materialized
+                        // and the trained checkpoint can be run through Burn.
+                        if chain_open {
+                            out.push_str("        .collect()?;\n");
+                            chain_open = false;
+                        }
+                        match find_model_binding(program, model_var) {
+                            Some(binding) if !binding.config.is_sweep() => {
+                                out.push_str(&emit_dl_predict_call(
+                                    var_name,
+                                    binding.model_name,
+                                    &binding.config.target,
+                                    as_col.as_deref(),
+                                    binding.embedding_input,
+                                ));
+                            }
+                            Some(_) => {
+                                out.push_str(&format!(
+                                    "    // |> predict({model_var}, as: ...) — 스윕 모델은 예측 대상 체크포인트가 모호해 emit 미지원 (xazz 실행 시 반영)\n"
+                                ));
+                            }
+                            None => {
+                                out.push_str(&format!(
+                                    "    // |> predict({model_var}, as: ...) — 같은 프로그램에서 학습된 모델 변수를 찾을 수 없어 emit 미지원 (xazz 실행 시 반영)\n"
+                                ));
+                            }
+                        }
+                        needs_relazy = true;
                     }
                     // ── v0.6 withDp — in emit rust, delegate DP injection to runtime ──
                     PipelineOp::WithDp(args) => {
@@ -630,8 +665,11 @@ fn generate_rust_src(
                 }
             }
 
-            // collect
-            out.push_str("        .collect()?;\n");
+            // collect (predict may have already closed the chain and produced the
+            // frame eagerly, in which case there is no open lazy chain to close)
+            if chain_open {
+                out.push_str("        .collect()?;\n");
+            }
 
             // terminal train(): the collected frame is the training data and the
             // variable itself denotes the trained model (mirrors the runtime).
@@ -921,13 +959,16 @@ fn emit_dl_act(out: &mut String, act: &str) {
     }
 }
 
-/// Column → f32 tensor data extraction helper (Polars DataFrame → (x_flat, y_flat, feature_count)).
+/// Column → f32 tensor data extraction helper
+/// (Polars DataFrame → (x_flat, y_flat, feature_count, feature_names)).
 fn emit_extract_xy_fn() -> String {
     r#"/// Extracts numeric columns (excluding the target) as features and the target column as the label.
+/// The feature names are returned so `predict()` can persist and later replay the
+/// exact training feature order and standardization.
 fn extract_xy(
     df: &DataFrame,
     target: &str,
-) -> Result<(Vec<f32>, Vec<f32>, usize), Box<dyn std::error::Error>> {
+) -> Result<(Vec<f32>, Vec<f32>, usize, Vec<String>), Box<dyn std::error::Error>> {
     let names = df.get_column_names();
     let mut features: Vec<String> = Vec::new();
     for name in names {
@@ -966,7 +1007,7 @@ fn extract_xy(
         let v = df.column(target)?.get(i).unwrap_or(AnyValue::Float64(f64::NAN));
         ys.push(xz_anyvalue_f32(v));
     }
-    Ok((xs, ys, features.len()))
+    Ok((xs, ys, features.len(), features))
 }
 
 /// AnyValue → f32 (non-numeric is NaN).
@@ -1057,7 +1098,7 @@ fn emit_dl_train_call(
     format!(
         r#"    // ── Deep Learning: run {source_var} |> train({model_name}, target: "{target}") ──────
     {{
-        let (xs, ys, feature_count) = extract_xy(&{source_var}, "{target}")?;
+        let (xs, ys, feature_count, feature_names) = extract_xy(&{source_var}, "{target}")?;
         let n = ys.len();
         if n == 0 {{
             return Err("학습 데이터가 비어 있습니다.".into());
@@ -1126,7 +1167,132 @@ fn emit_dl_train_call(
         std::fs::create_dir_all("checkpoints")?;
         valid.save_file(&format!("checkpoints/{model_name}"), &recorder)?;
         println!("[xazz] ✅ 체크포인트 저장 → checkpoints/{model_name}.json");
+
+        // Persist the feature order + z-score statistics predict() must replay
+        // so standalone emitted code reproduces the training preprocessing.
+        let stats = serde_json::json!({{
+            "feature_names": feature_names,
+            "fmean": fmean,
+            "fstd": fstd,
+        }});
+        std::fs::write(
+            &format!("checkpoints/{model_name}.stats.json"),
+            serde_json::to_string_pretty(&stats)?,
+        )?;
     }}
+"#
+    )
+}
+
+/// A model variable bound by `v <var> = ... |> train(<Model>, ...)`.
+struct ModelBinding<'a> {
+    model_name: &'a str,
+    config: &'a TrainConfig,
+    /// Whether the model starts with an `Embedding` layer (raw category input).
+    embedding_input: bool,
+}
+
+/// Resolves the trained-model variable referenced by `predict(model_var, ...)`
+/// to the model declaration and training config that produced it.
+fn find_model_binding<'a>(program: &'a Program, var: &str) -> Option<ModelBinding<'a>> {
+    for stmt in &program.stmts {
+        if let Stmt::VarDecl { var_name, ops, .. } = stmt
+            && var_name == var
+        {
+            for op in ops {
+                if let PipelineOp::Train { model_name, config } = op {
+                    let embedding_input = program.stmts.iter().any(|s| {
+                        matches!(s, Stmt::ModelDecl { name, layers }
+                            if name == model_name
+                                && matches!(layers.first(), Some(LayerKind::Embedding { .. })))
+                    });
+                    return Some(ModelBinding {
+                        model_name,
+                        config,
+                        embedding_input,
+                    });
+                }
+            }
+        }
+    }
+    None
+}
+
+/// `data |> predict(<model_var>, as: "col")` → eager inference block that loads
+/// the checkpoint + normalization sidecar written by the training emit, rebuilds
+/// the model, runs the forward pass, and appends the prediction column.
+fn emit_dl_predict_call(
+    frame_var: &str,
+    model_name: &str,
+    target: &str,
+    as_col: Option<&str>,
+    embedding_input: bool,
+) -> String {
+    let out_col = as_col
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("{target}_pred"));
+    let raw_input = if embedding_input { "true" } else { "false" };
+
+    format!(
+        r#"    // ── Deep Learning (predict): {frame_var} |> predict({model_name}, as: "{out_col}") ──────
+    let {frame_var} = {{
+        let stats_raw = std::fs::read_to_string("checkpoints/{model_name}.stats.json")?;
+        let stats: serde_json::Value = serde_json::from_str(&stats_raw)?;
+        let fmean: Vec<f64> = stats["fmean"]
+            .as_array()
+            .map(|a| a.iter().map(|v| v.as_f64().unwrap_or(0.0)).collect())
+            .unwrap_or_default();
+        let fstd: Vec<f64> = stats["fstd"]
+            .as_array()
+            .map(|a| a.iter().map(|v| v.as_f64().filter(|s| *s != 0.0).unwrap_or(1.0)).collect())
+            .unwrap_or_default();
+        let feature_names: Vec<String> = stats["feature_names"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+            .unwrap_or_default();
+        let feature_count = feature_names.len();
+        if feature_count == 0 {{
+            return Err("모델에 특성 정보가 없습니다. 먼저 train()으로 학습하세요.".into());
+        }}
+        let n = {frame_var}.height();
+        if n == 0 {{
+            return Err("예측할 데이터가 비어 있습니다.".into());
+        }}
+
+        // Same preprocessing as training: feature order from the stats sidecar,
+        // z-score for dense models, raw category indices for Embedding-first models.
+        let raw_input = {raw_input};
+        let mut xs: Vec<f32> = Vec::with_capacity(n * feature_count);
+        for i in 0..n {{
+            for (j, name) in feature_names.iter().enumerate() {{
+                let col = {frame_var}.column(name.as_str())?;
+                let v = xz_anyvalue_f32(col.get(i).unwrap_or(AnyValue::Float64(f64::NAN))) as f64;
+                if raw_input {{
+                    xs.push(if v.is_finite() {{ v as f32 }} else {{ 0.0 }});
+                }} else {{
+                    let mean = fmean.get(j).copied().unwrap_or(0.0);
+                    let std = fstd.get(j).copied().unwrap_or(1.0);
+                    let v = if v.is_finite() {{ v }} else {{ mean }};
+                    xs.push(((v - mean) / std) as f32);
+                }}
+            }}
+        }}
+
+        let device: Device<TrainBackend> = Default::default();
+        let recorder = PrettyJsonFileRecorder::<FullPrecisionSettings>::new();
+        let template = {model_name}::<TrainBackend>::new(&device, feature_count);
+        let model = template
+            .load_file("checkpoints/{model_name}.json", &recorder, &device)
+            .map_err(|e| format!("체크포인트 로드 실패: {{e}}"))?;
+        let x = Tensor::<TrainBackend, 2>::from_data(TensorData::new(xs, [n, feature_count]), &device);
+        let preds = model.forward(x).into_data().to_vec::<f32>().unwrap_or_default();
+        let mut out = {frame_var}.clone();
+        out.with_column(Column::new(
+            "{out_col}".into(),
+            preds.into_iter().map(|v| v as f64).collect::<Vec<f64>>(),
+        ))?;
+        out
+    }};
 "#
     )
 }
@@ -1161,7 +1327,7 @@ fn emit_dl_sweep_call(
     format!(
         r#"    // ── Deep Learning (sweep): run {source_var} |> train({model_name}, target: "{target}") ──────
     {{
-        let (xs, ys, feature_count) = extract_xy(&{source_var}, "{target}")?;
+        let (xs, ys, feature_count, _feature_names) = extract_xy(&{source_var}, "{target}")?;
         let n = ys.len();
         if n == 0 {{
             return Err("학습 데이터가 비어 있습니다.".into());
@@ -1794,6 +1960,110 @@ mod tests {
         assert!(
             out.contains(".with_has_header(has_header)"),
             "with_has_header 누락: {out}"
+        );
+    }
+
+    /// Training emit must persist the feature order + z-score statistics that
+    /// `predict()` replays, and `extract_xy` must return the feature names.
+    #[test]
+    fn emit_rust_train_writes_normalization_stats_sidecar() {
+        let out = emit(
+            "type S = { a: float, y: float };
+             model M { Dense(4) -> Dense(1) }
+             v data = load(\"x.csv\") :: S |> train(M, target: \"y\", epochs: 3);",
+        );
+        assert!(
+            out.contains("Result<(Vec<f32>, Vec<f32>, usize, Vec<String>)"),
+            "extract_xy 가 특성 이름을 반환하지 않음: {out}"
+        );
+        assert!(
+            out.contains("checkpoints/M.stats.json"),
+            "정규화 통계 사이드카 기록 누락: {out}"
+        );
+        assert!(
+            out.contains("\"feature_names\": feature_names"),
+            "특성 이름 직렬화 누락: {out}"
+        );
+    }
+
+    /// `data |> predict(model_var)` must emit a real inference block that loads
+    /// the checkpoint + stats sidecar and appends the prediction column instead of
+    /// the old placeholder comment.
+    #[test]
+    fn emit_rust_predict_emits_inference_block() {
+        let out = emit(
+            "type S = { a: float, y: float };
+             model M { Dense(4) -> Dense(1) }
+             v ds = load(\"x.csv\") :: S;
+             v m = ds |> train(M, target: \"y\", epochs: 3);
+             v p = ds |> predict(m, as: \"y_pred\");",
+        );
+        assert!(
+            out.contains("load_file(\"checkpoints/M.json\""),
+            "체크포인트 로드 누락: {out}"
+        );
+        assert!(
+            out.contains("model.forward(x).into_data()"),
+            "추론 forward 누락: {out}"
+        );
+        assert!(
+            out.contains("with_column(Column::new("),
+            "예측 컬럼 부착 누락: {out}"
+        );
+        assert!(
+            out.contains("\"y_pred\".into()"),
+            "지정 예측 컬럼명 누락: {out}"
+        );
+        assert!(
+            !out.contains("prediction column added (at xazz execution)"),
+            "구 placeholder 주석이 남음: {out}"
+        );
+    }
+
+    /// A `predict` with no `as:` uses `<target>_pred` and, when followed by more
+    /// operators, restarts a lazy chain on the materialized prediction frame.
+    #[test]
+    fn emit_rust_predict_default_column_and_relazy_chain() {
+        let out = emit(
+            "type S = { a: float, y: float };
+             model M { Dense(4) -> Dense(1) }
+             v ds = load(\"x.csv\") :: S;
+             v m = ds |> train(M, target: \"y\", epochs: 3);
+             v p = ds |> predict(m) |> rename(\"y\", \"y_actual\") |> take(5);",
+        );
+        assert!(
+            out.contains("\"y_pred\".into()"),
+            "기본 예측 컬럼명(y_pred) 누락: {out}"
+        );
+        assert!(
+            out.contains("let p = p.clone().lazy()"),
+            "predict 이후 lazy 체인 재시작 누락: {out}"
+        );
+        assert!(
+            out.contains(".rename([\"y\"], [\"y_actual\"], false)"),
+            "predict 이후 rename 누락: {out}"
+        );
+        assert!(out.contains(".limit(5)"), "predict 이후 take 누락: {out}");
+    }
+
+    /// A sweep-trained model has no single canonical checkpoint, so `predict`
+    /// falls back to a comment rather than referencing a nonexistent checkpoint.
+    #[test]
+    fn emit_rust_predict_sweep_falls_back_to_comment() {
+        let out = emit(
+            "type S = { a: float, y: float };
+             model M { Dense(4) -> Dense(1) }
+             v ds = load(\"x.csv\") :: S;
+             v m = ds |> train(M, target: \"y\", epochs: [3, 5]);
+             v p = ds |> predict(m, as: \"y_pred\");",
+        );
+        assert!(
+            out.contains("스윕 모델은 예측 대상 체크포인트가 모호해 emit 미지원"),
+            "스윕 predict 폴백 주석 누락: {out}"
+        );
+        assert!(
+            !out.contains("load_file(\"checkpoints/M.json\""),
+            "스윕 predict 가 체크포인트를 잘못 참조함: {out}"
         );
     }
 }
