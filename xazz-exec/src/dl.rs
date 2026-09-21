@@ -304,6 +304,18 @@ fn count_out_of_range_indices(values: &[f32], vocab_size: usize) -> usize {
         .count()
 }
 
+/// Counts raw embedding inputs that are finite but not whole numbers. The
+/// forward pass casts the raw value to an integer (truncation), so a continuous
+/// feature fed to Embedding silently loses its fractional part — this feeds the
+/// runtime diagnostic below (issue D3). Non-finite values are excluded because
+/// the forward pass maps them to index 0.
+fn count_non_integer_indices(values: &[f32]) -> usize {
+    values
+        .iter()
+        .filter(|v| v.is_finite() && v.fract() != 0.0)
+        .count()
+}
+
 /// Counts out-of-range indices across all columns, each against its own vocab.
 fn count_out_of_range_per_column(values: &[f32], feature_count: usize, vocabs: &[usize]) -> usize {
     if feature_count == 0 {
@@ -353,12 +365,33 @@ fn warn_embedding_out_of_range(count: usize, vocabs: &[usize]) {
     eprintln!("[xazz] {msg}");
 }
 
+/// Emits the non-integer embedding diagnostic to stderr. Non-fatal — the value
+/// is truncated, matching the documented forward-pass behaviour. A continuous
+/// feature must not be fed to Embedding: z-score is skipped for raw-index models,
+/// so the raw value becomes an index and its fractional part is lost.
+fn warn_embedding_non_integer(count: usize) {
+    let msg = if is_korean() {
+        format!(
+            "Embedding 입력 {count}개가 정수가 아닌 연속형 값입니다. raw 인덱스 모델은 z-score 를 건너뛰므로 소수부가 버려져(truncate) 인덱스로 사용됩니다. 범주형(정수 인코딩) 컬럼인지 확인하세요."
+        )
+    } else {
+        format!(
+            "{count} embedding input value(s) are non-integer continuous values; raw-index models skip z-score, so the fractional part is truncated to form an index. Check that the columns are categorical (integer-coded)."
+        )
+    };
+    eprintln!("[xazz] {msg}");
+}
+
 /// Runs the out-of-range embedding diagnostic when the model consumes raw indices.
 fn check_embedding_indices(layers: &[LayerKind], values: &[f32], feature_count: usize) {
     if let Some(vocabs) = leading_embedding_vocabs(layers, feature_count) {
         let count = count_out_of_range_per_column(values, feature_count, &vocabs);
         if count > 0 {
             warn_embedding_out_of_range(count, &vocabs);
+        }
+        let non_integer = count_non_integer_indices(values);
+        if non_integer > 0 {
+            warn_embedding_non_integer(non_integer);
         }
     }
 }
@@ -1041,5 +1074,17 @@ mod tests {
         assert_eq!(count_out_of_range_indices(&[-1.0, 0.0], 5), 1);
         // non-finite 는 forward 에서 0 으로 매핑되므로 세지 않는다.
         assert_eq!(count_out_of_range_indices(&[f32::NAN, f32::INFINITY], 5), 0);
+    }
+
+    #[test]
+    fn counts_only_non_integer_finite_indices() {
+        // 정수값(소수부 0)은 세지 않는다.
+        assert_eq!(count_non_integer_indices(&[0.0, 1.0, 4.0]), 0);
+        // 소수부가 있는 연속형 값은 truncate 되므로 센다.
+        assert_eq!(count_non_integer_indices(&[0.5, 1.0, 2.25]), 2);
+        // 음수 비정수도 소수부가 버려진다.
+        assert_eq!(count_non_integer_indices(&[-0.5, 3.0]), 1);
+        // non-finite 는 forward 에서 0 으로 매핑되므로 세지 않는다.
+        assert_eq!(count_non_integer_indices(&[f32::NAN, f32::INFINITY]), 0);
     }
 }
