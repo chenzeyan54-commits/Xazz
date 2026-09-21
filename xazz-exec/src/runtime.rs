@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::fs;
 
 use crate::chart::{build_chart_spec, df_to_json_array, write_chart_html};
-use xazz_compiler::ast::{LayerKind, LoadOptions, SaveFormat};
+use xazz_compiler::ast::{LayerKind, LoadOptions, SaveFormat, SweepMetric};
 use xazz_compiler::ir::{ColType, MLOp, PipelineNode, Schema, SideOp, Source, Step as IrStep};
 use xazz_compiler::{Lexer, Parser};
 use xazz_core::i18n::{is_korean, tr};
@@ -1612,29 +1612,37 @@ fn handle_model_decl(name: &str, layers: &[LayerKind]) {
 fn print_sweep_report(report: &crate::dl::SweepReport) {
     println!("{}", "─".repeat(60));
     println!(
-        "🔎  {} ({} {})",
+        "🔎  {} ({} {})  [{}: {}]",
         tr("hyperparameter sweep", "하이퍼파라미터 스윕"),
         report.combos.len(),
-        tr("combinations", "조합")
+        tr("combinations", "조합"),
+        tr("metric", "지표"),
+        report.metric.id()
     );
     println!(
-        "  {:>3}  {:>6}  {:>7}  {:>10}  {:>12}  {:>10}",
+        "  {:>3}  {:>6}  {:>7}  {:>10}  {:>12}  {:>10}  {:>10}",
         "#",
         tr("epochs", "에폭"),
         tr("batch", "배치"),
         tr("lr", "학습률"),
         tr("val loss", "검증 손실"),
-        tr("train loss", "학습 손실")
+        tr("train loss", "학습 손실"),
+        tr("metric", "지표")
     );
     for (i, c) in report.combos.iter().enumerate() {
         let val = c
             .final_val_loss
             .map(|v| format!("{v:.6}"))
             .unwrap_or_else(|| "-".to_string());
+        let metric_value = match report.metric {
+            SweepMetric::Mse => c.final_val_loss.unwrap_or(c.final_train_loss),
+            SweepMetric::Mae => c.val_mae.unwrap_or(c.train_mae),
+            SweepMetric::R2 => c.val_r2.unwrap_or(c.train_r2),
+        };
         let mark = if i == report.best_index { " ★" } else { "" };
         println!(
-            "  {:>3}  {:>6}  {:>7}  {:>10.6}  {:>12}  {:>10.6}{}",
-            i, c.epochs, c.batch_size, c.learning_rate, val, c.final_train_loss, mark
+            "  {:>3}  {:>6}  {:>7}  {:>10.6}  {:>12}  {:>10.6}  {:>10.6}{}",
+            i, c.epochs, c.batch_size, c.learning_rate, val, c.final_train_loss, metric_value, mark
         );
         if c.stopped_early {
             println!(
@@ -1684,6 +1692,22 @@ fn print_train_report(trained: &crate::dl::TrainedModel) {
             tr("validation loss (MSE)", "검증 손실(MSE)"),
             v
         );
+    }
+    println!(
+        "  {} : {:.6}",
+        tr("final MAE (train)", "최종 MAE(학습)"),
+        report.final_train_mae
+    );
+    if let Some(v) = report.final_val_mae {
+        println!("  {} : {:.6}", tr("MAE (val)", "MAE(검증)"), v);
+    }
+    println!(
+        "  {} : {:.6}",
+        tr("final R² (train)", "최종 R²(학습)"),
+        report.final_train_r2
+    );
+    if let Some(v) = report.final_val_r2 {
+        println!("  {} : {:.6}", tr("R² (val)", "R²(검증)"), v);
     }
     println!(
         "  {}  : {:?}",

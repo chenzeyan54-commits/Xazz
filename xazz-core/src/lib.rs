@@ -22,7 +22,7 @@ pub use token::{Span, Token, TokenKind};
 pub use ast::{
     AggFn, AggSpec, BinOpKind, ChartConfig, ChartType, DpArgs, DpMechanism, EmbeddingVocab, Expr,
     FillNullValue, JoinHow, LayerKind, LoadOptions, PipelineOp, PipelineSource, Program, Stmt,
-    StructField, TrainConfig,
+    StructField, SweepMetric, TrainConfig,
 };
 
 // error

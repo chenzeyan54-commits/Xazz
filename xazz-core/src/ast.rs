@@ -475,6 +475,51 @@ impl LayerKind {
     }
 }
 
+/// Metric used to rank hyperparameter-sweep combinations (D3).
+///
+/// The default is MSE (the training loss). `mae` and `r2` are computed from the
+/// final model's predictions on the same train/validation split used for the
+/// loss, and let `train(..., metric: ..)` select a sweep winner by a different
+/// criterion. R² is "higher is better"; the error metrics are "lower is better".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SweepMetric {
+    /// Mean squared error (default; the training objective).
+    #[default]
+    Mse,
+    /// Mean absolute error.
+    Mae,
+    /// Coefficient of determination (higher is better).
+    R2,
+}
+
+impl SweepMetric {
+    /// Canonical id (also the `metric:` train() value).
+    pub fn id(self) -> &'static str {
+        match self {
+            SweepMetric::Mse => "mse",
+            SweepMetric::Mae => "mae",
+            SweepMetric::R2 => "r2",
+        }
+    }
+
+    /// Parses a `metric:` value, accepting common aliases.
+    /// Returns `None` for an unrecognised value.
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "" | "mse" | "l2" | "loss" => Some(SweepMetric::Mse),
+            "mae" | "l1" => Some(SweepMetric::Mae),
+            "r2" | "r^2" | "rsquared" => Some(SweepMetric::R2),
+            _ => None,
+        }
+    }
+
+    /// Whether a lower value is better. R² is the only "higher is better" metric.
+    pub fn lower_is_better(self) -> bool {
+        !matches!(self, SweepMetric::R2)
+    }
+}
+
 /// Hyperparameter sweep grid (D3) — list-valued `train()` arguments.
 ///
 /// Each non-empty vector is one axis of a full cartesian-product grid search;
@@ -519,6 +564,8 @@ pub struct TrainConfig {
     pub early_stopping_patience: Option<usize>,
     /// Hyperparameter sweep axes (D3). Empty when no list argument was given.
     pub sweep: SweepGrid,
+    /// Metric used to pick the sweep winner (D3). Defaults to MSE.
+    pub sweep_metric: SweepMetric,
 }
 
 impl Default for TrainConfig {
@@ -531,6 +578,7 @@ impl Default for TrainConfig {
             validation_split: None,
             early_stopping_patience: None,
             sweep: SweepGrid::default(),
+            sweep_metric: SweepMetric::default(),
         }
     }
 }
@@ -575,6 +623,7 @@ impl TrainConfig {
                         validation_split: self.validation_split,
                         early_stopping_patience: self.early_stopping_patience,
                         sweep: SweepGrid::default(),
+                        sweep_metric: self.sweep_metric,
                     });
                 }
             }
@@ -817,6 +866,40 @@ mod tests {
             combos
                 .iter()
                 .any(|c| c.epochs == 20 && c.learning_rate == 0.1)
+        );
+    }
+
+    // ── D3 sweep selection metric ────────────────────────────────────────────
+
+    #[test]
+    fn test_sweep_metric_parse_aliases() {
+        assert_eq!(SweepMetric::parse(""), Some(SweepMetric::Mse));
+        assert_eq!(SweepMetric::parse(" MSE "), Some(SweepMetric::Mse));
+        assert_eq!(SweepMetric::parse("l1"), Some(SweepMetric::Mae));
+        assert_eq!(SweepMetric::parse("R2"), Some(SweepMetric::R2));
+        assert_eq!(SweepMetric::parse("quantum"), None);
+        assert_eq!(SweepMetric::default(), SweepMetric::Mse);
+        assert!(SweepMetric::Mse.lower_is_better());
+        assert!(SweepMetric::Mae.lower_is_better());
+        assert!(!SweepMetric::R2.lower_is_better());
+    }
+
+    /// The sweep metric survives grid expansion so every combo ranks the same way.
+    #[test]
+    fn test_expand_sweep_carries_metric() {
+        let mut config = TrainConfig {
+            target: "y".into(),
+            epochs: 1,
+            learning_rate: 0.1,
+            ..Default::default()
+        };
+        config.sweep_metric = SweepMetric::R2;
+        config.sweep.epochs = vec![1, 2];
+        let combos = config.expand_sweep();
+        assert_eq!(combos.len(), 2);
+        assert!(
+            combos.iter().all(|c| c.sweep_metric == SweepMetric::R2),
+            "확장된 조합이 선택 지표를 유지해야 함"
         );
     }
 }

@@ -31,7 +31,7 @@
 use std::sync::OnceLock;
 
 use polars::prelude::DataFrame;
-use xazz_compiler::ast::{LayerKind, TrainConfig};
+use xazz_compiler::ast::{LayerKind, SweepMetric, TrainConfig};
 use xazz_core::i18n::{is_korean, tr};
 
 use crate::dl::{CheckpointManifest, SweepCombo, SweepReport, TrainedModel};
@@ -76,6 +76,7 @@ pub trait ComputeBackend: Send + Sync {
         config: &TrainConfig,
     ) -> Result<(TrainedModel, SweepReport), String> {
         let combos = config.expand_sweep();
+        let metric: SweepMetric = config.sweep_metric;
         let mut best: Option<(usize, TrainedModel)> = None;
         let mut entries: Vec<SweepCombo> = Vec::with_capacity(combos.len());
 
@@ -90,12 +91,17 @@ pub trait ComputeBackend: Send + Sync {
                 final_val_loss: report.final_val_loss,
                 stopped_early: report.stopped_early,
                 best_epoch: report.best_epoch,
+                train_mae: report.final_train_mae,
+                val_mae: report.final_val_mae,
+                train_r2: report.final_train_r2,
+                val_r2: report.final_val_r2,
                 selected: false,
             };
             let is_better = match &best {
                 None => true,
                 Some((best_index, _)) => {
-                    SweepReport::score(&entry) < SweepReport::score(&entries[*best_index])
+                    SweepReport::score(&entry, metric)
+                        < SweepReport::score(&entries[*best_index], metric)
                 }
             };
             if is_better {
@@ -129,6 +135,7 @@ pub trait ComputeBackend: Send + Sync {
             target: config.target.clone(),
             combos: entries,
             best_index,
+            metric,
         };
         Ok((best_model, report))
     }
@@ -463,6 +470,7 @@ mod tests {
             validation_split: None,
             early_stopping_patience: None,
             sweep: Default::default(),
+            sweep_metric: Default::default(),
         };
         (df, layers, config)
     }
@@ -562,6 +570,7 @@ mod tests {
             validation_split: None,
             early_stopping_patience: None,
             sweep: Default::default(),
+            sweep_metric: Default::default(),
         };
 
         let (backend, warning) = resolve(None);
@@ -632,6 +641,7 @@ mod tests {
             validation_split: None,
             early_stopping_patience: None,
             sweep: Default::default(),
+            sweep_metric: Default::default(),
         };
 
         let (backend, warning) = resolve(None);
@@ -680,6 +690,7 @@ mod tests {
             validation_split: None,
             early_stopping_patience: None,
             sweep: Default::default(),
+            sweep_metric: Default::default(),
         };
 
         let (backend, warning) = resolve(None);
@@ -757,6 +768,44 @@ mod tests {
             .expect("cpu sweep predict");
         assert_eq!(out.height(), df.height());
         assert!(out.column("pred").is_ok());
+
+        cleanup(&trained.report.checkpoint_path);
+    }
+
+    /// D3 sweep: `metric: r2` records the metric and picks the highest-R² combo.
+    #[test]
+    fn cpu_backend_sweep_selects_by_r2_metric() {
+        let (df, layers, mut config) = tiny_dataset();
+        config.sweep.epochs = vec![2, 3];
+        config.sweep.learning_rate = vec![0.05, 0.01];
+        config.sweep_metric = SweepMetric::R2;
+
+        let (backend, warning) = resolve(None);
+        assert!(warning.is_none());
+
+        let (trained, report) = backend
+            .sweep(&df, "backend_unit_sweep_r2", &layers, &config)
+            .expect("cpu sweep r2");
+        assert_eq!(report.metric, SweepMetric::R2);
+        assert_eq!(report.combos.len(), 4, "2×2 그리드");
+        assert_eq!(
+            report.combos.iter().filter(|c| c.selected).count(),
+            1,
+            "선택 조합은 하나여야 함"
+        );
+
+        let winner = &report.combos[report.best_index];
+        let winner_score = SweepReport::score(winner, SweepMetric::R2);
+        assert!(
+            winner_score.is_finite(),
+            "R² 선택 점수가 유한해야 함: {winner_score}"
+        );
+        for c in &report.combos {
+            assert!(
+                winner_score <= SweepReport::score(c, SweepMetric::R2),
+                "최적 조합이 R² 기준 최고여야 함"
+            );
+        }
 
         cleanup(&trained.report.checkpoint_path);
     }

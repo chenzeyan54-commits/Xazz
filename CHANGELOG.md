@@ -9,6 +9,20 @@ Versioning: [Semantic Versioning](https://semver.org/)
 
 ## [Unreleased]
 
+### Added — D3 스윕 선택 지표 (MAE/R²) (issue #64)
+
+- **`train(..., metric: "mae" | "r2")`** — 하이퍼파라미터 스윕의 우승 조합 선택
+  기준을 MSE(기본) 외에 MAE·R²로 고를 수 있다. 검증 분할이 있으면 검증 지표를,
+  없으면 학습 지표를 사용하고 R²는 높을수록 좋은 지표로 처리한다
+- `SweepMetric`(xazz-core AST) + 파서 `metric:` 인수(문자열/식별자, 별칭 허용,
+  미지원 값은 오류). `TrainConfig`/`expand_sweep`가 지표를 조합마다 전달
+- `dl::train`이 학습/검증 분할 전체에 대해 MAE·R²를 계산해 `TrainReport`와
+  `SweepCombo`에 기록(무분산 타깃 R²=0, 비유한 값은 최하위). `SweepReport`가
+  `metric`과 지표 인식 `score()`를 보유
+- 런타임 스윕 표에 선택 지표 컬럼/이름, 학습 리포트에 MAE·R² 출력
+- 검증: 지표 파싱/별칭/오류, expand_sweep 지표 전달, `regression_metrics`
+  (MAE/R²/무분산/빈 입력), `score` 지표별 정렬, `metric: r2` 스윕 E2E
+
 ### Added — `emit rust` predict 추론 코드 (issue #64)
 
 - **`data |> predict(model_var, as: "...")`가 실제 Burn 추론 블록을 생성** — 기존에는

@@ -46,7 +46,7 @@
 use crate::ast::{
     AggFn, AggSpec, BinOpKind, ChartConfig, ChartType, DpArgs, DpMechanism, EmbeddingVocab, Expr,
     FillNullValue, JoinHow, LayerKind, LoadOptions, PipelineOp, PipelineSource, Program,
-    SaveFormat, Stmt, StructField, TrainConfig,
+    SaveFormat, Stmt, StructField, SweepMetric, TrainConfig,
 };
 use crate::error::{CompileError, CompileResult, ErrorKind};
 use crate::token::{Span, Token, TokenKind};
@@ -370,7 +370,7 @@ impl Parser {
 
     /// Parses the named arguments of train() (called after consuming model_name).
     /// train_args = ("," named_arg)*
-    /// named_arg = ("target" | "epochs" | "lr" | "batch_size" | "validation_split" | "patience") ":" literal
+    /// named_arg = ("target" | "epochs" | "lr" | "batch_size" | "validation_split" | "patience" | "metric") ":" literal
     fn parse_train_args(&mut self) -> CompileResult<TrainConfig> {
         let mut config = TrainConfig::default();
         while self.eat(&TokenKind::Comma) {
@@ -449,12 +449,43 @@ impl Parser {
                 "patience" => {
                     config.early_stopping_patience = Some(self.expect_number()? as usize);
                 }
+                "metric" => {
+                    let raw = match self.current_kind() {
+                        TokenKind::StringLit(s) => {
+                            let s = s.clone();
+                            self.advance();
+                            s
+                        }
+                        TokenKind::Ident(name) => {
+                            let name = name.clone();
+                            self.advance();
+                            name
+                        }
+                        other => {
+                            return Err(CompileError::new(
+                                ErrorKind::ExpectedToken("StringLit".into()),
+                                self.current_span(),
+                                format!(
+                                    "metric은 문자열 또는 식별자여야 합니다. 실제: {:?}",
+                                    other
+                                ),
+                            ));
+                        }
+                    };
+                    config.sweep_metric = SweepMetric::parse(&raw).ok_or_else(|| {
+                        CompileError::new(
+                            ErrorKind::UnexpectedToken(raw.clone()),
+                            self.current_span(),
+                            format!("알 수 없는 스윕 지표: '{}'. 지원: mse, mae, r2", raw),
+                        )
+                    })?;
+                }
                 other => {
                     return Err(CompileError::new(
                         ErrorKind::UnexpectedToken(other.into()),
                         self.current_span(),
                         format!(
-                            "알 수 없는 train() 인수: '{}'. 지원: target, epochs, lr, batch_size, validation_split, patience",
+                            "알 수 없는 train() 인수: '{}'. 지원: target, epochs, lr, batch_size, validation_split, patience, metric",
                             other
                         ),
                     ));
@@ -2187,6 +2218,44 @@ type AirQuality = {
             run data |> train(M, target: "y", epochs: []);
         "#;
         assert!(parse_src(src).is_err());
+    }
+
+    #[test]
+    fn test_train_sweep_metric_parse() {
+        let src = r#"
+            model M { Dense(1) }
+            v data = load("x.csv") :: S;
+            run data |> train(M, target: "y", epochs: [1, 2], metric: "mae");
+            run data |> train(M, target: "y", epochs: [1, 2], metric: r2);
+        "#;
+        let program = parse_src(src).expect("파싱 실패");
+        match &program.stmts[2] {
+            Stmt::TrainStmt { config, .. } => {
+                assert_eq!(config.sweep_metric, SweepMetric::Mae);
+            }
+            other => panic!("TrainStmt 예상, 실제: {:?}", other),
+        }
+        match &program.stmts[3] {
+            Stmt::TrainStmt { config, .. } => {
+                assert_eq!(config.sweep_metric, SweepMetric::R2);
+            }
+            other => panic!("TrainStmt 예상, 실제: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_train_unknown_sweep_metric_is_error() {
+        let src = r#"
+            model M { Dense(1) }
+            v data = load("x.csv") :: S;
+            run data |> train(M, target: "y", epochs: [1, 2], metric: "quantum");
+        "#;
+        let err = parse_src(src).expect_err("알 수 없는 지표는 에러여야 함");
+        assert!(
+            err.message.contains("지표") || err.message.contains("metric"),
+            "오류 안내가 없음: {}",
+            err.message
+        );
     }
 
     #[test]

@@ -28,7 +28,7 @@ use burn::{
 };
 use burn_ndarray::NdArray;
 use polars::prelude::{Column, DataFrame};
-use xazz_compiler::ast::{LayerKind, TrainConfig};
+use xazz_compiler::ast::{LayerKind, SweepMetric, TrainConfig};
 use xazz_core::i18n::{is_korean, tr};
 
 use crate::tensor_bridge::{extract_data, series_to_f32};
@@ -433,6 +433,18 @@ pub struct TrainReport {
     /// Best validation epoch (1-based); 0 when no validation split was used.
     #[serde(default)]
     pub best_epoch: usize,
+    /// Final mean absolute error over the training split (D3 sweep metric).
+    #[serde(default)]
+    pub final_train_mae: f64,
+    /// Final mean absolute error over the validation split (if any).
+    #[serde(default)]
+    pub final_val_mae: Option<f64>,
+    /// Final coefficient of determination (R²) over the training split.
+    #[serde(default)]
+    pub final_train_r2: f64,
+    /// Final coefficient of determination (R²) over the validation split (if any).
+    #[serde(default)]
+    pub final_val_r2: Option<f64>,
 }
 
 /// Trained model — also holds the standardization statistics needed for predict().
@@ -465,6 +477,18 @@ pub struct SweepCombo {
     pub final_val_loss: Option<f64>,
     pub stopped_early: bool,
     pub best_epoch: usize,
+    /// Final training-split MAE (D3 sweep metric).
+    #[serde(default)]
+    pub train_mae: f64,
+    /// Final validation-split MAE, when a split is configured.
+    #[serde(default)]
+    pub val_mae: Option<f64>,
+    /// Final training-split R² (D3 sweep metric).
+    #[serde(default)]
+    pub train_r2: f64,
+    /// Final validation-split R², when a split is configured.
+    #[serde(default)]
+    pub val_r2: Option<f64>,
     /// Whether this combination was selected as the sweep winner.
     pub selected: bool,
 }
@@ -477,16 +501,34 @@ pub struct SweepReport {
     pub combos: Vec<SweepCombo>,
     /// Index into `combos` of the selected (best) combination.
     pub best_index: usize,
+    /// Metric the winner was selected by (D3). Defaults to MSE.
+    #[serde(default)]
+    pub metric: SweepMetric,
 }
 
 impl SweepReport {
-    /// Selection metric: validation loss when available, else training loss.
-    /// Non-finite losses rank last.
-    pub fn score(combo: &SweepCombo) -> f64 {
-        match combo.final_val_loss {
+    /// Selection score for `combo` under `metric` — lower is always better.
+    ///
+    /// The validation split is preferred over the training split when available;
+    /// R² is negated so that minimising the score maximises R². Non-finite
+    /// metrics rank last.
+    pub fn score(combo: &SweepCombo, metric: SweepMetric) -> f64 {
+        let (primary, fallback) = match metric {
+            SweepMetric::Mse => (combo.final_val_loss, combo.final_train_loss),
+            SweepMetric::Mae => (combo.val_mae, combo.train_mae),
+            SweepMetric::R2 => (combo.val_r2, combo.train_r2),
+        };
+        let value = match primary {
             Some(v) if v.is_finite() => v,
-            _ if combo.final_train_loss.is_finite() => combo.final_train_loss,
-            _ => f64::INFINITY,
+            _ => fallback,
+        };
+        if !value.is_finite() {
+            return f64::INFINITY;
+        }
+        if metric.lower_is_better() {
+            value
+        } else {
+            -value
         }
     }
 }
@@ -646,6 +688,41 @@ struct RawTrained<B: Backend> {
     fmean: Vec<f64>,
     fstd: Vec<f64>,
     target: String,
+}
+
+/// Computes `(mae, r2)` for a set of predictions against targets (D3 sweep metrics).
+///
+/// MAE is the mean absolute error. R² is `1 - SS_res / SS_tot`; when the targets
+/// have zero variance it is reported as `0.0` (undefined) rather than NaN so that
+/// sweep ranking stays well-defined.
+fn regression_metrics(preds: &[f32], targets: &[f32]) -> (f64, f64) {
+    let n = preds.len().min(targets.len());
+    if n == 0 {
+        return (f64::NAN, f64::NAN);
+    }
+    let mut abs_sum = 0.0f64;
+    let mut mean_t = 0.0f64;
+    for i in 0..n {
+        abs_sum += (preds[i] as f64 - targets[i] as f64).abs();
+        mean_t += targets[i] as f64;
+    }
+    let mae = abs_sum / n as f64;
+    mean_t /= n as f64;
+
+    let mut ss_res = 0.0f64;
+    let mut ss_tot = 0.0f64;
+    for i in 0..n {
+        let p = preds[i] as f64;
+        let t = targets[i] as f64;
+        ss_res += (t - p).powi(2);
+        ss_tot += (t - mean_t).powi(2);
+    }
+    let r2 = if ss_tot > 0.0 {
+        1.0 - ss_res / ss_tot
+    } else {
+        0.0
+    };
+    (mae, r2)
 }
 
 /// Runs `dataset |> train(<model>, target: "...", ...)` on the default CPU backend.
@@ -962,6 +1039,32 @@ where
     let predictions: Vec<f64> = preds.iter().map(|&v| v as f64).collect();
     let targets_out: Vec<f64> = (0..n_pred).map(|i| ys[i] as f64).collect();
 
+    // ── Full-set regression metrics (D3 sweep metrics) ──────────────────────
+    // MAE/R² are evaluated over every row (not just the sample above) so a sweep
+    // can select its winner by a metric other than MSE.
+    let mut xall = Vec::with_capacity(n * input_dim);
+    for i in 0..n {
+        for j in 0..input_dim {
+            xall.push(xs[i * input_dim + j]);
+        }
+    }
+    let xall_t = Tensor::<B, 2>::from_data(TensorData::new(xall, [n, input_dim]), &device_plain);
+    let all_preds = valid_model.forward(xall_t).into_data().to_vec::<f32>();
+    let (final_train_mae, final_train_r2, final_val_mae, final_val_r2) = match all_preds {
+        Ok(all_preds) if all_preds.len() == n => {
+            let (train_mae, train_r2) = regression_metrics(&all_preds[..train_n], &ys[..train_n]);
+            if val_idx.is_empty() {
+                (train_mae, train_r2, None, None)
+            } else {
+                let vp: Vec<f32> = val_idx.iter().map(|&i| all_preds[i]).collect();
+                let vt: Vec<f32> = val_idx.iter().map(|&i| ys[i]).collect();
+                let (val_mae, val_r2) = regression_metrics(&vp, &vt);
+                (train_mae, train_r2, Some(val_mae), Some(val_r2))
+            }
+        }
+        _ => (f64::NAN, f64::NAN, None, None),
+    };
+
     let num_params = model.num_params();
     let output_dim = model.out_dim;
 
@@ -1006,6 +1109,10 @@ where
         checkpoint_format_version: CHECKPOINT_FORMAT_VERSION,
         stopped_early,
         best_epoch,
+        final_train_mae,
+        final_val_mae,
+        final_train_r2,
+        final_val_r2,
     };
 
     // Versioned sidecar manifest (D3) — written next to the Burn record so a
@@ -1174,6 +1281,78 @@ mod tests {
     }
 
     #[test]
+    fn regression_metrics_mae_and_r2() {
+        // Perfect predictions: MAE 0, R² 1.
+        let (mae, r2) = regression_metrics(&[1.0, 2.0, 3.0], &[1.0, 2.0, 3.0]);
+        assert!(mae.abs() < 1e-12, "완벽 예측 MAE: {mae}");
+        assert!((r2 - 1.0).abs() < 1e-12, "완벽 예측 R²: {r2}");
+
+        // Constant offset of 1 on [0, 2, 4]: MAE 1, R² 1 - (3)/(8) = 0.625.
+        let (mae, r2) = regression_metrics(&[1.0, 3.0, 5.0], &[0.0, 2.0, 4.0]);
+        assert!((mae - 1.0).abs() < 1e-12, "MAE: {mae}");
+        assert!((r2 - 0.625).abs() < 1e-12, "R²: {r2}");
+
+        // Zero-variance targets: R² is defined as 0.0, not NaN.
+        let (mae, r2) = regression_metrics(&[5.0, 5.0], &[3.0, 3.0]);
+        assert!((mae - 2.0).abs() < 1e-12, "MAE: {mae}");
+        assert_eq!(r2, 0.0);
+
+        // Empty input is NaN, never a panic.
+        let (mae, r2) = regression_metrics(&[], &[]);
+        assert!(mae.is_nan() && r2.is_nan());
+    }
+
+    #[test]
+    fn sweep_score_respects_selected_metric() {
+        let mk = |val_loss: f64,
+                  train_loss: f64,
+                  val_mae: Option<f64>,
+                  train_mae: f64,
+                  val_r2: Option<f64>,
+                  train_r2: f64| SweepCombo {
+            epochs: 1,
+            batch_size: 1,
+            learning_rate: 0.01,
+            final_train_loss: train_loss,
+            final_val_loss: Some(val_loss),
+            stopped_early: false,
+            best_epoch: 1,
+            train_mae,
+            val_mae,
+            train_r2,
+            val_r2,
+            selected: false,
+        };
+
+        // a has the better MSE, b has the better MAE and R².
+        let a = mk(0.10, 0.20, Some(0.50), 0.50, Some(0.10), 0.10);
+        let b = mk(0.30, 0.40, Some(0.20), 0.20, Some(0.90), 0.90);
+
+        assert!(
+            SweepReport::score(&a, SweepMetric::Mse) < SweepReport::score(&b, SweepMetric::Mse)
+        );
+        assert!(
+            SweepReport::score(&b, SweepMetric::Mae) < SweepReport::score(&a, SweepMetric::Mae)
+        );
+        // R² is negated so the higher value wins the minimisation.
+        assert!(SweepReport::score(&b, SweepMetric::R2) < SweepReport::score(&a, SweepMetric::R2));
+
+        // Without a validation split the training-split metric is the fallback.
+        let mut no_val = b.clone();
+        no_val.final_val_loss = None;
+        no_val.val_mae = None;
+        no_val.val_r2 = None;
+        assert_eq!(SweepReport::score(&no_val, SweepMetric::Mae), 0.20);
+        assert_eq!(SweepReport::score(&no_val, SweepMetric::R2), -0.90);
+
+        // A non-finite metric ranks last.
+        let mut nan = b.clone();
+        nan.val_mae = Some(f64::NAN);
+        nan.train_mae = f64::NAN;
+        assert_eq!(SweepReport::score(&nan, SweepMetric::Mae), f64::INFINITY);
+    }
+
+    #[test]
     fn leading_embedding_vocabs_expands_shared_and_per_column() {
         // A shared vocab is replicated for every input column.
         assert_eq!(
@@ -1271,6 +1450,10 @@ mod tests {
             checkpoint_format_version: CHECKPOINT_FORMAT_VERSION,
             stopped_early: false,
             best_epoch: 0,
+            final_train_mae: 0.4,
+            final_val_mae: Some(0.5),
+            final_train_r2: 0.9,
+            final_val_r2: Some(0.85),
         }
     }
 

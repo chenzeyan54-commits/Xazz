@@ -193,8 +193,9 @@ datasets. This track makes Xazz handle real workloads.
       parser/checker/emitter/dl; CPU E2E train/predict test added (2026-09-18)
 - [x] **Hyperparameter sweep** — list-valued `epochs`/`lr`/`batch_size` in `train()`
       run a cartesian grid search; the best combination (validation loss when a
-      split is set, else training loss) is reported and kept for `predict()`
-      (2026-09-18)
+      split is set, else training loss) is reported and kept for `predict()`.
+      `metric: "mae" | "r2"` selects the winner by MAE or R² instead of MSE
+      (2026-09-18, metric 2026-09-21)
 - [x] **Checkpoint versioning** — a `<model>.meta.json` sidecar manifest records the Xazz
       checkpoint format version, xazz version, model shape/provenance; loads fail closed when
       the manifest declares a newer format, while legacy checkpoints without a manifest still
