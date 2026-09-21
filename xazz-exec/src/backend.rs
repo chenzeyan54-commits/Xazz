@@ -34,7 +34,7 @@ use polars::prelude::DataFrame;
 use xazz_compiler::ast::{LayerKind, TrainConfig};
 use xazz_core::i18n::{is_korean, tr};
 
-use crate::dl::{SweepCombo, SweepReport, TrainedModel};
+use crate::dl::{CheckpointManifest, SweepCombo, SweepReport, TrainedModel};
 
 /// A pluggable ML engine behind the Typed IR's `MLOp` boundary.
 ///
@@ -118,6 +118,11 @@ pub trait ComputeBackend: Send + Sync {
         // checkpoint matches the model returned for downstream predict().
         let base = best_model.report.checkpoint_path.trim_end_matches(".json");
         crate::dl::save_checkpoint(&best_model.model, base)?;
+        // Keep the versioned sidecar manifest in sync with the winning weights.
+        crate::dl::save_checkpoint_manifest(
+            &best_model.report.checkpoint_path,
+            &CheckpointManifest::from_trained(&best_model),
+        )?;
 
         let report = SweepReport {
             model_name: model_name.to_string(),
@@ -464,6 +469,7 @@ mod tests {
 
     fn cleanup(checkpoint_path: &str) {
         let _ = std::fs::remove_file(checkpoint_path);
+        let _ = std::fs::remove_file(crate::dl::manifest_path(checkpoint_path));
         let _ = std::fs::remove_dir("checkpoints");
     }
 
@@ -836,6 +842,8 @@ mod acceptance {
 
         let _ = std::fs::remove_file(&cpu.report.checkpoint_path);
         let _ = std::fs::remove_file(&gpu.report.checkpoint_path);
+        let _ = std::fs::remove_file(crate::dl::manifest_path(&cpu.report.checkpoint_path));
+        let _ = std::fs::remove_file(crate::dl::manifest_path(&gpu.report.checkpoint_path));
         let _ = std::fs::remove_dir("checkpoints");
     }
 

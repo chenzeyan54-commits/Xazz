@@ -195,12 +195,15 @@ datasets. This track makes Xazz handle real workloads.
       run a cartesian grid search; the best combination (validation loss when a
       split is set, else training loss) is reported and kept for `predict()`
       (2026-09-18)
-- [ ] Checkpoint versioning
+- [x] **Checkpoint versioning** — a `<model>.meta.json` sidecar manifest records the Xazz
+      checkpoint format version, xazz version, model shape/provenance; loads fail closed when
+      the manifest declares a newer format, while legacy checkpoints without a manifest still
+      load (2026-09-21)
 - Depends on: D1. Acceptance: a CNN pipeline trains end-to-end on image-style tabular data.
   ⏳ **Partial 2026-09-11 / updated 2026-09-18**: early stopping, the Conv1d layer,
   the Embedding layer, and the hyperparameter sweep are shipped and verified end-to-end
   on CPU (early stopping + `best_epoch`; Conv1d/Embedding CPU train/predict; sweep grid
-  selection). Checkpoint versioning remains.
+  selection). Checkpoint versioning shipped 2026-09-21.
 
 ---
 

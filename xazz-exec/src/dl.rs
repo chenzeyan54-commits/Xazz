@@ -44,6 +44,14 @@ type TrainBatch<B> = (Tensor<Autodiff<B>, 2>, Tensor<Autodiff<B>, 2>);
 /// Upper bound of the validation split ratio — at most this fraction of the data can be held out for validation.
 const MAX_VALIDATION_SPLIT: f64 = 0.9;
 
+/// Application-level checkpoint schema version (D3).
+///
+/// The Burn record carries its own serialization version; this constant versions
+/// Xazz's sidecar manifest so a checkpoint produced by a newer build is rejected
+/// instead of being silently misread. Bump it whenever the manifest layout or the
+/// checkpoint's semantics change incompatibly.
+pub const CHECKPOINT_FORMAT_VERSION: u32 = 1;
+
 /// DSL model block activation/normalization layer kinds.
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Activation {
@@ -416,6 +424,9 @@ pub struct TrainReport {
     pub predictions: Vec<f64>,
     pub targets: Vec<f64>,
     pub checkpoint_path: String,
+    /// Xazz checkpoint format version written with this artifact (D3).
+    #[serde(default)]
+    pub checkpoint_format_version: u32,
     /// Whether training stopped early (validation loss plateaued) — issue D3.
     #[serde(default)]
     pub stopped_early: bool,
@@ -489,6 +500,137 @@ pub fn save_checkpoint(model: &Mlp<Plain>, path: &str) -> Result<(), String> {
             tr("checkpoint save failed", "체크포인트 저장 실패")
         )
     })
+}
+
+/// Sidecar metadata written next to a Burn checkpoint (`<name>.json` →
+/// `<name>.meta.json`).
+///
+/// The Burn record holds only the weights; the manifest records the Xazz format
+/// version plus the model shape and training provenance, so a checkpoint can be
+/// validated against the model it is loaded into and a future format change can
+/// be detected instead of silently misread.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct CheckpointManifest {
+    pub format_version: u32,
+    pub xazz_version: String,
+    pub model_name: String,
+    pub target: String,
+    pub input_dim: usize,
+    pub output_dim: usize,
+    pub feature_names: Vec<String>,
+    /// Declared layer graph rendered via `Debug` (e.g. `Dense(4)`, `ReLU`).
+    pub layers: Vec<String>,
+    pub epochs: usize,
+    pub batch_size: usize,
+    pub learning_rate: f32,
+    pub final_train_loss: f64,
+    pub final_val_loss: Option<f64>,
+    pub stopped_early: bool,
+    pub best_epoch: usize,
+}
+
+impl CheckpointManifest {
+    /// Builds a manifest from a training report and the declared layer graph.
+    pub fn from_report(report: &TrainReport, layers: &[LayerKind]) -> Self {
+        Self {
+            format_version: CHECKPOINT_FORMAT_VERSION,
+            xazz_version: env!("CARGO_PKG_VERSION").to_string(),
+            model_name: report.model_name.clone(),
+            target: report.target.clone(),
+            input_dim: report.input_dim,
+            output_dim: report.output_dim,
+            feature_names: report.feature_names.clone(),
+            layers: layers.iter().map(|l| format!("{l:?}")).collect(),
+            epochs: report.epochs,
+            batch_size: report.batch_size,
+            learning_rate: report.learning_rate,
+            final_train_loss: report.final_train_loss,
+            final_val_loss: report.final_val_loss,
+            stopped_early: report.stopped_early,
+            best_epoch: report.best_epoch,
+        }
+    }
+
+    /// Builds a manifest from a materialised [`TrainedModel`].
+    pub fn from_trained(trained: &TrainedModel) -> Self {
+        Self::from_report(&trained.report, &trained.layers)
+    }
+}
+
+/// Sidecar manifest path for a Burn checkpoint path (`.json` → `.meta.json`).
+pub fn manifest_path(checkpoint_path: &str) -> String {
+    format!("{}.meta.json", checkpoint_path.trim_end_matches(".json"))
+}
+
+/// Writes the sidecar manifest next to the Burn checkpoint.
+pub fn save_checkpoint_manifest(
+    checkpoint_path: &str,
+    manifest: &CheckpointManifest,
+) -> Result<(), String> {
+    let path = manifest_path(checkpoint_path);
+    let json = serde_json::to_string_pretty(manifest).map_err(|e| {
+        format!(
+            "{}: {e}",
+            tr(
+                "checkpoint manifest encode failed",
+                "체크포인트 매니페스트 인코딩 실패"
+            )
+        )
+    })?;
+    std::fs::write(&path, json).map_err(|e| {
+        format!(
+            "{} '{path}': {e}",
+            tr(
+                "checkpoint manifest save failed",
+                "체크포인트 매니페스트 저장 실패"
+            )
+        )
+    })
+}
+
+/// Reads and validates the sidecar manifest for a checkpoint.
+///
+/// Returns `Ok(None)` when the manifest is absent — a legacy checkpoint written
+/// before versioning — so callers can fall back to the Burn record. Returns an
+/// error when the manifest is unreadable or declares a format version newer than
+/// this build understands (fail-closed on forward incompatibility).
+pub fn load_checkpoint_manifest(
+    checkpoint_path: &str,
+) -> Result<Option<CheckpointManifest>, String> {
+    let path = manifest_path(checkpoint_path);
+    if !std::path::Path::new(&path).exists() {
+        return Ok(None);
+    }
+    let raw = std::fs::read_to_string(&path).map_err(|e| {
+        format!(
+            "{} '{path}': {e}",
+            tr(
+                "checkpoint manifest read failed",
+                "체크포인트 매니페스트 읽기 실패"
+            )
+        )
+    })?;
+    let manifest: CheckpointManifest = serde_json::from_str(&raw).map_err(|e| {
+        format!(
+            "{} '{path}': {e}",
+            tr(
+                "checkpoint manifest parse failed",
+                "체크포인트 매니페스트 파싱 실패"
+            )
+        )
+    })?;
+    if manifest.format_version > CHECKPOINT_FORMAT_VERSION {
+        return Err(format!(
+            "{} (manifest v{}, supported v{})",
+            tr(
+                "checkpoint format is newer than this build supports",
+                "체크포인트 형식이 이 빌드가 지원하는 버전보다 최신입니다"
+            ),
+            manifest.format_version,
+            CHECKPOINT_FORMAT_VERSION
+        ));
+    }
+    Ok(Some(manifest))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -861,9 +1003,15 @@ where
         predictions,
         targets: targets_out,
         checkpoint_path: format!("{ckpt}.json"),
+        checkpoint_format_version: CHECKPOINT_FORMAT_VERSION,
         stopped_early,
         best_epoch,
     };
+
+    // Versioned sidecar manifest (D3) — written next to the Burn record so a
+    // later load can validate format compatibility and model shape.
+    let manifest = CheckpointManifest::from_report(&report, layers);
+    save_checkpoint_manifest(&report.checkpoint_path, &manifest)?;
 
     Ok(RawTrained {
         model: valid_model,
@@ -986,6 +1134,10 @@ where
 {
     let (xs, n, feature_count) = prepare_inference_input(trained, df)?;
 
+    // Fail closed on a checkpoint from a newer Xazz when a manifest is present;
+    // legacy checkpoints without one still load through the Burn record.
+    load_checkpoint_manifest(trained.report.checkpoint_path.as_str())?;
+
     let device: Device<B> = Default::default();
     let template = build_mlp::<B>(&trained.layers, feature_count, &device)?;
     let recorder = PrettyJsonFileRecorder::<FullPrecisionSettings>::new();
@@ -1086,5 +1238,85 @@ mod tests {
         assert_eq!(count_non_integer_indices(&[-0.5, 3.0]), 1);
         // non-finite 는 forward 에서 0 으로 매핑되므로 세지 않는다.
         assert_eq!(count_non_integer_indices(&[f32::NAN, f32::INFINITY]), 0);
+    }
+
+    // ── Checkpoint versioning (D3) ──────────────────────────────────────────
+
+    static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    /// Isolated temp directory per test (avoids the shared `checkpoints/` dir).
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        let n = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("xazz_dl_{tag}_{}_{n}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        dir
+    }
+
+    fn sample_report() -> TrainReport {
+        TrainReport {
+            model_name: "ManifestMlp".to_string(),
+            target: "y".to_string(),
+            feature_names: vec!["x1".to_string(), "x2".to_string()],
+            input_dim: 2,
+            output_dim: 1,
+            num_params: 17,
+            epochs: 3,
+            batch_size: 2,
+            learning_rate: 0.05,
+            final_train_loss: 0.25,
+            final_val_loss: Some(0.3),
+            predictions: vec![1.0],
+            targets: vec![1.0],
+            checkpoint_path: "checkpoints/ManifestMlp.json".to_string(),
+            checkpoint_format_version: CHECKPOINT_FORMAT_VERSION,
+            stopped_early: false,
+            best_epoch: 0,
+        }
+    }
+
+    #[test]
+    fn checkpoint_manifest_round_trips_with_version_and_layers() {
+        let dir = temp_dir("manifest");
+        let ckpt = dir.join("ManifestMlp.json").to_string_lossy().to_string();
+        let layers = vec![LayerKind::Dense(4), LayerKind::ReLU, LayerKind::Dense(1)];
+        let manifest = CheckpointManifest::from_report(&sample_report(), &layers);
+
+        save_checkpoint_manifest(&ckpt, &manifest).expect("write manifest");
+        assert_eq!(
+            manifest_path(&ckpt),
+            format!("{}.meta.json", ckpt.trim_end_matches(".json"))
+        );
+
+        let loaded = load_checkpoint_manifest(&ckpt)
+            .expect("read manifest")
+            .expect("manifest present");
+        assert_eq!(loaded, manifest);
+        assert_eq!(loaded.format_version, CHECKPOINT_FORMAT_VERSION);
+        assert_eq!(loaded.layers, vec!["Dense(4)", "ReLU", "Dense(1)"]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn checkpoint_manifest_rejects_newer_format() {
+        let dir = temp_dir("newer");
+        let ckpt = dir.join("Newer.json").to_string_lossy().to_string();
+        let mut manifest =
+            CheckpointManifest::from_report(&sample_report(), &[LayerKind::Dense(1)]);
+        manifest.format_version = CHECKPOINT_FORMAT_VERSION + 1;
+        save_checkpoint_manifest(&ckpt, &manifest).expect("write manifest");
+
+        let err = load_checkpoint_manifest(&ckpt).expect_err("newer format must be rejected");
+        assert!(err.contains("newer") || err.contains("최신"), "{err}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn checkpoint_manifest_absent_is_legacy() {
+        let dir = temp_dir("legacy");
+        let ckpt = dir.join("Absent.json").to_string_lossy().to_string();
+        assert_eq!(load_checkpoint_manifest(&ckpt).expect("no error"), None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

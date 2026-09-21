@@ -9,6 +9,20 @@ Versioning: [Semantic Versioning](https://semver.org/)
 
 ## [Unreleased]
 
+### Added — D3 체크포인트 버저닝 (issue #64)
+
+- **`CheckpointManifest` + 사이드카** — Burn 체크포인트(`<model>.json`) 옆에
+  `<model>.meta.json`을 기록한다. Xazz 체크포인트 형식 버전(`CHECKPOINT_FORMAT_VERSION`),
+  xazz 버전, 모델명/타깃/입출력 차원/특성 컬럼/레이어 그래프/학습 하이퍼파라미터와
+  손실을 담는다
+- **로드 시 검증** — `load_checkpoint_manifest`가 사이드카가 선언한 형식이 이 빌드보다
+  최신이면 fail-closed로 거부한다. 사이드카가 없는 레거시 체크포인트는 그대로 로드한다.
+  `TrainReport`에 `checkpoint_format_version`을 추가했다
+- 학습(`train_impl`)과 스윕(winner 재저장) 양 경로에서 매니페스트를 기록하고, GPU
+  `predict_on`이 디스크에서 로드하기 전에 검증한다
+- 검증: 매니페스트 라운드트립(버전·레이어), 신버전 거부, 레거시 부재 허용 단위 테스트.
+  xazz-exec 65 tests
+
 ### Added — D3 Embedding 컬럼별 독립 vocab (issue #64)
 
 - **`Embedding([v0, v1, ...], embed_dim)`** — 선두 Embedding 의 vocab 인자를
