@@ -29,6 +29,7 @@ use crate::ast::{
 };
 use crate::policy::printer::escape;
 use crate::{Codegen, Lexer, Parser, StructField};
+use xazz_core::i18n::is_korean;
 
 /// default training batch size (the default in generated code).
 const DEFAULT_BATCH_SIZE: usize = 32;
@@ -679,6 +680,7 @@ fn generate_rust_src(
                         if name == model_name
                             && matches!(layers.first(), Some(LayerKind::Embedding { .. })))
                 });
+                warn_emit_output_dim(program, model_name);
                 out.push_str(&emit_dl_train_call(
                     var_name,
                     model_name,
@@ -722,6 +724,7 @@ fn generate_rust_src(
                     if name == model_name
                         && matches!(layers.first(), Some(LayerKind::Embedding { .. })))
             });
+            warn_emit_output_dim(program, model_name);
             out.push_str(&emit_dl_train_call(
                 source_var,
                 model_name,
@@ -824,6 +827,48 @@ fn set_dl_act(specs: &mut [DlLayer], act: &str) {
                 *a = act.to_string()
             }
         }
+    }
+}
+
+/// Returns the declared layers of a model, if any.
+fn find_model_layers<'a>(program: &'a Program, model_name: &str) -> Option<&'a [LayerKind]> {
+    program.stmts.iter().find_map(|stmt| match stmt {
+        Stmt::ModelDecl { name, layers } if name == model_name => Some(layers.as_slice()),
+        _ => None,
+    })
+}
+
+/// Emit-stage counterpart to `checker::warn_model_output_dim`.
+///
+/// A scalar regression target needs the model's final layer to be `Dense(1)`;
+/// a chain ending in Conv1d/Embedding (or `Dense(n)` with `n != 1`) makes the
+/// generated `forward` return several values, so training broadcasts the target
+/// and `predict()` later fails. The runtime is already fail-closed; this surfaces
+/// the same problem when `xazz emit rust` runs, before the generated program is
+/// compiled. `None` means the chain ends in `Dense(1)` (or has no usable layer).
+fn emit_output_dim_warning(model_name: &str, layers: &[LayerKind]) -> Option<String> {
+    let specs = dl_layer_specs(layers);
+    if specs.is_empty() || matches!(specs.last(), Some(DlLayer::Dense(1, _))) {
+        return None;
+    }
+    Some(if is_korean() {
+        format!(
+            "emit rust : 모델 '{model_name}' 의 마지막 레이어가 Dense(1) 이 아닙니다. 스칼라 타겟 회귀에서는 학습이 타겟을 브로드캐스트하고 predict() 가 실패합니다. 마지막에 Dense(1) 을 추가하세요."
+        )
+    } else {
+        format!(
+            "emit rust : model '{model_name}' does not end with Dense(1); a single scalar target will be broadcast and predict() will fail. Add a final Dense(1)."
+        )
+    })
+}
+
+/// Looks up a model's layers and prints the emit-stage output-dimension warning
+/// (if any) to stderr. Shared by the `TrainStmt` and VarDecl `train()` paths.
+fn warn_emit_output_dim(program: &Program, model_name: &str) {
+    if let Some(layers) = find_model_layers(program, model_name)
+        && let Some(msg) = emit_output_dim_warning(model_name, layers)
+    {
+        eprintln!("[xazz] {msg}");
     }
 }
 
@@ -1739,6 +1784,54 @@ mod tests {
         assert!(out.contains("use burn::"), "burn import 없음");
         assert!(out.contains("struct M<B: Backend>"), "모델 구조체 없음");
         assert!(out.contains("Adam"), "Adam 옵티마이저 없음");
+    }
+
+    /// Emit stage: a chain ending in Conv1d/Embedding (no final `Dense(1)`)
+    /// produces a multi-output `forward`; the emit path must flag it.
+    #[test]
+    fn emit_output_dim_warning_flags_non_scalar_final_layer() {
+        let conv_only = vec![
+            LayerKind::Conv1d {
+                out_channels: 4,
+                kernel_size: 3,
+            },
+            LayerKind::ReLU,
+        ];
+        let msg = emit_output_dim_warning("CNN", &conv_only).expect("경고 없음");
+        assert!(msg.contains("CNN"), "모델명 누락: {msg}");
+        assert!(msg.contains("Dense(1)"), "안내 누락: {msg}");
+
+        let embedding_only = vec![
+            LayerKind::Embedding {
+                vocab: EmbeddingVocab::Shared(5),
+                embed_dim: 2,
+            },
+            LayerKind::ReLU,
+        ];
+        assert!(
+            emit_output_dim_warning("E", &embedding_only).is_some(),
+            "Embedding 종단 경고 없음"
+        );
+
+        let dense_n = vec![LayerKind::Dense(4), LayerKind::ReLU, LayerKind::Dense(2)];
+        assert!(
+            emit_output_dim_warning("D", &dense_n).is_some(),
+            "Dense(n!=1) 종단 경고 없음"
+        );
+    }
+
+    /// A chain ending in `Dense(1)` (the scalar regression shape) must not warn.
+    #[test]
+    fn emit_output_dim_warning_accepts_final_dense_one() {
+        let ok = vec![
+            LayerKind::Conv1d {
+                out_channels: 4,
+                kernel_size: 3,
+            },
+            LayerKind::ReLU,
+            LayerKind::Dense(1),
+        ];
+        assert!(emit_output_dim_warning("M", &ok).is_none(), "오경고 발생");
     }
 
     /// VarDecl form `v m = ... |> train(...)` must emit the real Burn training
