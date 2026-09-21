@@ -117,7 +117,6 @@ pub trait ComputeBackend: Send + Sync {
             )
             .to_string()
         })?;
-        entries[best_index].selected = true;
 
         // Every combination re-trains onto the same checkpoint path, so the file
         // left on disk is the last combination's. Re-save the winner so the
@@ -130,12 +129,46 @@ pub trait ComputeBackend: Send + Sync {
             &CheckpointManifest::from_trained(&best_model),
         )?;
 
+        // The winner is always the best-by-metric combination, so a `top` filter
+        // (best-by-metric) can never drop it. Order the retained set afterwards.
+        let total_combos = entries.len();
+        let mut indexed: Vec<(usize, SweepCombo)> = entries.into_iter().enumerate().collect();
+        if let Some(top) = config.sweep_top {
+            let top = top.max(1);
+            if top < indexed.len() {
+                indexed.sort_by(|(_, a), (_, b)| {
+                    SweepReport::score(a, metric)
+                        .partial_cmp(&SweepReport::score(b, metric))
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+                indexed.truncate(top);
+            }
+        }
+        let sort = config.sweep_sort;
+        indexed.sort_by(|(_, a), (_, b)| SweepReport::compare(a, b, sort, metric));
+
+        let report_best = indexed
+            .iter()
+            .position(|(orig, _)| *orig == best_index)
+            .ok_or_else(|| {
+                tr(
+                    "sweep winner missing from the reported combinations.",
+                    "스윕 최적 조합이 리포트에서 누락되었습니다.",
+                )
+                .to_string()
+            })?;
+        let mut combos: Vec<SweepCombo> = indexed.into_iter().map(|(_, c)| c).collect();
+        combos[report_best].selected = true;
+
         let report = SweepReport {
             model_name: model_name.to_string(),
             target: config.target.clone(),
-            combos: entries,
-            best_index,
+            combos,
+            best_index: report_best,
             metric,
+            sort,
+            top: config.sweep_top,
+            total_combos,
         };
         Ok((best_model, report))
     }
@@ -449,6 +482,7 @@ pub fn active() -> &'static dyn ComputeBackend {
 mod tests {
     use super::*;
     use xazz_compiler::ast::EmbeddingVocab;
+    use xazz_compiler::ast::SweepSort;
 
     /// Tiny separable regression set shared by the CPU round-trip test and the
     /// hardware acceptance tests.
@@ -471,6 +505,8 @@ mod tests {
             early_stopping_patience: None,
             sweep: Default::default(),
             sweep_metric: Default::default(),
+            sweep_sort: Default::default(),
+            sweep_top: None,
         };
         (df, layers, config)
     }
@@ -571,6 +607,8 @@ mod tests {
             early_stopping_patience: None,
             sweep: Default::default(),
             sweep_metric: Default::default(),
+            sweep_sort: Default::default(),
+            sweep_top: None,
         };
 
         let (backend, warning) = resolve(None);
@@ -642,6 +680,8 @@ mod tests {
             early_stopping_patience: None,
             sweep: Default::default(),
             sweep_metric: Default::default(),
+            sweep_sort: Default::default(),
+            sweep_top: None,
         };
 
         let (backend, warning) = resolve(None);
@@ -691,6 +731,8 @@ mod tests {
             early_stopping_patience: None,
             sweep: Default::default(),
             sweep_metric: Default::default(),
+            sweep_sort: Default::default(),
+            sweep_top: None,
         };
 
         let (backend, warning) = resolve(None);
@@ -806,6 +848,71 @@ mod tests {
                 "최적 조합이 R² 기준 최고여야 함"
             );
         }
+
+        cleanup(&trained.report.checkpoint_path);
+    }
+
+    /// D3 sweep: `sort: lr` orders the reported combinations ascending by lr,
+    /// while the winner is still selected by the metric.
+    #[test]
+    fn cpu_backend_sweep_sorts_report_by_axis() {
+        let (df, layers, mut config) = tiny_dataset();
+        config.sweep.epochs = vec![2, 3];
+        config.sweep.learning_rate = vec![0.05, 0.01];
+        config.sweep_sort = SweepSort::Lr;
+        assert!(config.is_sweep());
+
+        let (backend, warning) = resolve(None);
+        assert!(warning.is_none());
+
+        let (trained, report) = backend
+            .sweep(&df, "backend_unit_sweep_sort", &layers, &config)
+            .expect("cpu sweep sort");
+        assert_eq!(report.sort, SweepSort::Lr);
+        assert_eq!(report.top, None);
+        assert_eq!(report.total_combos, 4);
+        let lrs: Vec<f32> = report.combos.iter().map(|c| c.learning_rate).collect();
+        assert!(
+            lrs.windows(2).all(|w| w[0] <= w[1]),
+            "lr 기준 오름차순이어야 함: {lrs:?}"
+        );
+        assert!(report.combos[report.best_index].selected);
+        assert_eq!(report.combos.iter().filter(|c| c.selected).count(), 1);
+
+        cleanup(&trained.report.checkpoint_path);
+    }
+
+    /// D3 sweep: `top: N` keeps only the N best-by-metric combinations, still
+    /// includes the winner, and reports the unfiltered total.
+    #[test]
+    fn cpu_backend_sweep_top_filters_report() {
+        let (df, layers, mut config) = tiny_dataset();
+        config.sweep.epochs = vec![2, 3];
+        config.sweep.learning_rate = vec![0.05, 0.01];
+        config.sweep_top = Some(2);
+        assert!(config.is_sweep());
+
+        let (backend, warning) = resolve(None);
+        assert!(warning.is_none());
+
+        let (trained, report) = backend
+            .sweep(&df, "backend_unit_sweep_top", &layers, &config)
+            .expect("cpu sweep top");
+        assert_eq!(report.combos.len(), 2, "top: 2로 잘려야 함");
+        assert_eq!(report.total_combos, 4, "필터 전 전체 조합 수");
+        assert_eq!(report.top, Some(2));
+        assert!(report.combos[report.best_index].selected);
+        assert_eq!(report.combos.iter().filter(|c| c.selected).count(), 1);
+        // Default sort is metric, so the report is best-first.
+        let scores: Vec<f64> = report
+            .combos
+            .iter()
+            .map(|c| SweepReport::score(c, report.metric))
+            .collect();
+        assert!(
+            scores.windows(2).all(|w| w[0] <= w[1]),
+            "metric 기준 최적 우선이어야 함: {scores:?}"
+        );
 
         cleanup(&trained.report.checkpoint_path);
     }

@@ -195,7 +195,9 @@ datasets. This track makes Xazz handle real workloads.
       run a cartesian grid search; the best combination (validation loss when a
       split is set, else training loss) is reported and kept for `predict()`.
       `metric: "mae" | "r2"` selects the winner by MAE or R² instead of MSE
-      (2026-09-18, metric 2026-09-21)
+      (2026-09-18, metric 2026-09-21). `sort: "metric" | "epochs" | "lr" | "batch"`
+      orders the reported table and `top: N` keeps only the N best-by-metric
+      combinations (2026-09-21)
 - [x] **Checkpoint versioning** — a `<model>.meta.json` sidecar manifest records the Xazz
       checkpoint format version, xazz version, model shape/provenance; loads fail closed when
       the manifest declares a newer format, while legacy checkpoints without a manifest still

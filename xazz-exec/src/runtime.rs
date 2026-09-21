@@ -1611,13 +1611,20 @@ fn handle_model_decl(name: &str, layers: &[LayerKind]) {
 /// Prints a hyperparameter sweep table (D3) — one row per combination plus the winner.
 fn print_sweep_report(report: &crate::dl::SweepReport) {
     println!("{}", "─".repeat(60));
+    let scope = if report.combos.len() < report.total_combos {
+        format!("{}/{}", report.combos.len(), report.total_combos)
+    } else {
+        report.combos.len().to_string()
+    };
     println!(
-        "🔎  {} ({} {})  [{}: {}]",
+        "🔎  {} ({} {})  [{}: {}, {}: {}]",
         tr("hyperparameter sweep", "하이퍼파라미터 스윕"),
-        report.combos.len(),
+        scope,
         tr("combinations", "조합"),
         tr("metric", "지표"),
-        report.metric.id()
+        report.metric.id(),
+        tr("sort", "정렬"),
+        report.sort.id()
     );
     println!(
         "  {:>3}  {:>6}  {:>7}  {:>10}  {:>12}  {:>10}  {:>10}",

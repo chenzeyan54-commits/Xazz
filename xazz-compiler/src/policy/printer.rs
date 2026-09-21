@@ -11,7 +11,7 @@
 
 use crate::ast::{
     BinOpKind, ChartConfig, DpArgs, Expr, FillNullValue, JoinHow, LayerKind, PipelineOp,
-    PipelineSource, Program, Stmt, StructField, TrainConfig,
+    PipelineSource, Program, Stmt, StructField, SweepSort, TrainConfig,
 };
 
 /// Turns a whole `Program` back into a `.xzz` source string.
@@ -359,6 +359,12 @@ fn print_train_args(model_name: &str, config: &TrainConfig) -> String {
     }
     if let Some(vs) = config.validation_split {
         parts.push(format!("validation_split: {}", print_f64(vs)));
+    }
+    if config.sweep_sort != SweepSort::default() {
+        parts.push(format!("sort: \"{}\"", config.sweep_sort.id()));
+    }
+    if let Some(top) = config.sweep_top {
+        parts.push(format!("top: {top}"));
     }
     parts.join(", ")
 }

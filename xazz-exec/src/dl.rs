@@ -9,6 +9,7 @@
 //!   - AD    = NdArrayAutodiff<f32>  (for training: autodiff graph enabled)
 //!   - Plain = NdArray<f32>          (for inference)
 
+use std::cmp::Ordering;
 use std::collections::HashMap;
 
 use burn::{
@@ -28,7 +29,7 @@ use burn::{
 };
 use burn_ndarray::NdArray;
 use polars::prelude::{Column, DataFrame};
-use xazz_compiler::ast::{LayerKind, SweepMetric, TrainConfig};
+use xazz_compiler::ast::{LayerKind, SweepMetric, SweepSort, TrainConfig};
 use xazz_core::i18n::{is_korean, tr};
 
 use crate::tensor_bridge::{extract_data, series_to_f32};
@@ -504,6 +505,15 @@ pub struct SweepReport {
     /// Metric the winner was selected by (D3). Defaults to MSE.
     #[serde(default)]
     pub metric: SweepMetric,
+    /// Ordering of the reported combinations (D3). Defaults to metric.
+    #[serde(default)]
+    pub sort: SweepSort,
+    /// When set, only this many best-by-metric combinations are reported (D3).
+    #[serde(default)]
+    pub top: Option<usize>,
+    /// Number of combinations evaluated before any `top` filter (D3).
+    #[serde(default)]
+    pub total_combos: usize,
 }
 
 impl SweepReport {
@@ -529,6 +539,43 @@ impl SweepReport {
             value
         } else {
             -value
+        }
+    }
+
+    /// Ordering of two combinations under the report `sort` (D3).
+    ///
+    /// `Metric` sorts best-first (ascending [`Self::score`]); the axis variants
+    /// sort ascending by that hyperparameter. Ties fall back to the remaining
+    /// axes so the order is deterministic.
+    pub fn compare(
+        a: &SweepCombo,
+        b: &SweepCombo,
+        sort: SweepSort,
+        metric: SweepMetric,
+    ) -> Ordering {
+        let by_lr = |a: &SweepCombo, b: &SweepCombo| {
+            a.learning_rate
+                .partial_cmp(&b.learning_rate)
+                .unwrap_or(Ordering::Equal)
+        };
+        let by_epochs = |a: &SweepCombo, b: &SweepCombo| a.epochs.cmp(&b.epochs);
+        let by_batch = |a: &SweepCombo, b: &SweepCombo| a.batch_size.cmp(&b.batch_size);
+        match sort {
+            SweepSort::Metric => Self::score(a, metric)
+                .partial_cmp(&Self::score(b, metric))
+                .unwrap_or(Ordering::Equal)
+                .then_with(|| by_epochs(a, b))
+                .then_with(|| by_lr(a, b))
+                .then_with(|| by_batch(a, b)),
+            SweepSort::Epochs => by_epochs(a, b)
+                .then_with(|| by_lr(a, b))
+                .then_with(|| by_batch(a, b)),
+            SweepSort::Lr => by_lr(a, b)
+                .then_with(|| by_epochs(a, b))
+                .then_with(|| by_batch(a, b)),
+            SweepSort::Batch => by_batch(a, b)
+                .then_with(|| by_epochs(a, b))
+                .then_with(|| by_lr(a, b)),
         }
     }
 }
@@ -1350,6 +1397,51 @@ mod tests {
         nan.val_mae = Some(f64::NAN);
         nan.train_mae = f64::NAN;
         assert_eq!(SweepReport::score(&nan, SweepMetric::Mae), f64::INFINITY);
+    }
+
+    #[test]
+    fn sweep_compare_orders_by_requested_axis() {
+        let mk = |epochs: usize, batch_size: usize, learning_rate: f32, val_loss: f64| SweepCombo {
+            epochs,
+            batch_size,
+            learning_rate,
+            final_train_loss: val_loss,
+            final_val_loss: Some(val_loss),
+            stopped_early: false,
+            best_epoch: 1,
+            train_mae: val_loss,
+            val_mae: Some(val_loss),
+            train_r2: 0.0,
+            val_r2: Some(0.0),
+            selected: false,
+        };
+        let a = mk(3, 8, 0.05, 0.10);
+        let b = mk(2, 4, 0.01, 0.30);
+
+        // Axis sorts are ascending by that hyperparameter.
+        assert_eq!(
+            SweepReport::compare(&b, &a, SweepSort::Epochs, SweepMetric::Mse),
+            Ordering::Less
+        );
+        assert_eq!(
+            SweepReport::compare(&b, &a, SweepSort::Lr, SweepMetric::Mse),
+            Ordering::Less
+        );
+        assert_eq!(
+            SweepReport::compare(&b, &a, SweepSort::Batch, SweepMetric::Mse),
+            Ordering::Less
+        );
+        // Metric sort is best-first, so the lower-loss combo orders first.
+        assert_eq!(
+            SweepReport::compare(&a, &b, SweepSort::Metric, SweepMetric::Mse),
+            Ordering::Less
+        );
+        // Equal on the sort axis falls through to a deterministic tiebreak.
+        let c = mk(2, 4, 0.01, 0.30);
+        assert_eq!(
+            SweepReport::compare(&b, &c, SweepSort::Epochs, SweepMetric::Mse),
+            Ordering::Equal
+        );
     }
 
     #[test]

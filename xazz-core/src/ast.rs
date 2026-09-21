@@ -520,6 +520,49 @@ impl SweepMetric {
     }
 }
 
+/// Ordering applied to the reported hyperparameter-sweep combinations (D3).
+///
+/// This only affects how the per-combination table/report is ordered; the winner
+/// is always chosen by [`SweepMetric`]. `Metric` sorts best-first, the axis
+/// variants sort ascending by that hyperparameter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SweepSort {
+    /// Best-first by the selection metric (default).
+    #[default]
+    Metric,
+    /// Ascending by `epochs`.
+    Epochs,
+    /// Ascending by learning rate.
+    Lr,
+    /// Ascending by `batch_size`.
+    Batch,
+}
+
+impl SweepSort {
+    /// Canonical id (also the `sort:` train() value).
+    pub fn id(self) -> &'static str {
+        match self {
+            SweepSort::Metric => "metric",
+            SweepSort::Epochs => "epochs",
+            SweepSort::Lr => "lr",
+            SweepSort::Batch => "batch",
+        }
+    }
+
+    /// Parses a `sort:` value, accepting common aliases.
+    /// Returns `None` for an unrecognised value.
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "" | "metric" | "score" | "loss" => Some(SweepSort::Metric),
+            "epochs" | "epoch" => Some(SweepSort::Epochs),
+            "lr" | "learning_rate" => Some(SweepSort::Lr),
+            "batch" | "batch_size" => Some(SweepSort::Batch),
+            _ => None,
+        }
+    }
+}
+
 /// Hyperparameter sweep grid (D3) — list-valued `train()` arguments.
 ///
 /// Each non-empty vector is one axis of a full cartesian-product grid search;
@@ -566,6 +609,10 @@ pub struct TrainConfig {
     pub sweep: SweepGrid,
     /// Metric used to pick the sweep winner (D3). Defaults to MSE.
     pub sweep_metric: SweepMetric,
+    /// Ordering of the reported sweep combinations (D3). Defaults to metric.
+    pub sweep_sort: SweepSort,
+    /// When set, report only this many best-by-metric combinations (D3).
+    pub sweep_top: Option<usize>,
 }
 
 impl Default for TrainConfig {
@@ -579,6 +626,8 @@ impl Default for TrainConfig {
             early_stopping_patience: None,
             sweep: SweepGrid::default(),
             sweep_metric: SweepMetric::default(),
+            sweep_sort: SweepSort::default(),
+            sweep_top: None,
         }
     }
 }
@@ -624,6 +673,8 @@ impl TrainConfig {
                         early_stopping_patience: self.early_stopping_patience,
                         sweep: SweepGrid::default(),
                         sweep_metric: self.sweep_metric,
+                        sweep_sort: SweepSort::default(),
+                        sweep_top: None,
                     });
                 }
             }
@@ -901,5 +952,38 @@ mod tests {
             combos.iter().all(|c| c.sweep_metric == SweepMetric::R2),
             "확장된 조합이 선택 지표를 유지해야 함"
         );
+    }
+
+    // ── D3 sweep report ordering / top-N ─────────────────────────────────────
+
+    #[test]
+    fn test_sweep_sort_parse_aliases() {
+        assert_eq!(SweepSort::parse(""), Some(SweepSort::Metric));
+        assert_eq!(SweepSort::parse(" Score "), Some(SweepSort::Metric));
+        assert_eq!(SweepSort::parse("epoch"), Some(SweepSort::Epochs));
+        assert_eq!(SweepSort::parse("learning_rate"), Some(SweepSort::Lr));
+        assert_eq!(SweepSort::parse("BATCH_SIZE"), Some(SweepSort::Batch));
+        assert_eq!(SweepSort::parse("quantum"), None);
+        assert_eq!(SweepSort::default(), SweepSort::Metric);
+        assert_eq!(SweepSort::Batch.id(), "batch");
+    }
+
+    /// `sort`/`top` default off and survive on the original config, but expanded
+    /// combos always carry the neutral defaults since they are run individually.
+    #[test]
+    fn test_expand_sweep_resets_sort_and_top() {
+        let mut config = TrainConfig {
+            target: "y".into(),
+            epochs: 1,
+            learning_rate: 0.1,
+            ..Default::default()
+        };
+        config.sweep.epochs = vec![1, 2];
+        config.sweep_sort = SweepSort::Lr;
+        config.sweep_top = Some(1);
+        let combos = config.expand_sweep();
+        assert_eq!(combos.len(), 2);
+        assert!(combos.iter().all(|c| c.sweep_sort == SweepSort::Metric));
+        assert!(combos.iter().all(|c| c.sweep_top.is_none()));
     }
 }

@@ -9,6 +9,21 @@ Versioning: [Semantic Versioning](https://semver.org/)
 
 ## [Unreleased]
 
+### Added — D3 스윕 리포트 정렬/필터 (`sort:`, `top:`) (issue #64)
+
+- **`train(..., sort: "metric" | "epochs" | "lr" | "batch")`** — 하이퍼파라미터
+  스윕 표/리포트에 출력되는 조합의 정렬 기준을 고를 수 있다. `metric`(기본)은
+  선택 지표 기준 최적 우선, 나머지는 해당 하이퍼파라미터 오름차순이며 동률은
+  나머지 축으로 결정적으로 정렬된다. 우승 조합 선정은 기존 `metric` 기준 유지
+- **`train(..., top: N)`** — 지표 기준 상위 N개 조합만 리포트에 남긴다(1 이상,
+  `top: 0`은 오류). 우승 조합은 항상 포함되며 `SweepReport.total_combos`가
+  필터 전 전체 조합 수를 보존한다
+- `SweepSort`(xazz-core AST) + 파서 `sort:`/`top:` 인수(문자열/식별자, 별칭 허용,
+  미지원 값/0은 오류). `SweepReport`에 `sort`/`top`/`total_combos` 추가(JSON 노출),
+  `dl::SweepReport::compare` 정렬 헬퍼, 런타임 표 헤더에 지표/정렬·`표시/전체` 표기
+- 검증: `SweepSort` 파싱/별칭, expand_sweep의 sort/top 중립화, 파서 sort/top/오류
+  3종, `compare` 축별 정렬, `sort: lr`·`top: 2` 스윕 E2E 2종
+
 ### Added — D3 스윕 선택 지표 (MAE/R²) (issue #64)
 
 - **`train(..., metric: "mae" | "r2")`** — 하이퍼파라미터 스윕의 우승 조합 선택
