@@ -20,7 +20,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::ast::{
     AggFn, AggSpec, BinOpKind, ChartConfig, DpArgs, Expr, FillNullValue, JoinHow, LayerKind,
-    PipelineOp, PipelineSource, Program, Stmt, StructField, TrainConfig,
+    PipelineOp, PipelineSource, Program, Stmt, StructField, SweepSort, TrainConfig,
 };
 use crate::error::{CompileError, ErrorKind};
 use crate::ir;
@@ -462,9 +462,32 @@ impl Analyzer {
     /// Validates the list-valued sweep axes of a `train()` config (D3).
     ///
     /// Emits a compile error for out-of-range values (`epochs`/`batch_size` < 1,
-    /// `lr` <= 0 or non-finite). Non-sweep configs are a no-op.
+    /// `lr` <= 0 or non-finite). A `sort:`/`top:` option without a sweep grid is a
+    /// no-op (there is a single combination), so it warns instead of failing.
+    /// Fully non-sweep configs with no such options are a no-op.
     fn validate_train_sweep(&mut self, model_name: &str, config: &TrainConfig) {
         if !config.is_sweep() {
+            let sort_set = config.sweep_sort != SweepSort::default();
+            let top_set = config.sweep_top.is_some();
+            if sort_set || top_set {
+                let option = match (sort_set, top_set) {
+                    (true, true) => "sort:/top:",
+                    (true, false) => "sort:",
+                    (false, _) => "top:",
+                };
+                self.warning(
+                    Some(model_name),
+                    if is_korean() {
+                        format!(
+                            "train({model_name}) : 스윕 그리드(리스트형 epochs/lr/batch_size)가 없어 {option} 옵션이 무시됩니다."
+                        )
+                    } else {
+                        format!(
+                            "train({model_name}): {option} is ignored because there is no sweep grid (list-valued epochs/lr/batch_size)."
+                        )
+                    },
+                );
+            }
             return;
         }
         for &epochs in &config.sweep.epochs {
@@ -1672,6 +1695,11 @@ mod tests {
             .collect()
     }
 
+    /// Language-agnostic check for the "option ignored without a sweep grid" warning.
+    fn is_ignored_warning(message: &str) -> bool {
+        message.contains("ignored") || message.contains("무시")
+    }
+
     #[test]
     fn ok_pipeline_no_diagnostics() {
         let r = check(
@@ -1942,6 +1970,58 @@ mod tests {
                 .any(|k| k.contains("잘못된 하이퍼파라미터")),
             "스윕 lr 오류 진단 없음: {:?}",
             err_kinds(&r)
+        );
+    }
+
+    #[test]
+    fn train_sort_without_sweep_warns() {
+        let r = check(
+            "type X = { a: float, y: float };
+             model M { Dense(4) -> Dense(1) }
+             v data = load(\"x.csv\") :: X;
+             v trained = data |> train(M, target: \"y\", epochs: 5, sort: \"lr\");",
+        );
+        assert!(r.is_ok(), "오류: {:?}", r.errors);
+        assert!(
+            r.warnings
+                .iter()
+                .any(|w| w.message.contains("sort") && is_ignored_warning(&w.message)),
+            "sort 무시 경고 없음: {:?}",
+            r.warnings.iter().map(|w| &w.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn train_top_without_sweep_warns() {
+        let r = check(
+            "type X = { a: float, y: float };
+             model M { Dense(4) -> Dense(1) }
+             v data = load(\"x.csv\") :: X;
+             run data |> train(M, target: \"y\", epochs: 5, top: 3);",
+        );
+        assert!(r.is_ok(), "오류: {:?}", r.errors);
+        assert!(
+            r.warnings
+                .iter()
+                .any(|w| w.message.contains("top") && is_ignored_warning(&w.message)),
+            "top 무시 경고 없음: {:?}",
+            r.warnings.iter().map(|w| &w.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn train_sort_and_top_with_sweep_no_warning() {
+        let r = check(
+            "type X = { a: float, y: float };
+             model M { Dense(4) -> Dense(1) }
+             v data = load(\"x.csv\") :: X;
+             v trained = data |> train(M, target: \"y\", epochs: [5, 10], sort: \"lr\", top: 2);",
+        );
+        assert!(r.is_ok(), "오류: {:?}", r.errors);
+        assert!(
+            !r.warnings.iter().any(|w| is_ignored_warning(&w.message)),
+            "스윕에서는 무시 경고가 없어야 함: {:?}",
+            r.warnings.iter().map(|w| &w.message).collect::<Vec<_>>()
         );
     }
 
