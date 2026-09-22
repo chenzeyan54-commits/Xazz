@@ -133,6 +133,10 @@ proven semantics-preserving at the language level:
 Each pass is covered by structural unit tests, and an execution-equivalence test
 in `xazz-exec` proves the reordered pipeline yields the same DataFrame.
 
+The pass is opt-in at runtime: `xazz run --opt` threads the flag through
+`xazz-runner` into `xazz-exec`, which calls `optimize_program` before lowering
+the Typed IR.
+
 Polars' `LazyFrame` also performs internal predicate pushdown / column pruning;
 the IR optimizer defines these transformations explicitly at the language layer
 for backend independence (future backends benefit without re-deriving them).

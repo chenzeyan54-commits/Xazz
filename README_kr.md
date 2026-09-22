@@ -94,9 +94,12 @@ xazz new my-project    # 프로젝트 + 샘플 CSV 생성
 cd my-project
 xazz import data.csv   # 스키마 자동 추론 → main.xzz에 타입 블록 기록
 xazz run main.xzz      # 컴파일 + 실행
+xazz run main.xzz --opt  # 선택: Typed IR 최적화 패스 활성화
 ```
 
 이게 전부입니다. `xazz import`는 CSV(EUC-KR/CP949 자동 감지)를 읽고, 컬럼 타입을 추론해 스키마 선언을 생성합니다.
+
+`--opt`는 실행 전에 Typed IR 최적화 패스(예: 필터 재정렬)를 켭니다 — 파이프라인 의미는 그대로 유지되며, 미적용 경로와의 동등성이 테스트로 검증됩니다.
 
 ---
 
@@ -277,7 +280,7 @@ python benches/render_benchmark_chart.py        # 위 차트 재생성
 
 | 기능 | 설명 | 상태 |
 |---------|-------------|--------|
-| `xazz run` | `.xzz` 파이프라인 컴파일·실행 (`--json` 기계 판독 결과) | Stable |
+| `xazz run` | `.xzz` 파이프라인 컴파일·실행 (`--json` 기계 판독 결과, `--opt` Typed IR 최적화 패스) | Stable |
 | `xazz check` | 정적 의미 분석 — 미선언 변수/컬럼, 중복 선언, 잘못된 cast, did-you-mean 제안, 행:열 단위 진단 | Stable |
 | `xazz import` | CSV 스키마 자동 추론 → 타입 블록 생성 (EUC-KR/CP949 자동 감지) | Stable |
 | DuckDB 커넥터 | `load("duckdb://...?sql=...")` — 인메모리·파일 DuckDB를 파이프라인 소스로 사용 (Track A3) | Stable |

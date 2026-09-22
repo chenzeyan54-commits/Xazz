@@ -94,9 +94,12 @@ xazz new my-project    # scaffold a project + sample CSV
 cd my-project
 xazz import data.csv   # auto-infer the schema → writes a type block into main.xzz
 xazz run main.xzz      # compile + execute
+xazz run main.xzz --opt  # optional: enable the typed-IR optimization pass
 ```
 
 That's the whole loop. `xazz import` reads your CSV (EUC-KR/CP949 auto-detected), infers column types, and generates the schema declaration for you.
+
+`--opt` turns on the typed-IR optimization pass (e.g. filter reordering) before execution — it preserves pipeline semantics and is equivalence-tested against the unoptimized path.
 
 ---
 
@@ -283,7 +286,7 @@ python benches/run_readme_benchmark.py --xlarge
 
 | Feature | Description | Status |
 |---------|-------------|--------|
-| `xazz run` | Compile and execute `.xzz` pipelines (`--json` for machine-readable results) | Stable |
+| `xazz run` | Compile and execute `.xzz` pipelines (`--json` for machine-readable results, `--opt` for the typed-IR optimization pass) | Stable |
 | `xazz check` | Static semantic analysis — undeclared variables/columns, duplicate declarations, invalid casts, with did-you-mean hints and `line:col` spans | Stable |
 | `xazz import` | Auto-infer schema → generate `type` block (CSV EUC-KR/CP949, Parquet, Arrow) | Stable |
 | `import "mod.xzz"` | Module system — share `type`/`model`/`v` pipelines across files (cycle-fail-closed) | Stable |
