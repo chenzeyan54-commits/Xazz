@@ -609,8 +609,17 @@ pub struct TrainConfig {
     pub sweep: SweepGrid,
     /// Metric used to pick the sweep winner (D3). Defaults to MSE.
     pub sweep_metric: SweepMetric,
+    /// Whether `metric:` was explicitly written in the source (D3).
+    ///
+    /// The value alone cannot distinguish `metric: "mse"` from an omitted
+    /// `metric:` because both equal [`SweepMetric::default`]; this flag records
+    /// the explicit mention so the checker can warn about a no-op option.
+    pub sweep_metric_explicit: bool,
     /// Ordering of the reported sweep combinations (D3). Defaults to metric.
     pub sweep_sort: SweepSort,
+    /// Whether `sort:` was explicitly written in the source (D3). See
+    /// [`TrainConfig::sweep_metric_explicit`].
+    pub sweep_sort_explicit: bool,
     /// When set, report only this many best-by-metric combinations (D3).
     pub sweep_top: Option<usize>,
 }
@@ -626,7 +635,9 @@ impl Default for TrainConfig {
             early_stopping_patience: None,
             sweep: SweepGrid::default(),
             sweep_metric: SweepMetric::default(),
+            sweep_metric_explicit: false,
             sweep_sort: SweepSort::default(),
+            sweep_sort_explicit: false,
             sweep_top: None,
         }
     }
@@ -673,7 +684,9 @@ impl TrainConfig {
                         early_stopping_patience: self.early_stopping_patience,
                         sweep: SweepGrid::default(),
                         sweep_metric: self.sweep_metric,
+                        sweep_metric_explicit: false,
                         sweep_sort: SweepSort::default(),
+                        sweep_sort_explicit: false,
                         sweep_top: None,
                     });
                 }

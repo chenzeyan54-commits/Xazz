@@ -505,7 +505,9 @@ mod tests {
             early_stopping_patience: None,
             sweep: Default::default(),
             sweep_metric: Default::default(),
+            sweep_metric_explicit: false,
             sweep_sort: Default::default(),
+            sweep_sort_explicit: false,
             sweep_top: None,
         };
         (df, layers, config)
@@ -607,7 +609,9 @@ mod tests {
             early_stopping_patience: None,
             sweep: Default::default(),
             sweep_metric: Default::default(),
+            sweep_metric_explicit: false,
             sweep_sort: Default::default(),
+            sweep_sort_explicit: false,
             sweep_top: None,
         };
 
@@ -680,7 +684,9 @@ mod tests {
             early_stopping_patience: None,
             sweep: Default::default(),
             sweep_metric: Default::default(),
+            sweep_metric_explicit: false,
             sweep_sort: Default::default(),
+            sweep_sort_explicit: false,
             sweep_top: None,
         };
 
@@ -731,7 +737,9 @@ mod tests {
             early_stopping_patience: None,
             sweep: Default::default(),
             sweep_metric: Default::default(),
+            sweep_metric_explicit: false,
             sweep_sort: Default::default(),
+            sweep_sort_explicit: false,
             sweep_top: None,
         };
 

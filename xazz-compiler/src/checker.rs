@@ -20,7 +20,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::ast::{
     AggFn, AggSpec, BinOpKind, ChartConfig, DpArgs, Expr, FillNullValue, JoinHow, LayerKind,
-    PipelineOp, PipelineSource, Program, Stmt, StructField, SweepMetric, SweepSort, TrainConfig,
+    PipelineOp, PipelineSource, Program, Stmt, StructField, TrainConfig,
 };
 use crate::error::{CompileError, ErrorKind};
 use crate::ir;
@@ -468,10 +468,10 @@ impl Analyzer {
     fn validate_train_sweep(&mut self, model_name: &str, config: &TrainConfig) {
         if !config.is_sweep() {
             let mut ignored: Vec<&str> = Vec::new();
-            if config.sweep_metric != SweepMetric::default() {
+            if config.sweep_metric_explicit {
                 ignored.push("metric:");
             }
-            if config.sweep_sort != SweepSort::default() {
+            if config.sweep_sort_explicit {
                 ignored.push("sort:");
             }
             if config.sweep_top.is_some() {
@@ -1989,6 +1989,45 @@ mod tests {
         assert!(
             !r.warnings.iter().any(|w| is_ignored_warning(&w.message)),
             "스윕에서는 무시 경고가 없어야 함: {:?}",
+            r.warnings.iter().map(|w| &w.message).collect::<Vec<_>>()
+        );
+    }
+
+    /// Explicitly writing a default-valued option (`metric: "mse"`) is still an
+    /// explicit mention and must warn when there is no sweep grid.
+    #[test]
+    fn train_explicit_default_metric_without_sweep_warns() {
+        let r = check(
+            "type X = { a: float, y: float };
+             model M { Dense(4) -> Dense(1) }
+             v data = load(\"x.csv\") :: X;
+             v trained = data |> train(M, target: \"y\", epochs: 5, metric: \"mse\");",
+        );
+        assert!(r.is_ok(), "오류: {:?}", r.errors);
+        assert!(
+            r.warnings
+                .iter()
+                .any(|w| w.message.contains("metric") && is_ignored_warning(&w.message)),
+            "metric 무시 경고 없음: {:?}",
+            r.warnings.iter().map(|w| &w.message).collect::<Vec<_>>()
+        );
+    }
+
+    /// Explicitly writing the default `sort: "metric"` must also warn without a grid.
+    #[test]
+    fn train_explicit_default_sort_without_sweep_warns() {
+        let r = check(
+            "type X = { a: float, y: float };
+             model M { Dense(4) -> Dense(1) }
+             v data = load(\"x.csv\") :: X;
+             v trained = data |> train(M, target: \"y\", epochs: 5, sort: \"metric\");",
+        );
+        assert!(r.is_ok(), "오류: {:?}", r.errors);
+        assert!(
+            r.warnings
+                .iter()
+                .any(|w| w.message.contains("sort") && is_ignored_warning(&w.message)),
+            "sort 무시 경고 없음: {:?}",
             r.warnings.iter().map(|w| &w.message).collect::<Vec<_>>()
         );
     }

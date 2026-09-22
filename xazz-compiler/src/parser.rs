@@ -473,6 +473,7 @@ impl Parser {
                 }
                 "metric" => {
                     let raw = self.parse_string_or_ident("metric")?;
+                    config.sweep_metric_explicit = true;
                     config.sweep_metric = SweepMetric::parse(&raw).ok_or_else(|| {
                         CompileError::new(
                             ErrorKind::UnexpectedToken(raw.clone()),
@@ -483,6 +484,7 @@ impl Parser {
                 }
                 "sort" => {
                     let raw = self.parse_string_or_ident("sort")?;
+                    config.sweep_sort_explicit = true;
                     config.sweep_sort = SweepSort::parse(&raw).ok_or_else(|| {
                         CompileError::new(
                             ErrorKind::UnexpectedToken(raw.clone()),
@@ -2257,6 +2259,7 @@ type AirQuality = {
         match &program.stmts[2] {
             Stmt::TrainStmt { config, .. } => {
                 assert_eq!(config.sweep_metric, SweepMetric::Mae);
+                assert!(config.sweep_metric_explicit);
             }
             other => panic!("TrainStmt 예상, 실제: {:?}", other),
         }
@@ -2296,6 +2299,7 @@ type AirQuality = {
             Stmt::TrainStmt { config, .. } => {
                 assert_eq!(config.sweep_sort, SweepSort::Lr);
                 assert_eq!(config.sweep_top, None);
+                assert!(config.sweep_sort_explicit);
             }
             other => panic!("TrainStmt 예상, 실제: {:?}", other),
         }
@@ -2303,6 +2307,25 @@ type AirQuality = {
             Stmt::TrainStmt { config, .. } => {
                 assert_eq!(config.sweep_sort, SweepSort::Batch);
                 assert_eq!(config.sweep_top, Some(3));
+            }
+            other => panic!("TrainStmt 예상, 실제: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_train_omitted_metric_and_sort_are_not_explicit() {
+        let src = r#"
+            model M { Dense(1) }
+            v data = load("x.csv") :: S;
+            run data |> train(M, target: "y", epochs: [1, 2]);
+        "#;
+        let program = parse_src(src).expect("파싱 실패");
+        match &program.stmts[2] {
+            Stmt::TrainStmt { config, .. } => {
+                assert_eq!(config.sweep_metric, SweepMetric::default());
+                assert!(!config.sweep_metric_explicit);
+                assert_eq!(config.sweep_sort, SweepSort::default());
+                assert!(!config.sweep_sort_explicit);
             }
             other => panic!("TrainStmt 예상, 실제: {:?}", other),
         }

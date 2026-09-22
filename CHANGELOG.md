@@ -14,8 +14,11 @@ Versioning: [Semantic Versioning](https://semver.org/)
 - 스윕 그리드(리스트형 `epochs`/`lr`/`batch_size`) 없이 `metric:`/`sort:`/`top:`만
   지정하면 조합이 하나뿐이라 옵션이 조용히 무시되던 문제를 체커 경고로 알린다.
   오류가 아니라 경고(비치명적)이며, 지정된 옵션만 안내한다
+- `metric: "mse"`/`sort: "metric"`처럼 기본값을 명시 지정한 경우에도 "지정됨"을
+  구분하지 못해 경고가 누락되던 문제를 `sweep_metric_explicit`/`sweep_sort_explicit`
+  플래그로 수정 (2026-09-22)
 - 검증: `metric:`만/`sort:`만/`top:`만 무그리드 경고 3종 + 3종 동시 지정 통합
-  경고 1종 + 스윕 동반 시 무경고 1종
+  경고 1종 + 스윕 동반 시 무경고 1종 + 명시 기본값 경고 2종
 
 ### Added — D3 스윕 리포트 정렬/필터 (`sort:`, `top:`) (issue #64)
 

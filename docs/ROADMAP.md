@@ -198,7 +198,8 @@ datasets. This track makes Xazz handle real workloads.
       (2026-09-18, metric 2026-09-21). `sort: "metric" | "epochs" | "lr" | "batch"`
       orders the reported table and `top: N` keeps only the N best-by-metric
       combinations (2026-09-21); a `metric:`/`sort:`/`top:` without a sweep grid
-      is a no-op and the checker warns (2026-09-21)
+      is a no-op and the checker warns — including explicitly written defaults
+      like `metric: "mse"`/`sort: "metric"` (2026-09-22)
 - [x] **Checkpoint versioning** — a `<model>.meta.json` sidecar manifest records the Xazz
       checkpoint format version, xazz version, model shape/provenance; loads fail closed when
       the manifest declares a newer format, while legacy checkpoints without a manifest still
