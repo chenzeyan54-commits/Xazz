@@ -34,6 +34,11 @@ use xazz_core::i18n::{is_korean, tr};
 
 use crate::tensor_bridge::{extract_data, series_to_f32};
 
+/// ONNX export + inference path (D2 #63), enabled by the `onnx` feature. A child
+/// module so it can read `Mlp`'s private graph/weights without widening them.
+#[cfg(feature = "onnx")]
+pub(crate) mod onnx_export;
+
 /// Autodiff backend for training (CPU): NdArray + Autodiff wrapper.
 pub type AD = Autodiff<NdArray<f32>>;
 /// Pure backend for inference (CPU).

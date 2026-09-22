@@ -23,7 +23,7 @@ path = "src/main.rs"
 default = []
 cuda = ["dep:burn-tch", "dep:tch"]
 wgpu = ["dep:burn-wgpu"]
-onnx = []
+onnx = ["dep:ort", "dep:rlx-onnx-proto", "dep:protobuf"]
 
 [dependencies]
 # 공유 핵심 타입
@@ -62,6 +62,22 @@ burn-wgpu = { version = "0.21", optional = true }
 # the provider can probe CUDA availability without panicking.
 burn-tch = { version = "0.21", optional = true }
 tch = { version = "0.22", optional = true }
+
+# ONNX provider (D2 #63) — export + inference, enabled by the `onnx` feature.
+# `ort` is the ONNX Runtime binding (its `download-binaries` default fetches a
+# prebuilt runtime, so no system install is required); `rlx-onnx-proto` provides
+# the ONNX protobuf types without a build-time `protoc`, and `protobuf` is its
+# serialization trait. `tls-rustls` is used instead of the default `tls-native`
+# so the download needs no system OpenSSL (`openssl-sys`).
+ort = { version = "2.0.0-rc.13", default-features = false, features = [
+    "std",
+    "download-binaries",
+    "copy-dylibs",
+    "api-27",
+    "tls-rustls",
+], optional = true }
+rlx-onnx-proto = { version = "0.2", optional = true }
+protobuf = { version = "1.7", optional = true }
 
 # ── DuckDB 외부 소스 커넥터 (issue #56, Track A3) ─────────────────────────────
 # bundled: embeds DuckDB (no system install needed).

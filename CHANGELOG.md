@@ -9,6 +9,26 @@ Versioning: [Semantic Versioning](https://semver.org/)
 
 ## [Unreleased]
 
+### Added — D2 ONNX export + ONNX Runtime 추론 (issue #63)
+
+- **`OnnxBackend` 실제 구현** — `--features onnx`에서 CPU 참조 학습 후
+  `checkpoints/<Model>.onnx`로 export하고, 추론은 ONNX Runtime(`ort`)으로 실행한다.
+  기존 스캐폴드(에러 반환)를 대체한다
+- **ONNX exporter** (`xazz-exec/src/dl/onnx_export.rs`, `dl`의 자식 모듈) — `Mlp`
+  그래프를 표준 ONNX `ModelProto`로 방출한다. `Dense`(Gemm), `Conv1d`(Same 패딩
+  `pads`), `Embedding`(Split→Clip→Add→Cast→Gather→Reshape), ReLU/Sigmoid/Tanh/
+  Softmax 지원(Dropout은 추론 시 항등). 미지원 그래프는 fail-closed
+- **런타임** — `ort`(ONNX Runtime) + protobuf 타입은 `rlx-onnx-proto`(빌드 시
+  `protoc` 불필요), 바이너리는 `ort`의 `download-binaries`로 자동 확보. 기본
+  `tls-native`(시스템 OpenSSL) 대신 `tls-rustls` 사용
+- **파리티 검증** — D2 acceptance(`onnx_matches_cpu_losses`)는 동일 CPU 가중치를
+  CPU 인메모리 추론과 ONNX Runtime 추론으로 각각 실행해 예측이 일치하는지 확인.
+  exporter 단위 테스트(`dense_export_emits_gemm_relu_gemm`) 추가
+- 검증: `cargo check/clippy -p xazz-exec --features onnx --all-targets -- -D warnings`
+  통과. 프로그램 전체 `cargo test --workspace`/`cargo deny check` 회귀 없음
+  (이 WSL은 zig C++ 링커라 ort의 prebuilt C++ 정적 라이브러리 링크가 불가해
+  실기 acceptance는 표준 툴체인/Windows에서 실행)
+
 ### Added — D1 `burn-tch`(CUDA) 실제 provider (issue #62)
 
 - **`CudaBackend` 실제 구현** — `--features cuda`에서 `burn-tch`(LibTorch)로 NVIDIA

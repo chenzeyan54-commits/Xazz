@@ -179,11 +179,17 @@ datasets. This track makes Xazz handle real workloads.
   CUDA-built LibTorch (`TORCH_CUDA_VERSION`).
 
 ### D2. ONNX export/import — issue #63
-- [x] ONNX provider slot in `ComputeBackend` (`--features onnx`, scaffold) + gated parity test
-- [ ] `TrainedModel` → ONNX export; ONNX → inference without re-training
-- [ ] Unlocks ecosystem interop and model serving
+- [x] ONNX provider slot in `ComputeBackend` (`--features onnx`)
+- [x] `TrainedModel` → ONNX export — `dl::onnx_export` emits a standard `ModelProto`
+      for Dense/Conv1d/Embedding + ReLU/Sigmoid/Tanh/Softmax (2026-09-22)
+- [x] ONNX → inference without re-training — `OnnxBackend::predict` runs the exported
+      graph through ONNX Runtime (`ort`, binaries auto-downloaded) (2026-09-22)
+- [ ] Real ONNX Runtime acceptance on a standard toolchain — `cargo test -p xazz-exec --features onnx -- --ignored`
+- Unlocks ecosystem interop and model serving
 - Depends on: D1 (device mapping). Acceptance: exported ONNX runs in onnxruntime with same prediction.
-  ⏳ **Slot landed 2026-09-11**: provider + `#[ignore]` acceptance test; needs `onnxruntime`.
+  ⏳ **Provider landed 2026-09-22**: export + `ort` runtime + parity test wired; the local
+  WSL zig C++ linker cannot link ort's prebuilt C++ static library, so the gated acceptance
+  must run on a standard toolchain (Windows/CI).
 
 ### D3. Model graph expansion — issue #64
 - [x] **Early stopping** — `train(..., validation_split: 0.3, patience: N)` stops when validation

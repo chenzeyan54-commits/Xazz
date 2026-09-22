@@ -261,9 +261,9 @@ impl BackendKind {
 // ─────────────────────────────────────────────────────────────────────────────
 // Feature-gated providers
 //
-// `cuda` (burn-tch) and `wgpu` (burn-wgpu) are implemented; `onnx` is still a
-// scaffold (swap its body for the onnxruntime implementation). Each provider's
-// acceptance test beside the trait pins the contract it must satisfy.
+// `cuda` (burn-tch), `wgpu` (burn-wgpu), and `onnx` (ONNX Runtime) are all
+// implemented. Each provider's acceptance test beside the trait pins the
+// contract it must satisfy.
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[cfg(feature = "cuda")]
@@ -375,10 +375,16 @@ mod wgpu {
 #[cfg(feature = "onnx")]
 mod onnx {
     use super::*;
-    use xazz_core::i18n::tr;
 
-    /// ONNX Runtime provider. Scaffold — see issue D2 (#63).
+    /// ONNX Runtime provider (D2 #63). ONNX is an interop/inference target, so
+    /// `train` runs the CPU reference training and exports the result to a
+    /// sibling `.onnx` artifact; `predict` evaluates that graph via ONNX Runtime.
     pub struct OnnxBackend;
+
+    /// `checkpoints/<name>.json` → `checkpoints/<name>.onnx`.
+    fn artifact_path(checkpoint_path: &str) -> String {
+        format!("{}.onnx", checkpoint_path.trim_end_matches(".json"))
+    }
 
     impl ComputeBackend for OnnxBackend {
         fn id(&self) -> &'static str {
@@ -387,29 +393,26 @@ mod onnx {
 
         fn train(
             &self,
-            _df: &DataFrame,
-            _model_name: &str,
-            _layers: &[LayerKind],
-            _config: &TrainConfig,
+            df: &DataFrame,
+            model_name: &str,
+            layers: &[LayerKind],
+            config: &TrainConfig,
         ) -> Result<TrainedModel, String> {
-            Err(tr(
-                "ONNX backend is a scaffold: add `onnxruntime` and implement it (issue #63).",
-                "ONNX 백엔드는 스캐폴드입니다: `onnxruntime`을 추가하고 구현하세요 (이슈 #63).",
-            )
-            .into())
+            let trained = crate::dl::train(df, model_name, layers, config)?;
+            crate::dl::onnx_export::export(
+                &trained,
+                &artifact_path(&trained.report.checkpoint_path),
+            )?;
+            Ok(trained)
         }
 
         fn predict(
             &self,
-            _trained: &TrainedModel,
-            _df: &DataFrame,
-            _as_col: Option<&str>,
+            trained: &TrainedModel,
+            df: &DataFrame,
+            as_col: Option<&str>,
         ) -> Result<DataFrame, String> {
-            Err(tr(
-                "ONNX backend is a scaffold: add `onnxruntime` and implement it (issue #63).",
-                "ONNX 백엔드는 스캐폴드입니다: `onnxruntime`을 추가하고 구현하세요 (이슈 #63).",
-            )
-            .into())
+            crate::dl::onnx_export::predict(trained, df, as_col)
         }
     }
 }
@@ -1061,6 +1064,10 @@ mod acceptance {
         let _ = std::fs::remove_file(&gpu.report.checkpoint_path);
         let _ = std::fs::remove_file(crate::dl::manifest_path(&cpu.report.checkpoint_path));
         let _ = std::fs::remove_file(crate::dl::manifest_path(&gpu.report.checkpoint_path));
+        // ONNX artifacts are written next to the checkpoints by that provider.
+        for ckpt in [&cpu.report.checkpoint_path, &gpu.report.checkpoint_path] {
+            let _ = std::fs::remove_file(format!("{}.onnx", ckpt.trim_end_matches(".json")));
+        }
         let _ = std::fs::remove_dir("checkpoints");
     }
 
@@ -1080,7 +1087,7 @@ mod acceptance {
 
     #[cfg(feature = "onnx")]
     #[test]
-    #[ignore = "requires onnxruntime + an exported model: `cargo test -p xazz-exec --features onnx -- --ignored` (issue #63)"]
+    #[ignore = "builds ONNX Runtime (downloaded by ort) + exports a model: `cargo test -p xazz-exec --features onnx -- --ignored` (issue #63)"]
     fn onnx_matches_cpu_losses() {
         assert_parity("onnx");
     }
