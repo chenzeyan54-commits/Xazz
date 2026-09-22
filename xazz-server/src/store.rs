@@ -31,6 +31,9 @@ pub const DB_FILE: &str = "xazz.db";
 const DEFAULT_POLICY_HISTORY_MAX: usize = 1000;
 /// Environment override for the per-tenant policy-history retention cap.
 const POLICY_HISTORY_MAX_ENV: &str = "XAZZ_TENANT_POLICY_HISTORY_MAX";
+/// Environment override for the per-tenant policy-history retention window
+/// (seconds). Unset or `0` disables time-based expiry, leaving only the count cap.
+const POLICY_HISTORY_TTL_ENV: &str = "XAZZ_TENANT_POLICY_HISTORY_TTL_SECS";
 
 /// Parses the per-tenant policy-history retention cap (issue C2).
 ///
@@ -40,6 +43,15 @@ pub fn resolve_policy_history_max(raw: Option<&str>) -> usize {
     raw.and_then(|v| v.parse::<usize>().ok())
         .filter(|v| *v > 0)
         .unwrap_or(DEFAULT_POLICY_HISTORY_MAX)
+}
+
+/// Parses the per-tenant policy-history retention window in seconds (issue C2).
+///
+/// `0` (the default) disables time-based expiry. Invalid values also fall back to
+/// `0` rather than a shorter window that could silently discard audit rows; the
+/// count cap ([`resolve_policy_history_max`]) still bounds growth.
+pub fn resolve_policy_history_ttl(raw: Option<&str>) -> u64 {
+    raw.and_then(|v| v.parse::<u64>().ok()).unwrap_or(0)
 }
 
 /// Current Unix epoch seconds.
@@ -170,15 +182,20 @@ pub struct Store {
     conn: Mutex<Option<Connection>>,
     /// Max policy-history rows retained per tenant (issue C2).
     history_max: usize,
+    /// Policy-history retention window in seconds (`0` = no time-based expiry).
+    history_ttl_secs: u64,
 }
 
 impl Store {
     pub fn new() -> Self {
         let history_max =
             resolve_policy_history_max(std::env::var(POLICY_HISTORY_MAX_ENV).ok().as_deref());
+        let history_ttl_secs =
+            resolve_policy_history_ttl(std::env::var(POLICY_HISTORY_TTL_ENV).ok().as_deref());
         Store {
             conn: Mutex::new(None),
             history_max,
+            history_ttl_secs,
         }
     }
 
@@ -186,16 +203,27 @@ impl Store {
     /// Used by tests to isolate runs from the real `xazz.db`.
     #[allow(dead_code)]
     pub fn open_at(path: &std::path::Path) -> Self {
-        Self::open_at_with_history_max(path, DEFAULT_POLICY_HISTORY_MAX)
+        Self::open_at_with_history(path, DEFAULT_POLICY_HISTORY_MAX, 0)
     }
 
     /// Like [`Store::open_at`] but with an explicit retention cap (tests).
+    #[allow(dead_code)]
     fn open_at_with_history_max(path: &std::path::Path, history_max: usize) -> Self {
+        Self::open_at_with_history(path, history_max, 0)
+    }
+
+    /// Like [`Store::open_at`] but with explicit retention settings (tests).
+    fn open_at_with_history(
+        path: &std::path::Path,
+        history_max: usize,
+        history_ttl_secs: u64,
+    ) -> Self {
         let conn = Connection::open(path).expect("open store db");
         ensure_schema(&conn).expect("create store schema");
         Store {
             conn: Mutex::new(Some(conn)),
             history_max,
+            history_ttl_secs,
         }
     }
 
@@ -642,7 +670,7 @@ impl Store {
             changed_by,
             now,
         )?;
-        prune_policy_history(&tx, tenant, self.history_max)?;
+        prune_policy_history(&tx, tenant, self.history_max, self.history_ttl_secs, now)?;
         tx.commit()
             .map_err(|e| format!("failed to commit policy transaction: {e}"))?;
         Ok(())
@@ -676,7 +704,7 @@ impl Store {
                 changed_by,
                 now,
             )?;
-            prune_policy_history(&tx, tenant, self.history_max)?;
+            prune_policy_history(&tx, tenant, self.history_max, self.history_ttl_secs, now)?;
         }
         tx.commit()
             .map_err(|e| format!("failed to commit policy transaction: {e}"))?;
@@ -687,8 +715,11 @@ impl Store {
     ///
     /// History is tenant-scoped like the packs themselves, so one tenant's change
     /// trail is never visible to another. The rows are append-only up to the
-    /// retention cap (see [`resolve_policy_history_max`]) and survive pack
-    /// replacement/deletion. `limit`/`offset` page the newest-first list.
+    /// retention cap (see [`resolve_policy_history_max`]) and retention window
+    /// (see [`resolve_policy_history_ttl`]), and survive pack
+    /// replacement/deletion. `limit`/`offset` page the newest-first list; rows
+    /// older than the retention window are filtered out even if a write has not
+    /// pruned them yet.
     pub fn list_policy_history(
         &self,
         tenant: &str,
@@ -697,30 +728,48 @@ impl Store {
     ) -> Result<Vec<PolicyChangeRecord>, String> {
         let guard = self.open()?;
         let conn = guard.as_ref().expect("open guarantees Some");
+        let cutoff = history_cutoff(self.history_ttl_secs, now_epoch());
         let mut stmt = conn
             .prepare(
                 "SELECT id, tenant, action, old_policy_json, new_policy_json, changed_by, changed_at
-                 FROM tenant_policy_history WHERE tenant = ?1 ORDER BY id DESC LIMIT ?2 OFFSET ?3",
+                 FROM tenant_policy_history
+                 WHERE tenant = ?1 AND changed_at >= ?2
+                 ORDER BY id DESC LIMIT ?3 OFFSET ?4",
             )
             .map_err(|e| format!("failed to prepare policy history: {e}"))?;
         let rows = stmt
-            .query_map(params![tenant, limit as i64, offset as i64], |row| {
-                Ok(PolicyChangeRecord {
-                    id: row.get(0)?,
-                    tenant: row.get(1)?,
-                    action: row.get(2)?,
-                    old_policy_json: row.get(3)?,
-                    new_policy_json: row.get(4)?,
-                    changed_by: row.get(5)?,
-                    changed_at: row.get(6)?,
-                })
-            })
+            .query_map(
+                params![tenant, cutoff, limit as i64, offset as i64],
+                |row| {
+                    Ok(PolicyChangeRecord {
+                        id: row.get(0)?,
+                        tenant: row.get(1)?,
+                        action: row.get(2)?,
+                        old_policy_json: row.get(3)?,
+                        new_policy_json: row.get(4)?,
+                        changed_by: row.get(5)?,
+                        changed_at: row.get(6)?,
+                    })
+                },
+            )
             .map_err(|e| format!("failed to query policy history: {e}"))?;
         let mut out = Vec::new();
         for r in rows {
             out.push(r.map_err(|e| format!("failed to read policy history row: {e}"))?);
         }
         Ok(out)
+    }
+}
+
+/// Oldest `changed_at` still retained under a retention window (`0` = no limit).
+///
+/// Uses `0` as the "no limit" cutoff: `changed_at` is always a positive Unix
+/// epoch, so `changed_at >= 0` keeps every row.
+fn history_cutoff(ttl_secs: u64, now: i64) -> i64 {
+    if ttl_secs > 0 {
+        now - ttl_secs as i64
+    } else {
+        0
     }
 }
 
@@ -762,12 +811,27 @@ fn insert_policy_change(
     Ok(())
 }
 
-/// Trims a tenant's policy history to its newest `max` rows (issue C2).
+/// Trims a tenant's policy history to its retention cap and window (issue C2).
 ///
 /// Runs in the same transaction as the change that triggered it, so the table
 /// never grows unbounded while the newest rows (the ones the audit endpoint
-/// serves) are always preserved. Other tenants are never touched.
-fn prune_policy_history(conn: &Connection, tenant: &str, max: usize) -> Result<(), String> {
+/// serves) are always preserved. Rows older than the retention window are
+/// removed first; the count cap then keeps at most `max` rows. Other tenants are
+/// never touched.
+fn prune_policy_history(
+    conn: &Connection,
+    tenant: &str,
+    max: usize,
+    ttl_secs: u64,
+    now: i64,
+) -> Result<(), String> {
+    if ttl_secs > 0 {
+        conn.execute(
+            "DELETE FROM tenant_policy_history WHERE tenant = ?1 AND changed_at < ?2",
+            params![tenant, history_cutoff(ttl_secs, now)],
+        )
+        .map_err(|e| format!("failed to expire policy history: {e}"))?;
+    }
     if max == 0 {
         return Ok(());
     }
@@ -1160,6 +1224,23 @@ mod tests {
         );
     }
 
+    /// The retention-window parser is opt-in: unset/invalid/zero disable expiry
+    /// (issue C2).
+    #[test]
+    fn policy_history_ttl_resolver_defaults_to_disabled() {
+        assert_eq!(resolve_policy_history_ttl(None), 0);
+        assert_eq!(resolve_policy_history_ttl(Some("3600")), 3600);
+        assert_eq!(resolve_policy_history_ttl(Some("0")), 0);
+        assert_eq!(resolve_policy_history_ttl(Some("not-a-number")), 0);
+    }
+
+    /// A disabled window never filters any row (issue C2).
+    #[test]
+    fn history_cutoff_keeps_all_rows_when_disabled() {
+        assert_eq!(history_cutoff(0, 1_000_000), 0);
+        assert_eq!(history_cutoff(60, 1_000_000), 999_940);
+    }
+
     /// Each change prunes the tenant's history to the newest `max` rows,
     /// leaving other tenants untouched (issue C2).
     #[test]
@@ -1201,6 +1282,68 @@ mod tests {
         assert_eq!(hist_b.len(), 1, "pruning is tenant-scoped");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A retention window hides expired rows on read and physically removes them
+    /// on the next change, while other tenants are untouched (issue C2).
+    #[test]
+    fn policy_history_expires_after_retention_window() {
+        let db = unique_db("hist_ttl");
+        let store = Store::open_at_with_history(&db, DEFAULT_POLICY_HISTORY_MAX, 3600);
+
+        for i in 1..=3 {
+            store
+                .set_tenant_policy("a", &format!(r#"{{"id":"a-{i}"}}"#), "a")
+                .expect("set a");
+        }
+        store
+            .set_tenant_policy("b", r#"{"id":"b-1"}"#, "b")
+            .expect("set b");
+
+        // Age a's first two changes past the one-hour window.
+        {
+            let conn = Connection::open(&db).expect("open raw");
+            conn.execute(
+                "UPDATE tenant_policy_history SET changed_at = ?1
+                 WHERE tenant = 'a' AND id <= 2",
+                params![now_epoch() - 7200],
+            )
+            .expect("age rows");
+        }
+
+        // Expired rows are hidden even before a write prunes them.
+        let hist_a = store.list_policy_history("a", 100, 0).expect("history a");
+        assert_eq!(hist_a.len(), 1, "only the fresh change is served");
+        assert_eq!(
+            hist_a[0].new_policy_json.as_deref(),
+            Some(r#"{"id":"a-3"}"#)
+        );
+
+        // The next change prunes the expired rows from disk.
+        store
+            .set_tenant_policy("a", r#"{"id":"a-4"}"#, "a")
+            .expect("set a");
+        {
+            let conn = Connection::open(&db).expect("open raw");
+            let remaining: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM tenant_policy_history WHERE tenant = 'a'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("count a rows");
+            assert_eq!(remaining, 2, "expired rows are deleted on write");
+        }
+        // b's older-than-window risk does not apply; its single row is fresh.
+        assert_eq!(
+            store
+                .list_policy_history("b", 100, 0)
+                .expect("history b")
+                .len(),
+            1
+        );
+
+        let _ = std::fs::remove_dir_all(db.parent().unwrap());
     }
 
     /// History pages newest-first via `limit`/`offset` (issue C2).
