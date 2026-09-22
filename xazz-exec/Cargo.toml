@@ -24,6 +24,14 @@ default = []
 cuda = ["dep:burn-tch", "dep:tch"]
 wgpu = ["dep:burn-wgpu"]
 onnx = ["dep:ort", "dep:rlx-onnx-proto", "dep:protobuf"]
+# ONNX GPU execution providers (D2). Each enables the matching `ort` feature, so
+# `ort`'s `download-binaries` fetches a GPU-enabled ONNX Runtime (Windows:
+# cuda13+tensorrt+nvrtx+directml, macOS: coreml) instead of the CPU build.
+# Runtime EP selection is `XAZZ_ORT_EP` (see backend.rs / onnx_export.rs).
+onnx-cuda = ["onnx", "ort/cuda"]
+onnx-tensorrt = ["onnx", "ort/tensorrt"]
+onnx-directml = ["onnx", "ort/directml"]
+onnx-coreml = ["onnx", "ort/coreml"]
 
 [dependencies]
 # 공유 핵심 타입

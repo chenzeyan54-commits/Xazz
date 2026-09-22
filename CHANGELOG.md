@@ -9,6 +9,46 @@ Versioning: [Semantic Versioning](https://semver.org/)
 
 ## [Unreleased]
 
+### Added — ONNX GPU 실행 프로바이더 (D2 #63)
+
+- **EP feature 4종** — `onnx-cuda`(`ort/cuda`), `onnx-tensorrt`(`ort/tensorrt`),
+  `onnx-directml`(`ort/directml`), `onnx-coreml`(`ort/coreml`). 각 feature를 켜면
+  `ort`의 `download-binaries`가 **GPU 빌드**를 받는다(Windows x86_64:
+  `cuda13,tensorrt,nvrtx,directml`, macOS aarch64: `coreml`). 즉 `--features
+  onnx-cuda`만으로 GPU ONNX Runtime이 확보된다
+- **`XAZZ_ORT_EP` 선택** — `auto`(기본)는 컴파일된 GPU EP를 우선순위
+  (cuda→tensorrt→directml→coreml)로 등록하고 실패 시 다음/CPU로 조용히 폴백한다.
+  명시 목록(`cpu,cuda,...`)은 **fail-closed**: 요청한 EP가 미컴파일/미가용이면
+  CPU로 몰래 도는 대신 오류를 낸다(벤치가 CPU를 GPU로 오측정하지 않도록)
+- **`XAZZ_ORT_DEVICE`** — CUDA/TensorRT/DirectML EP device index(기본 0)
+- `onnx_export::load_session`이 세션 생성 시 EP를 적용한다(캐시되어 1회).
+  `OrtEpKind`/`OrtEpSpec`/`parse_ort_ep_spec`는 `ort` 없이 단위 테스트 가능
+- 검증: `cargo check/clippy -p xazz-exec`가 `onnx`/`onnx-cuda`/`onnx-tensorrt`/
+  `onnx-directml`/`onnx-coreml` 및 4종 동시에서 `--all-targets -- -D warnings`
+  통과. `parse_ort_ep_spec` 단위 테스트. 실기 EP 실행은 Windows/macOS에서
+  (WSL은 ort prebuilt C++ 링크 제약)
+
+### Performance — GPU/ONNX 추론 캐시 + WebGPU device 선택·폴백 (NEXT #74/#75/#86)
+
+- **추론 캐시 (D1/D2)** — `dl::load_inference_model`/`dl::predict_with_model`를
+  분리하고, `ArtifactKey`(경로 + mtime + 길이) 기반 **단일슬롯 캐시**를 wgpu/cuda
+  백엔드에 적용했다. 반복 `predict`가 체크포인트를 디스크에서 재로드하지 않으며,
+  재학습으로 파일이 바뀌면 키가 달라져 자동 무효화된다
+- **ONNX 재export/세션 캐시 (D2)** — `onnx_export::ensure_export`(체크포인트보다
+  최신이면 재사용)/`load_session`/`predict_with_session`로 분리하고, `OnnxBackend`가
+  export 아티팩트 정체성 기준으로 `Session`을 캐시한다. `predict` 호출마다
+  `.onnx` 재작성 + 세션 재생성을 하지 않는다
+- **WebGPU device 선택 (D1 #75)** — `XAZZ_WGPU_DEVICE`
+  (`default|cpu|dgpu[:N]|igpu[:N]|vgpu[:N]`, `DiscreteGpu(N)` 표기 허용)로 어댑터를
+  고정한다. 예: RTX 4070 + Intel Arc 노트북에서 `dgpu`/`igpu` 선택
+- **device probe + CPU 폴백 (D1 #75)** — provider 생성 시 device를 1회 probe하고,
+  어댑터가 없으면 `resolve()`가 CPU로 폴백하며 경고한다(cubecl의 어댑터 선택 panic을
+  `catch_unwind`로 오류화). CUDA도 생성 시 probe로 이동
+- 검증: `cargo check/clippy -p xazz-exec`가 default/`wgpu`/`cuda`/`onnx` 전 조합에서
+  `--all-targets -- -D warnings` 통과. wgpu 실기 acceptance(lavapipe 소프트웨어
+  Vulkan) 통과. `parse_wgpu_device`/`artifact_key` 단위 테스트 추가
+  (2026-09-22)
+
 ### Added — D2 ONNX export + ONNX Runtime 추론 (issue #63)
 
 - **`OnnxBackend` 실제 구현** — `--features onnx`에서 CPU 참조 학습 후

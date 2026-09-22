@@ -682,6 +682,43 @@ pub fn save_checkpoint_manifest(
     })
 }
 
+/// Cheap on-disk identity of a checkpoint/artifact for in-memory cache
+/// invalidation (issue D1/D2: repeated `predict` must not reload/re-export).
+///
+/// Combines the path with the file's mtime and length so a retrain that rewrites
+/// the same path (different weights) invalidates a cached inference module,
+/// while a stable file is reused across calls.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtifactKey {
+    pub path: String,
+    /// File mtime in nanoseconds since the epoch (0 when unavailable).
+    pub modified_nanos: u64,
+    /// File length in bytes (0 when unavailable).
+    pub len: u64,
+}
+
+/// Builds an [`ArtifactKey`] for `path`. A missing file yields a key with zero
+/// mtime/len, which never equals a real on-disk key (so the caller reloads and
+/// surfaces the real "file not found" error).
+pub fn artifact_key(path: &str) -> ArtifactKey {
+    let (modified_nanos, len) = std::fs::metadata(path)
+        .map(|m| {
+            let nanos = m
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0);
+            (nanos, m.len())
+        })
+        .unwrap_or((0, 0));
+    ArtifactKey {
+        path: path.to_string(),
+        modified_nanos,
+        len,
+    }
+}
+
 /// Reads and validates the sidecar manifest for a checkpoint.
 ///
 /// Returns `Ok(None)` when the manifest is absent — a legacy checkpoint written
@@ -1323,26 +1360,29 @@ where
     predict_on_device::<B>(trained, df, as_col, &Default::default())
 }
 
-/// Like [`predict_on`], but evaluates on an explicit device `B::Device`.
+/// Loads the portable checkpoint into an inference module on `device`.
 ///
-/// Providers whose default device is the CPU (e.g. `burn-tch`) pass their device
-/// so the forward pass runs on the intended accelerator.
-pub fn predict_on_device<B>(
-    trained: &TrainedModel,
-    df: &DataFrame,
-    as_col: Option<&str>,
-    device: &Device<B>,
-) -> Result<DataFrame, String>
+/// Validates the sidecar manifest (fail-closed on a newer format), rebuilds the
+/// declared graph on `B`, and loads the backend-neutral record. Split out from
+/// [`predict_on_device`] so a provider can cache the loaded module and skip the
+/// disk round-trip on subsequent predictions (issue D1/D2).
+pub fn load_inference_model<B>(trained: &TrainedModel, device: &Device<B>) -> Result<Mlp<B>, String>
 where
     B: Backend,
 {
-    let (xs, n, feature_count) = prepare_inference_input(trained, df)?;
+    if trained.feature_names.is_empty() {
+        return Err(tr(
+            "The model has no feature information. Train it first with train().",
+            "모델에 특성 정보가 없습니다. 먼저 train()으로 학습하세요.",
+        )
+        .into());
+    }
 
     // Fail closed on a checkpoint from a newer Xazz when a manifest is present;
     // legacy checkpoints without one still load through the Burn record.
     load_checkpoint_manifest(trained.report.checkpoint_path.as_str())?;
 
-    let template = build_mlp::<B>(&trained.layers, feature_count, device)?;
+    let template = build_mlp::<B>(&trained.layers, trained.feature_names.len(), device)?;
     let recorder = PrettyJsonFileRecorder::<FullPrecisionSettings>::new();
     let mut infer_model = template
         .load_file(trained.report.checkpoint_path.as_str(), &recorder, device)
@@ -1353,12 +1393,50 @@ where
             )
         })?;
     infer_model.training = false;
+    Ok(infer_model)
+}
+
+/// Runs inference with an already-loaded module — no checkpoint disk access.
+///
+/// `device` must be the device `model` lives on. Preprocessing (feature order,
+/// standardization) is identical to [`predict`], so a cached module produces the
+/// same predictions.
+pub fn predict_with_model<B>(
+    trained: &TrainedModel,
+    model: &Mlp<B>,
+    device: &Device<B>,
+    df: &DataFrame,
+    as_col: Option<&str>,
+) -> Result<DataFrame, String>
+where
+    B: Backend,
+{
+    let (xs, n, feature_count) = prepare_inference_input(trained, df)?;
 
     let x = Tensor::<B, 2>::from_data(TensorData::new(xs, [n, feature_count]), device);
-    let pred_t = infer_model.forward(x);
+    let pred_t = model.forward(x);
     let preds = pred_t.into_data().to_vec::<f32>().unwrap_or_default();
 
     attach_prediction(trained, df, &preds, as_col)
+}
+
+/// Like [`predict_on`], but evaluates on an explicit device `B::Device`.
+///
+/// Providers whose default device is the CPU (e.g. `burn-tch`) pass their device
+/// so the forward pass runs on the intended accelerator. The checkpoint is loaded
+/// on each call; providers that predict repeatedly should cache via
+/// [`load_inference_model`] + [`predict_with_model`].
+pub fn predict_on_device<B>(
+    trained: &TrainedModel,
+    df: &DataFrame,
+    as_col: Option<&str>,
+    device: &Device<B>,
+) -> Result<DataFrame, String>
+where
+    B: Backend,
+{
+    let model = load_inference_model::<B>(trained, device)?;
+    predict_with_model::<B>(trained, &model, device, df, as_col)
 }
 
 /// Layered model registry helper: <model name, LayerKind list>.
@@ -1641,6 +1719,40 @@ mod tests {
         let dir = temp_dir("legacy");
         let ckpt = dir.join("Absent.json").to_string_lossy().to_string();
         assert_eq!(load_checkpoint_manifest(&ckpt).expect("no error"), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── Artifact cache key (D1/D2 predict caching) ──────────────────────────
+
+    #[test]
+    fn artifact_key_missing_file_is_zeroed() {
+        let dir = temp_dir("key_missing");
+        let path = dir.join("nope.json").to_string_lossy().to_string();
+        let key = artifact_key(&path);
+        assert_eq!(key.path, path);
+        assert_eq!(key.modified_nanos, 0);
+        assert_eq!(key.len, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn artifact_key_tracks_content_changes() {
+        let dir = temp_dir("key_change");
+        let path = dir.join("w.json").to_string_lossy().to_string();
+
+        std::fs::write(&path, b"one").expect("write");
+        let first = artifact_key(&path);
+        assert_eq!(first.len, 3);
+
+        // Rewriting different-length content must change the key.
+        std::fs::write(&path, b"two-longer").expect("rewrite");
+        let second = artifact_key(&path);
+        assert_eq!(second.len, 10);
+        assert_ne!(
+            first, second,
+            "content change must invalidate the cache key"
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

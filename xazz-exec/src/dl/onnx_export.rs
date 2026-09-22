@@ -14,9 +14,13 @@
 //! identity at inference). The exporter fails closed on anything it cannot map.
 
 use burn::tensor::Tensor;
+use ort::ep::ExecutionProviderDispatch;
 use polars::prelude::DataFrame;
 use protobuf::Message;
 use rlx_onnx_proto::onnx;
+use xazz_core::i18n::tr;
+
+use crate::backend::{OrtEpKind, OrtEpSpec, parse_ort_ep_spec};
 
 use super::{Activation, LayerOp, Plain, TrainedModel};
 
@@ -380,7 +384,7 @@ pub fn export(trained: &TrainedModel, path: &str) -> Result<(), String> {
 }
 
 /// ONNX Runtime environment (initialized once per process).
-fn init_runtime() {
+pub fn init_runtime() {
     use std::sync::Once;
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
@@ -388,27 +392,170 @@ fn init_runtime() {
     });
 }
 
-/// Runs `dataset |> predict(...)` through ONNX Runtime using the exported model.
+/// Writes the `.onnx` artifact only when it is missing or older than the
+/// checkpoint it was derived from (issue D2: avoid re-exporting every predict).
+pub fn ensure_export(trained: &TrainedModel, path: &str) -> Result<(), String> {
+    if onnx_is_fresh(trained, path) {
+        return Ok(());
+    }
+    export(trained, path)
+}
+
+/// Whether an existing `.onnx` is at least as new as its source checkpoint.
+fn onnx_is_fresh(trained: &TrainedModel, path: &str) -> bool {
+    let onnx = std::fs::metadata(path).and_then(|m| m.modified()).ok();
+    let checkpoint = std::fs::metadata(&trained.report.checkpoint_path)
+        .and_then(|m| m.modified())
+        .ok();
+    match (onnx, checkpoint) {
+        (Some(onnx), Some(ckpt)) => onnx >= ckpt,
+        // The `.onnx` exists but the checkpoint timestamp is unavailable → trust it.
+        (Some(_), None) => true,
+        _ => false,
+    }
+}
+
+/// Builds an ONNX Runtime session for an exported artifact.
 ///
-/// The graph consumes the same standardized input as the in-memory CPU predict,
-/// so the two are numerically comparable. The `.onnx` artifact is written next
-/// to the Burn checkpoint (`<checkpoint>.onnx`).
-pub fn predict(
+/// The execution providers come from `XAZZ_ORT_EP` (see [`execution_providers`]),
+/// so a GPU-enabled ONNX Runtime build runs the graph on CUDA/TensorRT/DirectML/
+/// CoreML. The session is cached by the caller, so this runs once per artifact.
+pub fn load_session(path: &str) -> Result<ort::session::Session, String> {
+    let eps = execution_providers()?;
+    let mut builder = ort::session::Session::builder().map_err(onnx_err)?;
+    if !eps.is_empty() {
+        builder = builder
+            .with_execution_providers(eps)
+            .map_err(|e| format!("ONNX: execution provider setup failed: {e}"))?;
+    }
+    builder
+        .commit_from_file(path)
+        .map_err(|e| format!("ONNX: session load '{path}' failed: {e}"))
+}
+
+/// `XAZZ_ORT_DEVICE` device index for the CUDA/TensorRT/DirectML EPs (default 0).
+fn ort_device_index() -> i32 {
+    std::env::var("XAZZ_ORT_DEVICE")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+/// Resolves the ONNX execution-provider list from `XAZZ_ORT_EP`.
+///
+/// `auto` (default) registers every GPU EP compiled into this build, in
+/// preference order, and degrades silently to the next provider or CPU. An
+/// explicit list (`cpu,cuda,...`) is fail-closed: a requested-but-unavailable EP
+/// errors instead of silently running on CPU, so a GPU benchmark cannot
+/// accidentally measure the CPU provider.
+fn execution_providers() -> Result<Vec<ExecutionProviderDispatch>, String> {
+    let spec = match std::env::var("XAZZ_ORT_EP") {
+        Ok(raw) => parse_ort_ep_spec(&raw)?,
+        Err(_) => OrtEpSpec::Auto,
+    };
+    let device = ort_device_index();
+    match spec {
+        OrtEpSpec::Auto => Ok(auto_providers(device)),
+        OrtEpSpec::Explicit(kinds) => {
+            let mut eps = Vec::with_capacity(kinds.len());
+            for kind in kinds {
+                eps.push(build_ep(kind, device)?.error_on_failure());
+            }
+            Ok(eps)
+        }
+    }
+}
+
+/// Every GPU EP compiled into this build, in preference order. Uncompiled EPs
+/// are skipped (auto degrades to CPU).
+fn auto_providers(device: i32) -> Vec<ExecutionProviderDispatch> {
+    [
+        OrtEpKind::Cuda,
+        OrtEpKind::TensorRt,
+        OrtEpKind::DirectML,
+        OrtEpKind::CoreML,
+    ]
+    .into_iter()
+    .filter_map(|kind| build_ep(kind, device).ok())
+    .collect()
+}
+
+/// Builds one execution provider, failing closed when its `ort` feature is not
+/// compiled into this binary.
+fn build_ep(kind: OrtEpKind, device: i32) -> Result<ExecutionProviderDispatch, String> {
+    match kind {
+        OrtEpKind::Cpu => Ok(ort::ep::CPU::default().build()),
+        OrtEpKind::Cuda => cuda_ep(device),
+        OrtEpKind::TensorRt => tensorrt_ep(device),
+        OrtEpKind::DirectML => directml_ep(device),
+        OrtEpKind::CoreML => coreml_ep(),
+    }
+}
+
+// Unused when every `onnx-*` EP feature is enabled (each `*_ep` helper then takes
+// its compiled branch), so allow dead code rather than feature-gating the calls.
+#[allow(dead_code)]
+fn ep_not_compiled(kind: OrtEpKind, feature: &str) -> String {
+    format!(
+        "{} ({}: --features {feature})",
+        tr(
+            "ONNX execution provider is not compiled into this binary",
+            "ONNX 실행 프로바이더가 이 바이너리에 포함되지 않았습니다"
+        ),
+        kind.id()
+    )
+}
+
+#[cfg(feature = "onnx-cuda")]
+fn cuda_ep(device: i32) -> Result<ExecutionProviderDispatch, String> {
+    Ok(ort::ep::CUDA::default().with_device_id(device).build())
+}
+
+#[cfg(not(feature = "onnx-cuda"))]
+fn cuda_ep(_device: i32) -> Result<ExecutionProviderDispatch, String> {
+    Err(ep_not_compiled(OrtEpKind::Cuda, "onnx-cuda"))
+}
+
+#[cfg(feature = "onnx-tensorrt")]
+fn tensorrt_ep(device: i32) -> Result<ExecutionProviderDispatch, String> {
+    Ok(ort::ep::TensorRT::default().with_device_id(device).build())
+}
+
+#[cfg(not(feature = "onnx-tensorrt"))]
+fn tensorrt_ep(_device: i32) -> Result<ExecutionProviderDispatch, String> {
+    Err(ep_not_compiled(OrtEpKind::TensorRt, "onnx-tensorrt"))
+}
+
+#[cfg(feature = "onnx-directml")]
+fn directml_ep(device: i32) -> Result<ExecutionProviderDispatch, String> {
+    Ok(ort::ep::DirectML::default().with_device_id(device).build())
+}
+
+#[cfg(not(feature = "onnx-directml"))]
+fn directml_ep(_device: i32) -> Result<ExecutionProviderDispatch, String> {
+    Err(ep_not_compiled(OrtEpKind::DirectML, "onnx-directml"))
+}
+
+#[cfg(feature = "onnx-coreml")]
+fn coreml_ep() -> Result<ExecutionProviderDispatch, String> {
+    Ok(ort::ep::CoreML::default().build())
+}
+
+#[cfg(not(feature = "onnx-coreml"))]
+fn coreml_ep() -> Result<ExecutionProviderDispatch, String> {
+    Err(ep_not_compiled(OrtEpKind::CoreML, "onnx-coreml"))
+}
+
+/// Runs inference through an already-loaded session — no re-export or session
+/// rebuild (issue D2). Preprocessing matches the in-memory CPU predict, so the
+/// two are numerically comparable.
+pub fn predict_with_session(
     trained: &TrainedModel,
+    session: &mut ort::session::Session,
     df: &DataFrame,
     as_col: Option<&str>,
 ) -> Result<DataFrame, String> {
     let (xs, n, feature_count) = super::prepare_inference_input(trained, df)?;
-
-    let base = trained.report.checkpoint_path.trim_end_matches(".json");
-    let path = format!("{base}.onnx");
-    export(trained, &path)?;
-
-    init_runtime();
-    let mut session = ort::session::Session::builder()
-        .map_err(onnx_err)?
-        .commit_from_file(&path)
-        .map_err(|e| format!("ONNX: session load '{path}' failed: {e}"))?;
 
     let input = ort::value::Tensor::from_array((vec![n as i64, feature_count as i64], xs))
         .map_err(onnx_err)?;
