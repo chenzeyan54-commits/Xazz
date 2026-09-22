@@ -21,7 +21,7 @@ path = "src/main.rs"
 # (`cargo test -p xazz-exec --features cuda -- --ignored`).
 [features]
 default = []
-cuda = []
+cuda = ["dep:burn-tch", "dep:tch"]
 wgpu = ["dep:burn-wgpu"]
 onnx = []
 
@@ -54,6 +54,14 @@ burn-ndarray = { version = "0.21", default-features = false, features = ["std", 
 # device is probed at runtime, and a missing device falls back to CPU through the
 # resolver's warning path.
 burn-wgpu = { version = "0.21", optional = true }
+
+# CUDA provider (D1 #62) — LibTorch backend, enabled by the `cuda` feature.
+# `burn-tch` links against LibTorch (downloaded by `torch-sys` at build time, or
+# located via the `LIBTORCH` env var). Build a CUDA LibTorch (set
+# `TORCH_CUDA_VERSION`) to run on an NVIDIA GPU; `tch` is a direct dependency so
+# the provider can probe CUDA availability without panicking.
+burn-tch = { version = "0.21", optional = true }
+tch = { version = "0.22", optional = true }
 
 # ── DuckDB 외부 소스 커넥터 (issue #56, Track A3) ─────────────────────────────
 # bundled: embeds DuckDB (no system install needed).

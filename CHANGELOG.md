@@ -9,6 +9,20 @@ Versioning: [Semantic Versioning](https://semver.org/)
 
 ## [Unreleased]
 
+### Added — D1 `burn-tch`(CUDA) 실제 provider (issue #62)
+
+- **`CudaBackend` 실제 구현** — `--features cuda`에서 `burn-tch`(LibTorch)로 NVIDIA
+  GPU 학습·추론을 수행한다. 기존 스캐폴드(에러 반환)를 대체한다
+- **device 주입 리팩터** — `dl::train_on_device`/`dl::predict_on_device`가 명시적
+  `B::Device`를 받는다. `burn-tch`의 기본 device가 CPU이므로 provider가
+  `LibTorchDevice::Cuda(index)`를 전달한다(`XAZZ_CUDA_DEVICE`, 기본 0)
+- **fail-closed 진단** — 연결된 LibTorch에 CUDA 런타임이 없거나 인덱스가 범위를
+  벗어나면 tch 내부 panic 대신 명확한 오류를 반환한다(`tch::Cuda::is_available`)
+- 기존 `train_on`/`predict_on`은 `Default::default()` device로 위임(하위호환, wgpu 경로 유지)
+- 검증: `cargo check/clippy -p xazz-exec --features cuda --all-targets -- -D warnings`
+  통과, CUDA device 부재 시 fail-closed 단위 테스트 추가. 실기 acceptance는 CUDA
+  호스트에서 `cargo test -p xazz-exec --features cuda -- --ignored`
+
 ### Fixed — 스윕 그리드 없는 `metric:`/`sort:`/`top:` 무시 경고 (issue #64)
 
 - 스윕 그리드(리스트형 `epochs`/`lr`/`batch_size`) 없이 `metric:`/`sort:`/`top:`만

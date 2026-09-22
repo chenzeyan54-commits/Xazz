@@ -259,20 +259,55 @@ impl BackendKind {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Feature-gated provider scaffolds
+// Feature-gated providers
 //
-// Each is the place a real provider lands: swap the body for the burn-tch /
-// burn-wgpu / onnxruntime implementation. The acceptance test beside the trait
-// pins the contract those providers must satisfy.
+// `cuda` (burn-tch) and `wgpu` (burn-wgpu) are implemented; `onnx` is still a
+// scaffold (swap its body for the onnxruntime implementation). Each provider's
+// acceptance test beside the trait pins the contract it must satisfy.
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[cfg(feature = "cuda")]
 mod cuda {
     use super::*;
-    use xazz_core::i18n::tr;
+    use burn_tch::{LibTorch, LibTorchDevice};
 
-    /// CUDA provider (`burn-tch`). Scaffold — see issue D1 (#62).
+    /// CUDA provider (`burn-tch`, LibTorch). Trains and predicts on an NVIDIA GPU;
+    /// the portable checkpoint round-trips back to CPU for storage.
     pub struct CudaBackend;
+
+    /// Resolves the CUDA device index from `XAZZ_CUDA_DEVICE` (default `0`).
+    fn device_index() -> usize {
+        std::env::var("XAZZ_CUDA_DEVICE")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(0)
+    }
+
+    /// Builds the LibTorch CUDA device, failing closed with a clear message when
+    /// the linked LibTorch has no CUDA runtime (rather than panicking inside tch).
+    fn device() -> Result<LibTorchDevice, String> {
+        if !tch::Cuda::is_available() {
+            return Err(tr(
+                "CUDA backend selected but LibTorch reports no available CUDA device. \
+                 Build LibTorch with CUDA (set TORCH_CUDA_VERSION) or unset XAZZ_BACKEND.",
+                "CUDA 백엔드를 선택했지만 LibTorch가 사용 가능한 CUDA 장치를 찾지 못했습니다. \
+                 LibTorch를 CUDA로 빌드(TORCH_CUDA_VERSION 설정)하거나 XAZZ_BACKEND를 해제하세요.",
+            )
+            .into());
+        }
+        let index = device_index();
+        let count = tch::Cuda::device_count();
+        if count > 0 && index as i64 >= count {
+            return Err(format!(
+                "{} (requested {index}, available {count})",
+                tr(
+                    "XAZZ_CUDA_DEVICE is out of range",
+                    "XAZZ_CUDA_DEVICE 인덱스가 범위를 벗어났습니다"
+                )
+            ));
+        }
+        Ok(LibTorchDevice::Cuda(index))
+    }
 
     impl ComputeBackend for CudaBackend {
         fn id(&self) -> &'static str {
@@ -281,29 +316,23 @@ mod cuda {
 
         fn train(
             &self,
-            _df: &DataFrame,
-            _model_name: &str,
-            _layers: &[LayerKind],
-            _config: &TrainConfig,
+            df: &DataFrame,
+            model_name: &str,
+            layers: &[LayerKind],
+            config: &TrainConfig,
         ) -> Result<TrainedModel, String> {
-            Err(tr(
-                "CUDA backend is a scaffold: add `burn-tch` and implement it (issue #62).",
-                "CUDA 백엔드는 스캐폴드입니다: `burn-tch`를 추가하고 구현하세요 (이슈 #62).",
-            )
-            .into())
+            let device = device()?;
+            crate::dl::train_on_device::<LibTorch<f32>>(df, model_name, layers, config, &device)
         }
 
         fn predict(
             &self,
-            _trained: &TrainedModel,
-            _df: &DataFrame,
-            _as_col: Option<&str>,
+            trained: &TrainedModel,
+            df: &DataFrame,
+            as_col: Option<&str>,
         ) -> Result<DataFrame, String> {
-            Err(tr(
-                "CUDA backend is a scaffold: add `burn-tch` and implement it (issue #62).",
-                "CUDA 백엔드는 스캐폴드입니다: `burn-tch`를 추가하고 구현하세요 (이슈 #62).",
-            )
-            .into())
+            let device = device()?;
+            crate::dl::predict_on_device::<LibTorch<f32>>(trained, df, as_col, &device)
         }
     }
 }
@@ -924,6 +953,30 @@ mod tests {
 
         cleanup(&trained.report.checkpoint_path);
     }
+
+    /// CUDA provider: on a host whose linked LibTorch has no CUDA runtime the
+    /// provider must fail closed with a clear message instead of panicking inside
+    /// tch. On a real CUDA host this test defers to the `#[ignore]`d acceptance
+    /// test, which exercises the actual device path.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_provider_fails_closed_without_device() {
+        if tch::Cuda::is_available() {
+            return;
+        }
+        let (df, layers, config) = tiny_dataset();
+        let (backend, warning) = resolve(Some("cuda"));
+        assert!(warning.is_none());
+        assert_eq!(backend.id(), "cuda");
+
+        let err = backend
+            .train(&df, "backend_unit_cuda_no_device", &layers, &config)
+            .expect_err("cuda without a device must fail closed");
+        assert!(
+            err.contains("CUDA"),
+            "오류 메시지에 CUDA 안내가 없음: {err}"
+        );
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -936,12 +989,12 @@ mod tests {
 //   cargo test -p xazz-exec --features cuda   -- --ignored
 //   cargo test -p xazz-exec --features onnx   -- --ignored
 //
-// `wgpu` is implemented: it trains on the device and evaluates the portable
-// checkpoint on the same device. The parity check compares inference from one
-// shared CPU-trained checkpoint on CPU vs the requested backend (identical
-// weights), rather than two independently-initialised training runs — random
-// initialisers differ across backends, so comparing losses from separate runs
-// would not be meaningful.
+// `wgpu` and `cuda` are implemented: each trains on its device and evaluates the
+// portable checkpoint on the same device. The parity check compares inference
+// from one shared CPU-trained checkpoint on CPU vs the requested backend
+// (identical weights), rather than two independently-initialised training runs —
+// random initialisers differ across backends, so comparing losses from separate
+// runs would not be meaningful.
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[cfg(all(test, any(feature = "cuda", feature = "wgpu", feature = "onnx")))]

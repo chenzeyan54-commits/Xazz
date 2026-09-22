@@ -24,7 +24,7 @@ use burn::{
     tensor::{
         Device, Tensor, TensorData,
         activation::{relu, sigmoid, softmax, tanh},
-        backend::{AutodiffBackend, Backend},
+        backend::{AutodiffBackend, Backend, BackendTypes},
     },
 };
 use burn_ndarray::NdArray;
@@ -779,7 +779,8 @@ pub fn train(
     layers: &[LayerKind],
     config: &TrainConfig,
 ) -> Result<TrainedModel, String> {
-    let raw = train_impl::<NdArray<f32>>(df, model_name, layers, config)?;
+    let device: Device<NdArray<f32>> = Default::default();
+    let raw = train_impl::<NdArray<f32>>(df, model_name, layers, config, &device)?;
     Ok(TrainedModel {
         model: raw.model,
         report: raw.report,
@@ -805,9 +806,32 @@ pub fn train_on<B>(
 where
     B: Backend,
     Autodiff<B>: AutodiffBackend,
+    Autodiff<B>: BackendTypes<Device = Device<B>>,
     Mlp<Autodiff<B>>: AutodiffModule<Autodiff<B>, InnerModule = Mlp<B>>,
 {
-    let raw = train_impl::<B>(df, model_name, layers, config)?;
+    train_on_device::<B>(df, model_name, layers, config, &Default::default())
+}
+
+/// Like [`train_on`], but trains on an explicit device `B::Device`.
+///
+/// GPU providers whose default device is the CPU (e.g. `burn-tch`'s
+/// `LibTorchDevice::default()` is `Cpu`) pass their device here so training runs
+/// on the intended accelerator. The returned artifact is still the portable CPU
+/// [`TrainedModel`] (round-tripped through the backend-neutral record format).
+pub fn train_on_device<B>(
+    df: &DataFrame,
+    model_name: &str,
+    layers: &[LayerKind],
+    config: &TrainConfig,
+    device: &Device<B>,
+) -> Result<TrainedModel, String>
+where
+    B: Backend,
+    Autodiff<B>: AutodiffBackend,
+    Autodiff<B>: BackendTypes<Device = Device<B>>,
+    Mlp<Autodiff<B>>: AutodiffModule<Autodiff<B>, InnerModule = Mlp<B>>,
+{
+    let raw = train_impl::<B>(df, model_name, layers, config, device)?;
     let device: Device<NdArray<f32>> = Default::default();
     let template = build_mlp::<NdArray<f32>>(layers, raw.report.input_dim, &device)?;
     let recorder = PrettyJsonFileRecorder::<FullPrecisionSettings>::new();
@@ -837,10 +861,12 @@ fn train_impl<B>(
     model_name: &str,
     layers: &[LayerKind],
     config: &TrainConfig,
+    device: &Device<B>,
 ) -> Result<RawTrained<B>, String>
 where
     B: Backend,
     Autodiff<B>: AutodiffBackend,
+    Autodiff<B>: BackendTypes<Device = Device<B>>,
     Mlp<Autodiff<B>>: AutodiffModule<Autodiff<B>, InnerModule = Mlp<B>>,
 {
     let (feature_names, features, targets) = extract_data(df, &config.target)?;
@@ -934,8 +960,8 @@ where
     let train_n = n - val_n;
     let val_idx: Vec<usize> = (train_n..n).collect();
 
-    let device: Device<Autodiff<B>> = Default::default();
-    let mut model = build_mlp::<Autodiff<B>>(layers, input_dim, &device)?;
+    let device_autodiff: Device<Autodiff<B>> = device.clone();
+    let mut model = build_mlp::<Autodiff<B>>(layers, input_dim, &device_autodiff)?;
     // A regression target is a single scalar; a model that ends in Conv1d/Embedding
     // (or a multi-unit Dense without a final Dense(1)) produces several outputs.
     // Fail closed instead of silently broadcasting the target (which then breaks
@@ -971,8 +997,11 @@ where
             }
             yv.push(ys[i]);
         }
-        let x = Tensor::<Autodiff<B>, 2>::from_data(TensorData::new(xv, [b, input_dim]), &device);
-        let y = Tensor::<Autodiff<B>, 2>::from_data(TensorData::new(yv, [b, 1]), &device);
+        let x = Tensor::<Autodiff<B>, 2>::from_data(
+            TensorData::new(xv, [b, input_dim]),
+            &device_autodiff,
+        );
+        let y = Tensor::<Autodiff<B>, 2>::from_data(TensorData::new(yv, [b, 1]), &device_autodiff);
         Some((x, y))
     };
 
@@ -1071,7 +1100,7 @@ where
 
     // ── Sample predictions (in-sample) ──────────────────────────────────────
     let n_pred = n.min(10);
-    let device_plain: Device<B> = Default::default();
+    let device_plain: Device<B> = device.clone();
     let mut xv = Vec::with_capacity(n_pred * input_dim);
     for i in 0..n_pred {
         for j in 0..input_dim {
@@ -1286,17 +1315,32 @@ pub fn predict_on<B>(
 where
     B: Backend,
 {
+    predict_on_device::<B>(trained, df, as_col, &Default::default())
+}
+
+/// Like [`predict_on`], but evaluates on an explicit device `B::Device`.
+///
+/// Providers whose default device is the CPU (e.g. `burn-tch`) pass their device
+/// so the forward pass runs on the intended accelerator.
+pub fn predict_on_device<B>(
+    trained: &TrainedModel,
+    df: &DataFrame,
+    as_col: Option<&str>,
+    device: &Device<B>,
+) -> Result<DataFrame, String>
+where
+    B: Backend,
+{
     let (xs, n, feature_count) = prepare_inference_input(trained, df)?;
 
     // Fail closed on a checkpoint from a newer Xazz when a manifest is present;
     // legacy checkpoints without one still load through the Burn record.
     load_checkpoint_manifest(trained.report.checkpoint_path.as_str())?;
 
-    let device: Device<B> = Default::default();
-    let template = build_mlp::<B>(&trained.layers, feature_count, &device)?;
+    let template = build_mlp::<B>(&trained.layers, feature_count, device)?;
     let recorder = PrettyJsonFileRecorder::<FullPrecisionSettings>::new();
     let mut infer_model = template
-        .load_file(trained.report.checkpoint_path.as_str(), &recorder, &device)
+        .load_file(trained.report.checkpoint_path.as_str(), &recorder, device)
         .map_err(|e| {
             format!(
                 "{}: {e}",
@@ -1305,7 +1349,7 @@ where
         })?;
     infer_model.training = false;
 
-    let x = Tensor::<B, 2>::from_data(TensorData::new(xs, [n, feature_count]), &device);
+    let x = Tensor::<B, 2>::from_data(TensorData::new(xs, [n, feature_count]), device);
     let pred_t = infer_model.forward(x);
     let preds = pred_t.into_data().to_vec::<f32>().unwrap_or_default();
 

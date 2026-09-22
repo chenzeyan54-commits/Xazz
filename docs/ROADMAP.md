@@ -166,12 +166,17 @@ datasets. This track makes Xazz handle real workloads.
 - [x] `ComputeBackend` trait at the `MLOp` boundary + `XAZZ_BACKEND` selection with an
       explicit CPU fallback warning (`xazz-exec/src/backend.rs`); GPU parity test is
       `#[ignore]`d behind each feature
-- [ ] `burn-tch` (CUDA) then `burn-wgpu` (cross-vendor) provider impls behind
-      `--features cuda` / `--features wgpu`
+- [x] `burn-wgpu` (cross-vendor) provider behind `--features wgpu` — trains and
+      predicts on the probed device with a portable checkpoint handoff; lavapipe
+      software acceptance passed (2026-09-16)
+- [x] `burn-tch` (CUDA) provider behind `--features cuda` (2026-09-22) — `LibTorch`
+      device selection via `XAZZ_CUDA_DEVICE` (default 0), fails closed with a clear
+      message when the linked LibTorch has no CUDA runtime
+- [ ] Real-hardware acceptance on a CUDA host — `cargo test -p xazz-exec --features cuda -- --ignored`
 - Depends on: none (Burn API is backend-agnostic). Acceptance: same `.xzz` trains on CPU and CUDA with identical reported losses.
-  ⏳ **Interface landed 2026-09-11**: trait + resolver + fallback verified on CPU; the acceptance
-  test exists and is gated (`cargo test -p xazz-exec --features cuda -- --ignored`) — running it
-  needs a CUDA host carrying the `burn-tch` provider.
+  ⏳ **Provider landed 2026-09-22**: `burn-tch` wired through the trait + `train_on_device`/
+  `predict_on_device` device threading; the gated acceptance test needs a CUDA host with a
+  CUDA-built LibTorch (`TORCH_CUDA_VERSION`).
 
 ### D2. ONNX export/import — issue #63
 - [x] ONNX provider slot in `ComputeBackend` (`--features onnx`, scaffold) + gated parity test
