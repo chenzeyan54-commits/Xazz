@@ -492,7 +492,7 @@ async fn main() {
                 match store.sweep_expired_policy_history() {
                     Ok(0) => {}
                     Ok(n) => {
-                        println!("[xazz-server] 🧹 policy-history sweep removed {n} expired row(s)")
+                        println!("[xazz-server] 🧹 policy-history sweep removed {n} stale row(s)")
                     }
                     Err(e) => eprintln!("[xazz-server] policy-history sweep failed: {e}"),
                 }

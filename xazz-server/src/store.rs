@@ -970,15 +970,20 @@ impl Store {
         Ok(out)
     }
 
-    /// Physically deletes expired policy-history rows for every tenant — periodic
-    /// sweep (issue C2).
+    /// Physically trims policy-history rows for every tenant — periodic sweep
+    /// (issue C2).
     ///
-    /// Pruning normally runs inside a pack change, so an idle tenant whose
-    /// retention window elapsed keeps expired rows on disk (hidden only by the
-    /// read filter). This sweep removes them without waiting for a write,
-    /// resolving each tenant's effective window (stored override first, else the
-    /// global default) so an explicit `0` override is never expired. Tenants with
-    /// no window are left untouched. Returns the number of rows removed.
+    /// Pruning normally runs inside a pack/override change, so an idle tenant
+    /// whose retention window elapsed (or whose count cap was lowered) keeps
+    /// stale rows on disk (hidden only by the read filter). This sweep enforces
+    /// both retentions without waiting for a write: it removes rows older than the
+    /// tenant's effective window (stored override first, else the global default,
+    /// so an explicit `0` override is never expired) and trims both the policy
+    /// history and the retention-window override change history to the count cap
+    /// ([`resolve_policy_history_max`]). The override change history only ever
+    /// gets the count cap — its own window must not expire the audit trail of who
+    /// set it. Tenants are discovered from both tables so an override-only tenant
+    /// is still trimmed. Returns the number of rows removed.
     pub fn sweep_expired_policy_history(&self) -> Result<usize, String> {
         let guard = self.open()?;
         let conn = guard.as_ref().expect("open guarantees Some");
@@ -988,7 +993,11 @@ impl Store {
         let now = now_epoch();
         let tenants = {
             let mut stmt = tx
-                .prepare("SELECT DISTINCT tenant FROM tenant_policy_history")
+                .prepare(
+                    "SELECT tenant FROM tenant_policy_history
+                     UNION
+                     SELECT tenant FROM tenant_policy_history_config_history",
+                )
                 .map_err(|e| format!("failed to list policy-history tenants: {e}"))?;
             let rows = stmt
                 .query_map([], |row| row.get::<_, String>(0))
@@ -1002,15 +1011,8 @@ impl Store {
         let mut removed = 0usize;
         for tenant in tenants {
             let ttl = effective_history_ttl(&tx, &tenant, self.history_ttl_secs)?;
-            if ttl == 0 {
-                continue;
-            }
-            removed += tx
-                .execute(
-                    "DELETE FROM tenant_policy_history WHERE tenant = ?1 AND changed_at < ?2",
-                    params![tenant, history_cutoff(ttl, now)],
-                )
-                .map_err(|e| format!("failed to sweep policy history: {e}"))?;
+            removed += prune_policy_history(&tx, &tenant, self.history_max, ttl, now)?;
+            removed += prune_policy_history_ttl_history(&tx, &tenant, self.history_max)?;
         }
         tx.commit()
             .map_err(|e| format!("failed to commit policy sweep: {e}"))?;
@@ -1095,35 +1097,38 @@ fn insert_policy_change(
 /// never grows unbounded while the newest rows (the ones the audit endpoint
 /// serves) are always preserved. Rows older than the retention window are
 /// removed first; the count cap then keeps at most `max` rows. Other tenants are
-/// never touched.
+/// never touched. Returns the number of rows removed.
 fn prune_policy_history(
     conn: &Connection,
     tenant: &str,
     max: usize,
     ttl_secs: u64,
     now: i64,
-) -> Result<(), String> {
+) -> Result<usize, String> {
+    let mut removed = 0usize;
     if ttl_secs > 0 {
-        conn.execute(
-            "DELETE FROM tenant_policy_history WHERE tenant = ?1 AND changed_at < ?2",
-            params![tenant, history_cutoff(ttl_secs, now)],
-        )
-        .map_err(|e| format!("failed to expire policy history: {e}"))?;
+        removed += conn
+            .execute(
+                "DELETE FROM tenant_policy_history WHERE tenant = ?1 AND changed_at < ?2",
+                params![tenant, history_cutoff(ttl_secs, now)],
+            )
+            .map_err(|e| format!("failed to expire policy history: {e}"))?;
     }
     if max == 0 {
-        return Ok(());
+        return Ok(removed);
     }
-    conn.execute(
-        "DELETE FROM tenant_policy_history
+    removed += conn
+        .execute(
+            "DELETE FROM tenant_policy_history
          WHERE tenant = ?1
            AND id NOT IN (
                SELECT id FROM tenant_policy_history
                WHERE tenant = ?1 ORDER BY id DESC LIMIT ?2
            )",
-        params![tenant, max as i64],
-    )
-    .map_err(|e| format!("failed to prune policy history: {e}"))?;
-    Ok(())
+            params![tenant, max as i64],
+        )
+        .map_err(|e| format!("failed to prune policy history: {e}"))?;
+    Ok(removed)
 }
 
 /// Appends one policy-history retention-window override change row (never
@@ -1161,25 +1166,27 @@ fn insert_policy_history_ttl_change(
 /// never grows unbounded while the newest rows (the ones the audit endpoint
 /// serves) are preserved. Only the count cap applies — the override's own window
 /// must not expire the audit trail of who set it. Other tenants are never touched.
+/// Returns the number of rows removed.
 fn prune_policy_history_ttl_history(
     conn: &Connection,
     tenant: &str,
     max: usize,
-) -> Result<(), String> {
+) -> Result<usize, String> {
     if max == 0 {
-        return Ok(());
+        return Ok(0);
     }
-    conn.execute(
-        "DELETE FROM tenant_policy_history_config_history
+    let removed = conn
+        .execute(
+            "DELETE FROM tenant_policy_history_config_history
          WHERE tenant = ?1
            AND id NOT IN (
                SELECT id FROM tenant_policy_history_config_history
                WHERE tenant = ?1 ORDER BY id DESC LIMIT ?2
            )",
-        params![tenant, max as i64],
-    )
-    .map_err(|e| format!("failed to prune policy history ttl history: {e}"))?;
-    Ok(())
+            params![tenant, max as i64],
+        )
+        .map_err(|e| format!("failed to prune policy history ttl history: {e}"))?;
+    Ok(removed)
 }
 
 impl Default for Store {
@@ -1646,6 +1653,56 @@ mod tests {
                 "an explicit 0 override disables expiry for c"
             );
         }
+
+        // A second sweep has nothing left to remove.
+        assert_eq!(
+            store.sweep_expired_policy_history().expect("sweep again"),
+            0
+        );
+
+        let _ = std::fs::remove_dir_all(db.parent().unwrap());
+    }
+
+    /// The sweep enforces the count cap for idle tenants whose cap was lowered
+    /// after their rows were written, covering both the pack history and the
+    /// override change history — and discovers override-only tenants (issue C2).
+    #[test]
+    fn policy_history_sweep_enforces_count_cap_for_idle_tenants() {
+        let db = unique_db("hist_sweep_cap");
+        // Populate under a generous cap so no write prunes anything.
+        let seed = Store::open_at_with_history_max(&db, 100);
+        for i in 1..=5 {
+            seed.set_tenant_policy("a", &format!(r#"{{"id":"a-{i}"}}"#), "a")
+                .expect("set a");
+        }
+        // Tenant b only ever changed its retention-window override.
+        for i in 1..=5 {
+            seed.set_policy_history_ttl("b", i, "b").expect("set b ttl");
+        }
+
+        // A later deployment lowers the cap; the sweep alone must trim both.
+        let store = Store::open_at_with_history_max(&db, 2);
+        let removed = store.sweep_expired_policy_history().expect("sweep");
+        assert_eq!(
+            removed, 6,
+            "a: 3 pack rows + b: 3 override rows over the cap"
+        );
+
+        assert_eq!(
+            store
+                .list_policy_history("a", 100, 0)
+                .expect("history a")
+                .len(),
+            2
+        );
+        assert_eq!(
+            store
+                .list_policy_history_ttl_history("b", 100, 0)
+                .expect("history b")
+                .len(),
+            2,
+            "an override-only tenant is discovered and capped"
+        );
 
         // A second sweep has nothing left to remove.
         assert_eq!(
