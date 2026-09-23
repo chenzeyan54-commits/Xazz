@@ -12,7 +12,7 @@
 //!   GET  /security/policy                                  → the current Policy-as-Code policy
 //!   PUT  /security/policy                                  → store the tenant's policy pack (C2)
 //!   DELETE /security/policy                                → remove the tenant's policy pack (C2)
-//!   GET  /security/policy/history?limit=&offset=          → tenant's policy-pack change audit (C2)
+//!   GET  /security/policy/history?limit=&offset=          → tenant's policy-pack change audit + effective TTL (C2)
 //!   GET  /security/policy/history/ttl                      → per-tenant effective history retention window (C2)
 //!   PUT  /security/policy/history/ttl                      → per-tenant history retention window (C2)
 //!   DELETE /security/policy/history/ttl                    → clear the tenant's retention override (C2)
@@ -1412,7 +1412,9 @@ async fn handle_policy_delete(
 /// though `tenant_policies` only keeps the latest state (issue C2). Stored packs
 /// are returned as embedded JSON (falling back to a string if a legacy row is not
 /// parseable) rather than escaped text. `?limit=&offset=` page the newest-first
-/// list; the response echoes the effective page.
+/// list; the response echoes the effective page plus the tenant's effective
+/// retention window (`ttl_secs`/`ttl_source`) so a caller can tell how much of
+/// the history has already expired (issue C2).
 async fn handle_policy_history(
     Extension(tenant): Extension<String>,
     State(state): State<AppState>,
@@ -1421,6 +1423,12 @@ async fn handle_policy_history(
     let tenant = tenant_str(tenant.as_str());
     let limit = page.limit();
     let offset = page.offset();
+    let ttl = effective_policy_history_ttl(&state.store, tenant).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e })),
+        )
+    })?;
     let records = state
         .store
         .list_policy_history(tenant, limit, offset)
@@ -1448,6 +1456,8 @@ async fn handle_policy_history(
         "tenant": tenant,
         "limit": limit,
         "offset": offset,
+        "ttl_secs": ttl.secs,
+        "ttl_source": ttl.source,
         "history": history,
     })))
 }
@@ -2669,6 +2679,52 @@ v x = load(\"examples/data/seoul_air_2024.csv\") :: AQ
                 .0;
         assert_eq!(tenant_view["ttl_source"], json!("tenant"));
         assert_eq!(tenant_view["ttl_secs"], json!(1800));
+    }
+
+    /// `GET /security/policy/history` exposes the tenant's effective retention
+    /// window alongside the page so clients can see how far back the history is
+    /// retained without a second call (issue C2).
+    #[tokio::test]
+    async fn policy_history_reports_effective_ttl() {
+        let state = unique_state("hist_ttl_view");
+        let tenant = format!("hist-ttl-view-{}", std::process::id());
+
+        // No override: global default + source.
+        let global = handle_policy_history(
+            Extension(tenant.clone()),
+            State(state.clone()),
+            Query(PolicyHistoryQuery {
+                limit: None,
+                offset: None,
+            }),
+        )
+        .await
+        .expect("history")
+        .0;
+        assert_eq!(global["ttl_source"], json!("global"));
+        assert_eq!(
+            global["ttl_secs"],
+            json!(state.store.policy_history_ttl_default())
+        );
+
+        // Tenant override is reflected in the same response.
+        state
+            .store
+            .set_policy_history_ttl(&tenant, 900)
+            .expect("set");
+        let overridden = handle_policy_history(
+            Extension(tenant.clone()),
+            State(state.clone()),
+            Query(PolicyHistoryQuery {
+                limit: None,
+                offset: None,
+            }),
+        )
+        .await
+        .expect("history")
+        .0;
+        assert_eq!(overridden["ttl_source"], json!("tenant"));
+        assert_eq!(overridden["ttl_secs"], json!(900));
     }
 
     // ── Per-tenant policy packs (issue C2) ────────────────────────────────────
