@@ -383,7 +383,16 @@ function NodeParamsEditor({ nodeId, nodes, setNodes }) {
         className="dag-field__input"
         type={f.type === 'number' ? 'number' : 'text'}
         step={f.step}
-        value={value ?? ''}
+        // Seeded Select nodes hold [{name, keep}]; show the kept names (the transpiler's
+        // rule), and typing stores the comma string it also accepts.
+        value={
+          Array.isArray(value)
+            ? value
+                .filter((c) => typeof c === 'string' || c.keep !== false)
+                .map((c) => (typeof c === 'string' ? c : c.name))
+                .join(', ')
+            : (value ?? '')
+        }
         placeholder={f.placeholder}
         onChange={(e) => update({ [f.key]: f.type === 'number' ? Number(e.target.value) : e.target.value })}
       />

@@ -62,7 +62,10 @@ async function request(path, { method = 'GET', json, form, timeoutMs = 10_000 } 
  */
 export async function checkHealth() {
   try {
-    const res = await fetch(`${API_BASE_URL}/health`, { signal: AbortSignal.timeout(3000) })
+    const res = await fetch(`${API_BASE_URL}/health`, {
+      headers: accessHeaders(),
+      signal: AbortSignal.timeout(3000),
+    })
     if (!res.ok) return false
     const body = await res.json()
     return body.status === 'ok'
@@ -93,7 +96,16 @@ export async function executeCode(code, { timeoutMs = 5 * 60 * 1000, signal } = 
     signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
   })
   if (!res.ok && res.status !== 422) {
-    throw new Error(`Server responded ${res.status}`)
+    // 401 (token), 429 (capacity / DP reservation), 500 (runner missing): the server
+    // answered, so this is not "offline" — keep its reason.
+    const text = await res.text()
+    let reason = text
+    try {
+      reason = JSON.parse(text)?.error ?? text
+    } catch {
+      // plain-text body
+    }
+    throw new ApiError(res.status, reason || `Server responded ${res.status}`)
   }
   return res.json()
 }

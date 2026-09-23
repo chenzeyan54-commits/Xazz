@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from 'react'
+import React, { useEffect, useId, useRef, useState } from 'react'
 import {
   FileClock,
   KeyRound,
@@ -56,6 +56,7 @@ const tenantLabel = (tenant, t) =>
 export function ConfirmDialog({ open, title, body, confirmLabel, onConfirm, onCancel, busy }) {
   const { t } = useLanguage()
   const ref = useRef(null)
+  const titleId = useId() // two dialogs share this panel group; a fixed id would cross-label them
   useEffect(() => {
     const dialog = ref.current
     if (!dialog) return
@@ -67,13 +68,13 @@ export function ConfirmDialog({ open, title, body, confirmLabel, onConfirm, onCa
     <dialog
       ref={ref}
       className="confirm-dialog"
-      aria-labelledby="confirm-dialog-title"
+      aria-labelledby={titleId}
       onCancel={(event) => {
         event.preventDefault()
         onCancel()
       }}
     >
-      <h2 id="confirm-dialog-title">{title}</h2>
+      <h2 id={titleId}>{title}</h2>
       <p>{body}</p>
       <div className="confirm-dialog__actions">
         <button className="button button--tool-secondary" type="button" onClick={onCancel} autoFocus>
@@ -175,6 +176,11 @@ function DpLedgerPanel({ revision }) {
   const data = state.status === 'ready' ? state.data : null
   const windowed = Number(data?.window_secs) > 0 && Number(data?.resets_at) > 0
   const now = useNow(windowed)
+  // Past resets_at the shown spend belongs to the previous window; read the new one.
+  const rolled = windowed && now >= data.resets_at * 1000
+  useEffect(() => {
+    if (rolled) reload()
+  }, [rolled, reload])
 
   const reset = async () => {
     setBusy(true)
@@ -297,7 +303,17 @@ function DpLedgerPanel({ revision }) {
 async function loadAudit() {
   const [log, chain] = await Promise.all([getAuditLog(), verifyAuditChain()])
   const records = Array.isArray(log?.records) ? log.records : []
-  return { records, intact: chain?.intact === true, firstBreak: await findFirstBreak(records) }
+  // The replay needs Web Crypto, which browsers only expose on HTTPS or localhost
+  // (not e.g. http://<LAN-IP> with XAZZ_BIND=0.0.0.0). Its absence must not hide
+  // the server's verdict.
+  let firstBreak = null
+  let replayUnavailable = false
+  try {
+    firstBreak = await findFirstBreak(records)
+  } catch {
+    replayUnavailable = true
+  }
+  return { records, intact: chain?.intact === true, firstBreak, replayUnavailable }
 }
 
 function AuditChainPanel({ revision }) {
@@ -339,7 +355,9 @@ function AuditChainPanel({ revision }) {
       <p>
         {data.firstBreak
           ? t(`gov.audit.break.${data.firstBreak.reason}`).replace(/\{index\}/g, data.firstBreak.index)
-          : t('gov.audit.breakUnlocated')}
+          : data.replayUnavailable
+            ? t('gov.audit.replayUnavailable')
+            : t('gov.audit.breakUnlocated')}
       </p>
     </div>
   )
@@ -385,7 +403,8 @@ function AuditChainPanel({ revision }) {
                     .reverse()
                     .slice(0, 50)
                     .map(({ record, position }) => (
-                      <tr key={record.index} className={position === brokenAt ? 'is-broken' : ''}>
+                      // A tampered log can repeat an index, so position is the identity.
+                      <tr key={position} className={position === brokenAt ? 'is-broken' : ''}>
                         <td>{record.index}</td>
                         <td>{time(record.timestamp)}</td>
                         <td>
@@ -459,7 +478,7 @@ function packName(json) {
   return `${json.id ?? '?'}@${json.version ?? '?'}`
 }
 
-function PolicyPackPanel({ revision }) {
+function PolicyPackPanel({ revision, onPolicyChange }) {
   const { t } = useLanguage()
   const time = useLocaleTime()
   const [policyState, reloadPolicy] = useServerData(getPolicy, revision)
@@ -504,7 +523,7 @@ function PolicyPackPanel({ revision }) {
     }
     act(() => putPolicy(pack), (result, tr) =>
       tr('gov.policy.installed').replace('{pack}', packName(result?.policy)),
-    )
+    ).then((ok) => ok && onPolicyChange())
   }
 
   const readFile = async (event) => {
@@ -640,7 +659,8 @@ function PolicyPackPanel({ revision }) {
           onSubmit={(event) => {
             event.preventDefault()
             const secs = Number(ttlDraft)
-            if (!Number.isInteger(secs) || secs < 0) {
+            // Number('') is 0, which the server reads as "keep forever".
+            if (ttlDraft.trim() === '' || !Number.isInteger(secs) || secs < 0) {
               setNotice({ tone: 'error', text: (tr) => tr('gov.policy.ttlInvalid') })
               return
             }
@@ -660,7 +680,11 @@ function PolicyPackPanel({ revision }) {
               onChange={(event) => setTtlDraft(event.target.value)}
             />
           </label>
-          <button className="button button--tool-secondary button--compact" type="submit" disabled={busy}>
+          <button
+            className="button button--tool-secondary button--compact"
+            type="submit"
+            disabled={busy || ttlDraft.trim() === ''}
+          >
             {t('gov.policy.ttlSave')}
           </button>
           <button
@@ -680,9 +704,10 @@ function PolicyPackPanel({ revision }) {
         body={t('gov.policy.confirmBody').replace('{tenant}', tenantLabel(active?.tenant, t))}
         confirmLabel={t('gov.policy.remove')}
         onConfirm={async () => {
-          await act(deletePolicy, (result, tr) =>
+          const ok = await act(deletePolicy, (result, tr) =>
             result?.deleted ? tr('gov.policy.removed') : tr('gov.policy.nothingRemoved'),
           )
+          if (ok) onPolicyChange()
           setConfirming(false)
         }}
         onCancel={() => setConfirming(false)}
@@ -697,7 +722,7 @@ function PolicyPackPanel({ revision }) {
  * it, nothing here depends on a Full Run: it is what the tenant allows and what the
  * server has recorded. `revision` bumps after each run and each access change.
  */
-export function GovernanceSection({ revision, onAccessChange }) {
+export function GovernanceSection({ revision, onAccessChange, onPolicyChange }) {
   const { t } = useLanguage()
   return (
     <section className="gov-section" aria-labelledby="gov-heading">
@@ -708,7 +733,7 @@ export function GovernanceSection({ revision, onAccessChange }) {
       <AccessPanel onApply={onAccessChange} />
       <DpLedgerPanel revision={revision} />
       <AuditChainPanel revision={revision} />
-      <PolicyPackPanel revision={revision} />
+      <PolicyPackPanel revision={revision} onPolicyChange={onPolicyChange} />
     </section>
   )
 }

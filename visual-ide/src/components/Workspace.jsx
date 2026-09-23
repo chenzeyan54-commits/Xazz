@@ -42,7 +42,7 @@ import {
   Workflow,
   X,
 } from 'lucide-react'
-import { Brand, Skeleton, StatusBadge } from './Common'
+import { Brand, ServerProblem, Skeleton, StatusBadge } from './Common'
 import { MonitorView } from './Monitor'
 import { GovernanceSection } from './Governance'
 import { ErrorBoundary } from './ErrorBoundary'
@@ -50,7 +50,7 @@ import { LineagePanel } from './Lineage'
 import { RunHistory } from './RunHistory'
 import { LocaleSwitch, localizeStep, useLanguage } from '../i18n'
 import DagEditor from './DagEditor'
-import { checkPolicy, executeCode, checkHealth, remediateCode, API_BASE_URL } from '../api'
+import { ApiError, checkPolicy, executeCode, checkHealth, remediateCode, API_BASE_URL } from '../api'
 
 // executeCode 기본 타임아웃(ms) — api.js 와 동일한 기본값 (ML 훈련 고려 5분)
 const EXEC_TIMEOUT_MS = 5 * 60 * 1000
@@ -128,6 +128,11 @@ function useCodeHash(dagCode) {
   useEffect(() => {
     let active = true
     const compute = async () => {
+      // Web Crypto exists only on HTTPS or localhost; elsewhere say so instead of throwing.
+      if (!crypto.subtle) {
+        if (active) setHash('Not available · needs HTTPS or localhost')
+        return
+      }
       // 실제 실행되는 코드(dagCode)의 무결성 해시를 계산한다.
       const bytes = new TextEncoder().encode(dagCode ?? '')
       const digest = await crypto.subtle.digest('SHA-256', bytes)
@@ -178,8 +183,15 @@ function DownloadDemoCsv({ rows }) {
   )
 }
 
+// Process axis for a Full Run that returned no process evidence: a dropped request
+// (stop / timeout) may still be running; a refused or unreachable one never started.
+function processWithoutEvidence(execError) {
+  return execError.kind === 'stopped' || execError.kind === 'timeout' ? 'Termination unknown' : 'Not started'
+}
+
 function WorkspaceTopbar({
   runState,
+  execError,
   onHome,
   onLiveCheck,
   onFullRun,
@@ -197,9 +209,11 @@ function WorkspaceTopbar({
   const processLabel =
     runState === 'running'
       ? 'Running'
-      : ['success', 'error'].includes(runState)
-        ? 'Exited'
-        : 'Not started'
+      : execError
+        ? processWithoutEvidence(execError)
+        : ['success', 'error'].includes(runState)
+          ? 'Exited'
+          : 'Not started'
   const backendTone =
     backendReachable === null
       ? 'neutral'
@@ -648,6 +662,9 @@ function PreviewTable({ runResult, runState, execError, onRunAgain }) {
   const columns = hasResult && schema.length > 0 ? schema : []
 
   if (runState === 'running') return <Skeleton lines={5} label={t('progress.waitingRows')} />
+  if (execError?.kind === 'error') {
+    return <ServerProblem state={{ status: 'error', error: execError }} onRetry={onRunAgain} />
+  }
   if (execError && execError.kind !== 'offline') {
     return <StoppedWaiting execError={execError} onRunAgain={onRunAgain} />
   }
@@ -875,7 +892,13 @@ function ChartPanel({ runResult }) {
 function RunTimeline({ runState, runResult, execError }) {
   const rows = Array.isArray(runResult?.rows) ? runResult.rows.length : undefined
   const items =
-    execError && execError.kind !== 'offline'
+    execError?.kind === 'error'
+      ? [
+          ['Process', `Not started · xazz-server answered ${execError.status}`, 'warning'],
+          ['Pipeline', 'Not executed', 'warning'],
+          ['Artifact', 'No outcome returned', 'warning'],
+        ]
+      : execError && execError.kind !== 'offline'
       ? [
           ['Process', 'Request dropped · the server may still be executing', 'warning'],
           ['Pipeline', 'Unknown · a dropped request is not recorded', 'warning'],
@@ -947,6 +970,9 @@ function RunTimeline({ runState, runResult, execError }) {
 function LogsPanel({ runResult, execError, onRunAgain }) {
   const logs = Array.isArray(runResult?.logs) ? runResult.logs : []
   const stdout = runResult?.stdout || ''
+  if (execError?.kind === 'error') {
+    return <ServerProblem state={{ status: 'error', error: execError }} onRetry={onRunAgain} />
+  }
   if (execError && execError.kind !== 'offline') {
     return <StoppedWaiting execError={execError} onRunAgain={onRunAgain} />
   }
@@ -1052,16 +1078,20 @@ function Receipt({ hash, runState, runResult, execError }) {
             {isError
               ? execError?.kind === 'offline'
                 ? 'xazz-server unreachable'
-                : execError
-                  ? 'Stopped waiting for xazz-server'
-                  : 'Pipeline exited with an error'
+                : execError?.kind === 'error'
+                  ? `xazz-server answered ${execError.status}`
+                  : execError
+                    ? 'Stopped waiting for xazz-server'
+                    : 'Pipeline exited with an error'
               : 'Pipeline evidence is complete'}
           </h3>
           <p>
             {isError
               ? (execError?.kind === 'offline'
                   ? 'Full Run could not reach the backend. No pipeline executed.'
-                  : execError
+                  : execError?.kind === 'error'
+                    ? `No pipeline executed. ${execError.message}`
+                    : execError
                     ? 'The request was dropped. The server may still execute it, but the run is not recorded.'
                     : (runResult?.error || 'xazz-exec reported an error in stderr.'))
               : 'Success returned a structured result with no detected runtime error.'}
@@ -1069,10 +1099,10 @@ function Receipt({ hash, runState, runResult, execError }) {
         </div>
         <div className="receipt__axes">
           <StatusBadge axis="Process" tone="neutral">
-            {isError ? 'Exited / blocked' : 'Exited'}
+            {execError ? processWithoutEvidence(execError) : isError ? 'Exited / blocked' : 'Exited'}
           </StatusBadge>
           <StatusBadge axis="Pipeline" tone={isError ? 'warning' : 'success'}>
-            {isError ? (execError?.kind === 'offline' ? 'Not executed' : execError ? 'Unknown' : 'Partial') : 'Succeeded'}
+            {isError ? (execError?.kind === 'offline' || execError?.kind === 'error' ? 'Not executed' : execError ? 'Unknown' : 'Partial') : 'Succeeded'}
           </StatusBadge>
           <StatusBadge axis="Control" tone="neutral">
             Not configured
@@ -1115,7 +1145,7 @@ function Receipt({ hash, runState, runResult, execError }) {
         </div>
         <div>
           <dt>Warnings</dt>
-          <dd>{isError ? (execError?.kind === 'offline' ? 'Backend connection failed' : execError ? 'Stopped waiting · the server may still finish' : 'Pipeline produced stderr') : 'None in returned result'}</dd>
+          <dd>{isError ? (execError?.kind === 'offline' ? 'Backend connection failed' : execError?.kind === 'error' ? execError.message : execError ? 'Stopped waiting · the server may still finish' : 'Pipeline produced stderr') : 'None in returned result'}</dd>
         </div>
         <div>
           <dt>Node durations</dt>
@@ -1213,6 +1243,8 @@ function ResultDock({
           <span>
             {execError?.kind === 'offline'
               ? 'xazz-server offline'
+              : execError?.kind === 'error'
+                ? `xazz-server answered ${execError.status}`
               : execError
                 ? 'Request dropped · not recorded'
               : runState === 'running'
@@ -1439,7 +1471,10 @@ function RunOverlay({ startedAt, onViewLogs, onStop }) {
       <div>
         <span className="eyebrow">{t('progress.eyebrow')}</span>
         <strong>{t('progress.title')}</strong>
-        <p className="run-overlay__elapsed">{t('progress.elapsed').replace('{s}', elapsed)}</p>
+        {/* role=timer is aria-live off: the status region must not re-read every second. */}
+        <p className="run-overlay__elapsed" role="timer">
+          {t('progress.elapsed').replace('{s}', elapsed)}
+        </p>
         <ol className="run-overlay__steps">
           {steps.map(([id, status]) => (
             <li key={id} className={`is-${status}`}>
@@ -1525,6 +1560,9 @@ export function Workspace({ initialState = 'ready', onStateChange, onHome }) {
   const hash = useCodeHash(dagCode)
   const selectedNode = pipeline.find((node) => node.id === selectedId) ?? pipeline[0]
   const guardrailBlocked = Boolean(policyReport && !policyReport.safe_to_execute)
+  // Graph, code, inspector and monitor show pipeline evidence. When the Full Run
+  // returned none (unreachable, refused, dropped), they must not point at a failed step.
+  const evidenceState = execError ? 'ready' : runState
 
   useEffect(() => {
     let active = true
@@ -1596,7 +1634,10 @@ export function Workspace({ initialState = 'ready', onStateChange, onHome }) {
       // AbortError. Either drops the request: xazz-server keeps executing, but the
       // dropped handler never records the run, its audit record or its ε spend.
       const name = typeof err === 'object' && err !== null ? err.name : ''
-      if (name === 'TimeoutError' || name === 'AbortError') {
+      if (err instanceof ApiError) {
+        setExecError({ kind: 'error', status: err.status, message: err.message })
+        setLiveMessage(`xazz-server answered ${err.status} · no pipeline executed`)
+      } else if (name === 'TimeoutError' || name === 'AbortError') {
         const kind = name === 'TimeoutError' ? 'timeout' : 'stopped'
         setExecError({ kind, message: String(err?.message ?? err) })
         setLiveMessage(
@@ -1609,9 +1650,10 @@ export function Workspace({ initialState = 'ready', onStateChange, onHome }) {
         setExecError({ kind: 'offline', message: err instanceof Error ? err.message : String(err) })
         setLiveMessage(`xazz-server unreachable · ${API_BASE_URL}`)
       }
+      // No process evidence came back, so the canvas keeps its selection instead of
+      // pointing at a failed step (see evidenceState below).
       setExecuting(false)
       setRunState('error')
-      setSelectedId('fill')
       setTab('logs')
       onStateChange('error')
     } finally {
@@ -1632,10 +1674,6 @@ export function Workspace({ initialState = 'ready', onStateChange, onHome }) {
   }
 
   const runLiveCheck = () => {
-    if (backendReachable === false) {
-      setLiveMessage(`xazz-server unreachable · check ${API_BASE_URL}`)
-      return
-    }
     setLiveMessage(`Checking xazz-server · ${API_BASE_URL}`)
     checkHealth().then((ok) => {
       setBackendReachable(ok)
@@ -1685,6 +1723,13 @@ export function Workspace({ initialState = 'ready', onStateChange, onHome }) {
     }
   }
 
+  // A guardrail verdict belongs to the tenant and pack it was checked under.
+  const clearGuardrail = () => {
+    setPolicyReport(null)
+    setRemediation(null)
+    setGuardrailSource(null)
+  }
+
   const openPreflight = () => {
     setAcknowledged(false)
     changeState('preflight')
@@ -1707,6 +1752,7 @@ export function Workspace({ initialState = 'ready', onStateChange, onHome }) {
       </a>
       <WorkspaceTopbar
         runState={runState}
+        execError={execError}
         onHome={onHome}
         onLiveCheck={runLiveCheck}
         onFullRun={openPreflight}
@@ -1769,7 +1815,7 @@ export function Workspace({ initialState = 'ready', onStateChange, onHome }) {
                   </button>
                 </div>
                 <MonitorView
-                  runState={runState}
+                  runState={evidenceState}
                   training={runResult?.training}
                   model={runResult?.model}
                   dp={runResult?.dp}
@@ -1779,7 +1825,11 @@ export function Workspace({ initialState = 'ready', onStateChange, onHome }) {
                 >
                   <GovernanceSection
                     revision={serverRevision}
-                    onAccessChange={() => setServerRevision((value) => value + 1)}
+                    onAccessChange={() => {
+                      clearGuardrail()
+                      setServerRevision((value) => value + 1)
+                    }}
+                    onPolicyChange={clearGuardrail}
                   />
                 </MonitorView>
               </div>
@@ -1800,11 +1850,11 @@ export function Workspace({ initialState = 'ready', onStateChange, onHome }) {
                   <PipelineCanvas
                     selectedId={selectedId}
                     onSelect={setSelectedId}
-                    runState={runState}
+                    runState={evidenceState}
                   />
                 )}
                 {view !== 'graph' && (
-                  <CodePane selectedNode={selectedNode} runState={runState} />
+                  <CodePane selectedNode={selectedNode} runState={evidenceState} />
                 )}
               </>
             )}
@@ -1814,7 +1864,7 @@ export function Workspace({ initialState = 'ready', onStateChange, onHome }) {
         <ErrorBoundary name={t('errors.panels.inspector')}>
           <Inspector
             selectedNode={selectedNode}
-            runState={runState}
+            runState={evidenceState}
             runResult={runResult}
             code={dagCode}
           />

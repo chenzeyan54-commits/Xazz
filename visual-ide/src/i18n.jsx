@@ -235,6 +235,7 @@ const en = {
         hash: 'The chain breaks at record #{index}: its contents changed after it was written (record_hash does not recompute).',
       },
       breakUnlocated: 'xazz-server reports a broken chain; the browser replay could not locate the record.',
+      replayUnavailable: 'xazz-server reports a broken chain. The browser replay that names the record needs HTTPS or localhost (Web Crypto) and is unavailable here.',
       replayDisagrees: 'Browser replay disagrees at record #{index}. The server verdict above stands; the IDE and server versions may differ.',
       empty: 'No audit record yet. Every /execute and inference check appends one.',
       when: 'When',
@@ -492,6 +493,7 @@ const ko = {
         hash: '레코드 #{index}에서 체인이 끊깁니다: 기록된 뒤 내용이 바뀌었습니다 (record_hash가 재계산되지 않음).',
       },
       breakUnlocated: 'xazz-server는 체인이 깨졌다고 판정했지만, 브라우저 재검증으로는 위치를 찾지 못했습니다.',
+      replayUnavailable: 'xazz-server는 체인이 깨졌다고 판정했습니다. 레코드 위치를 찾는 브라우저 재검증은 HTTPS나 localhost(Web Crypto)에서만 동작해 여기서는 쓸 수 없습니다.',
       replayDisagrees: '브라우저 재검증 결과가 레코드 #{index}에서 다릅니다. 위 서버 판정이 기준이며, IDE와 서버 버전이 다를 수 있습니다.',
       empty: '아직 감사 레코드가 없습니다. /execute와 추론 검사가 실행될 때마다 하나씩 추가됩니다.',
       when: '시각',
@@ -688,7 +690,8 @@ export function localizeToolDescription(tool, language) {
   return language === 'ko' ? (dagToolsKo[tool.id] ?? tool.description) : tool.description
 }
 
-const DICTIONARIES = { en, ko }
+// Exported for the key-parity check in tests/contract.mjs.
+export const DICTIONARIES = { en, ko }
 
 function lookup(dictionary, key) {
   return key.split('.').reduce((node, part) => (node == null ? undefined : node[part]), dictionary)
