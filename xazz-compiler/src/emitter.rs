@@ -160,6 +160,8 @@ fn generate_rust_src(
         out.push('\n');
         out.push_str(&emit_dl_metrics_fn());
         out.push('\n');
+        out.push_str(&emit_dl_sweep_helpers_fn());
+        out.push('\n');
     }
 
     // fn main()
@@ -1140,6 +1142,70 @@ fn xz_regression_metrics(preds: &[f32], targets: &[f32]) -> (f64, f64) {
     .to_string()
 }
 
+/// Emitted sweep-result row + comparator used by the sweep emitter to order and
+/// filter the reported combinations by `sort:`/`tiebreak:`/`top:` (D3), mirroring
+/// `xazz-exec`'s `SweepReport::compare`.
+fn emit_dl_sweep_helpers_fn() -> String {
+    r#"/// A single hyperparameter-sweep result (D3), used for report ordering.
+#[derive(Clone)]
+struct XzSweepRow {
+    epochs: usize,
+    lr: f64,
+    batch_size: usize,
+    score: f64,
+    final_train_loss: f64,
+    final_val_loss: Option<f64>,
+    metric_value: f64,
+    selected: bool,
+}
+
+/// Compares two rows on one sweep axis (D3); `metric` is a pseudo-axis handled
+/// by the caller, so it compares equal here.
+fn xz_sweep_axis(ax: &str, a: &XzSweepRow, b: &XzSweepRow) -> std::cmp::Ordering {
+    match ax {
+        "epochs" => a.epochs.cmp(&b.epochs),
+        "lr" => a.lr.partial_cmp(&b.lr).unwrap_or(std::cmp::Ordering::Equal),
+        "batch" => a.batch_size.cmp(&b.batch_size),
+        _ => std::cmp::Ordering::Equal,
+    }
+}
+
+/// Orders sweep rows by `sort` then the `tiebreak` axes (D3). `metric` sorts
+/// best-first (ascending score); axis sorts ascend. Explicit tiebreak axes are
+/// tried first (deduped, excluding the sort axis), then the canonical remaining
+/// axes — mirroring `SweepReport::compare`.
+fn xz_sweep_compare(
+    a: &XzSweepRow,
+    b: &XzSweepRow,
+    sort: &str,
+    tiebreak: &[&str],
+) -> std::cmp::Ordering {
+    let primary = if sort == "metric" {
+        a.score.partial_cmp(&b.score).unwrap_or(std::cmp::Ordering::Equal)
+    } else {
+        xz_sweep_axis(sort, a, b)
+    };
+    let mut fallback: Vec<&str> = Vec::with_capacity(3);
+    for &t in tiebreak {
+        if t != "metric" && t != sort && !fallback.contains(&t) {
+            fallback.push(t);
+        }
+    }
+    for ax in ["epochs", "lr", "batch"] {
+        if ax != sort && !fallback.contains(&ax) {
+            fallback.push(ax);
+        }
+    }
+    let mut ord = primary;
+    for ax in fallback {
+        ord = ord.then_with(|| xz_sweep_axis(ax, a, b));
+    }
+    ord
+}
+"#
+    .to_string()
+}
+
 /// `run <src> |> train(<Model>, ...)` → main() training code block.
 fn emit_dl_train_call(
     source_var: &str,
@@ -1413,6 +1479,17 @@ fn emit_dl_sweep_call(
         .collect::<Vec<_>>()
         .join(", ");
     let metric_id = config.sweep_metric.id();
+    let sort_id = config.sweep_sort.id();
+    let tiebreak_list = config
+        .sweep_tiebreak
+        .iter()
+        .map(|t| format!("\"{}\"", t.id()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let top_expr = match config.sweep_top {
+        Some(n) => format!("Some({})", n.max(1)),
+        None => "None".to_string(),
+    };
     let patience_expr = match config.early_stopping_patience {
         Some(p) if p > 0 => format!("Some({p})"),
         _ => "None".to_string(),
@@ -1464,7 +1541,7 @@ fn emit_dl_sweep_call(
         let combos: Vec<(usize, f64, usize)> = vec![{combo_list}];
         let metric = "{metric_id}";
         let patience: Option<usize> = {patience_expr};
-        let mut best: Option<(f64, usize, f64, usize)> = None;
+        let mut rows: Vec<XzSweepRow> = Vec::new();
         for (epochs, lr, batch_size) in combos {{
             let device: Device<TrainBackend> = Default::default();
             let mut model = {model_name}::<TrainBackend>::new(&device, feature_count);
@@ -1541,6 +1618,11 @@ fn emit_dl_sweep_call(
                 _ => final_val_loss.unwrap_or(final_train_loss),
             }};
             let score = if score.is_finite() {{ score }} else {{ f64::INFINITY }};
+            let metric_value = match metric {{
+                "mae" => if val_n > 0 {{ val_mae }} else {{ train_mae }},
+                "r2" => if val_n > 0 {{ val_r2 }} else {{ train_r2 }},
+                _ => final_val_loss.unwrap_or(final_train_loss),
+            }};
 
             let valid = model.valid();
             let recorder = PrettyJsonFileRecorder::<FullPrecisionSettings>::new();
@@ -1553,14 +1635,78 @@ fn emit_dl_sweep_call(
                 "[xazz] combo epochs={{}} lr={{}} batch={{}} score={{:.6}}",
                 epochs, lr, batch_size, score
             );
-            if best.map_or(true, |(s, _, _, _)| score < s) {{
-                best = Some((score, epochs, lr, batch_size));
+            rows.push(XzSweepRow {{
+                epochs,
+                lr,
+                batch_size,
+                score,
+                final_train_loss,
+                final_val_loss,
+                metric_value,
+                selected: false,
+            }});
+        }}
+        if rows.is_empty() {{
+            return Err("하이퍼파라미터 스윕 조합이 없습니다.".into());
+        }}
+
+        // The winner is the first minimum by metric, independent of sort/top (D3).
+        let mut best_pos = 0usize;
+        for i in 1..rows.len() {{
+            if rows[i].score < rows[best_pos].score {{
+                best_pos = i;
             }}
         }}
-        if let Some((score, epochs, lr, batch_size)) = best {{
+        rows[best_pos].selected = true;
+
+        // `top:` keeps only the N best-by-metric combinations (the winner is
+        // best-by-metric, so it is always retained).
+        let top: Option<usize> = {top_expr};
+        if let Some(top) = top {{
+            if top < rows.len() {{
+                let mut order: Vec<usize> = (0..rows.len()).collect();
+                order.sort_by(|&a, &b| {{
+                    rows[a]
+                        .score
+                        .partial_cmp(&rows[b].score)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                }});
+                order.truncate(top);
+                rows = order.into_iter().map(|i| rows[i].clone()).collect();
+            }}
+        }}
+
+        // `sort:`/`tiebreak:` order the reported table (D3).
+        let sort = "{sort_id}";
+        let tiebreak: Vec<&str> = vec![{tiebreak_list}];
+        rows.sort_by(|a, b| xz_sweep_compare(a, b, sort, &tiebreak));
+
+        println!("{{}}", "─".repeat(60));
+        println!(
+            "[xazz] sweep report ({{}} combos, metric: {{}}, sort: {{}})",
+            rows.len(),
+            metric,
+            sort
+        );
+        println!(
+            "  {{:>3}}  {{:>6}}  {{:>7}}  {{:>10}}  {{:>12}}  {{:>12}}  {{:>10}}",
+            "no", "epochs", "batch", "lr", "val loss", "train loss", "metric"
+        );
+        for (i, r) in rows.iter().enumerate() {{
+            let val = r
+                .final_val_loss
+                .map(|v| format!("{{v:.6}}"))
+                .unwrap_or_else(|| "-".to_string());
+            let mark = if r.selected {{ " ★" }} else {{ "" }};
+            println!(
+                "  {{:>3}}  {{:>6}}  {{:>7}}  {{:>10.6}}  {{:>12}}  {{:>12.6}}  {{:>10.6}}{{}}",
+                i, r.epochs, r.batch_size, r.lr, val, r.final_train_loss, r.metric_value, mark
+            );
+        }}
+        if let Some(best) = rows.iter().find(|r| r.selected) {{
             println!(
                 "[xazz] ✅ best combo: epochs={{}} lr={{}} batch={{}} score={{:.6}}",
-                epochs, lr, batch_size, score
+                best.epochs, best.lr, best.batch_size, best.score
             );
         }}
     }}
@@ -2071,8 +2217,65 @@ mod tests {
             "R² 점수 부호 처리 누락: {out}"
         );
         assert!(
-            out.contains("best.map_or(true, |(s, _, _, _)| score < s)"),
+            out.contains("if rows[i].score < rows[best_pos].score"),
             "metric 기반 최적 조합 비교 누락: {out}"
+        );
+    }
+
+    /// D3 sweep: `sort:`/`tiebreak:`/`top:` are reflected in the emitted report —
+    /// the comparator helper is emitted, the requested sort/tiebreak axes reach
+    /// the generated code, and the `top` filter is emitted.
+    #[test]
+    fn emit_rust_sweep_sort_tiebreak_top_reflected() {
+        let out = emit(
+            "type S = { a: float, y: float };
+             model M { Dense(4) -> Dense(1) }
+             v data = load(\"x.csv\") :: S;
+             run data |> train(M, target: \"y\", epochs: [3, 5], lr: [0.01, 0.001], sort: \"lr\", tiebreak: [batch, epochs], top: 2);",
+        );
+        assert!(
+            out.contains("fn xz_sweep_compare("),
+            "스윕 정렬 비교 헬퍼 누락: {out}"
+        );
+        assert!(
+            out.contains("let sort = \"lr\";"),
+            "sort 축이 emit되지 않음: {out}"
+        );
+        assert!(
+            out.contains("let tiebreak: Vec<&str> = vec![\"batch\", \"epochs\"];"),
+            "tiebreak 축이 순서대로 emit되지 않음: {out}"
+        );
+        assert!(
+            out.contains("let top: Option<usize> = Some(2);"),
+            "top 필터가 emit되지 않음: {out}"
+        );
+        assert!(
+            out.contains("rows.sort_by(|a, b| xz_sweep_compare(a, b, sort, &tiebreak));"),
+            "정렬 적용 코드 누락: {out}"
+        );
+    }
+
+    /// D3 sweep: no `sort:`/`tiebreak:`/`top:` still emits the default metric
+    /// sort, an empty tiebreak, and no top filter.
+    #[test]
+    fn emit_rust_sweep_default_sort_emitted() {
+        let out = emit(
+            "type S = { a: float, y: float };
+             model M { Dense(4) -> Dense(1) }
+             v data = load(\"x.csv\") :: S;
+             run data |> train(M, target: \"y\", epochs: [3, 5], lr: [0.01, 0.001]);",
+        );
+        assert!(
+            out.contains("let sort = \"metric\";"),
+            "기본 sort 값 누락: {out}"
+        );
+        assert!(
+            out.contains("let tiebreak: Vec<&str> = vec![];"),
+            "빈 tiebreak emit 누락: {out}"
+        );
+        assert!(
+            out.contains("let top: Option<usize> = None;"),
+            "top 비활성 emit 누락: {out}"
         );
     }
 
