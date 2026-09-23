@@ -13,6 +13,8 @@
 //!   PUT  /security/policy                                  → store the tenant's policy pack (C2)
 //!   DELETE /security/policy                                → remove the tenant's policy pack (C2)
 //!   GET  /security/policy/history?limit=&offset=          → tenant's policy-pack change audit (C2)
+//!   PUT  /security/policy/history/ttl                      → per-tenant history retention window (C2)
+//!   DELETE /security/policy/history/ttl                    → clear the tenant's retention override (C2)
 //!   POST /security/policy/check { "code": "<xzz DSL>" }    → static guardrail inspection report
 //!   POST /security/remediate    { "code": "<xzz DSL>" }    → safe code auto-remediation (deterministic + sLM)
 //!   GET  /runs                                → run history (SQLite, issue C1)
@@ -416,6 +418,10 @@ async fn main() {
         )
         .route("/security/policy/check", post(handle_policy_check))
         .route("/security/policy/history", get(handle_policy_history))
+        .route(
+            "/security/policy/history/ttl",
+            put(handle_policy_history_ttl_set).delete(handle_policy_history_ttl_clear),
+        )
         .route("/security/remediate", post(handle_remediate))
         .route("/security/inference/check", post(handle_inference_check))
         .route("/runs", get(handle_runs_list))
@@ -1423,6 +1429,91 @@ fn embed_policy_json(raw: Option<String>) -> Value {
         Some(s) => serde_json::from_str(&s).unwrap_or(Value::String(s)),
         None => Value::Null,
     }
+}
+
+// ── Per-tenant policy-history retention window (issue C2) ─────────────────────
+
+/// A tenant's effective policy-history retention window and where it came from.
+struct PolicyHistoryTtl {
+    /// Window length in seconds (`0` = no time-based expiry).
+    secs: u64,
+    /// `"tenant"` when a stored per-tenant override is in effect, else `"global"`.
+    source: &'static str,
+}
+
+/// Resolves a tenant's effective policy-history retention window — issue C2.
+///
+/// A stored per-tenant override (`tenant_policy_history_config`) takes precedence
+/// over the global `XAZZ_TENANT_POLICY_HISTORY_TTL_SECS` default. An explicit
+/// stored `0` is a tenant override (source `"tenant"`), distinct from having no
+/// override.
+fn effective_policy_history_ttl(
+    store: &store::Store,
+    tenant: &str,
+) -> Result<PolicyHistoryTtl, String> {
+    match store.get_policy_history_ttl(tenant)? {
+        Some(secs) => Ok(PolicyHistoryTtl {
+            secs,
+            source: "tenant",
+        }),
+        None => Ok(PolicyHistoryTtl {
+            secs: store.policy_history_ttl_default(),
+            source: "global",
+        }),
+    }
+}
+
+/// Request body for `PUT /security/policy/history/ttl`.
+#[derive(Deserialize)]
+struct PolicyHistoryTtlRequest {
+    /// Retention window in seconds; `0` disables time-based expiry for the tenant.
+    ttl_secs: u64,
+}
+
+/// Sets the authenticated tenant's policy-history retention-window override — issue C2.
+///
+/// Self-service and tenant-scoped: only the caller's override is written; the
+/// global `XAZZ_TENANT_POLICY_HISTORY_TTL_SECS` remains the fallback for tenants
+/// without one. `ttl_secs: 0` stores an explicit "no time-based expiry" override,
+/// which differs from deleting the override (which restores the global default).
+async fn handle_policy_history_ttl_set(
+    State(state): State<AppState>,
+    Extension(tenant): Extension<String>,
+    Json(payload): Json<PolicyHistoryTtlRequest>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let tenant = tenant_str(tenant.as_str());
+    state
+        .store
+        .set_policy_history_ttl(tenant, payload.ttl_secs)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    Ok(Json(json!({
+        "tenant": tenant,
+        "ttl_secs": payload.ttl_secs,
+        "ttl_source": "tenant",
+    })))
+}
+
+/// Removes the authenticated tenant's policy-history retention-window override — issue C2.
+///
+/// After removal the tenant falls back to the global
+/// `XAZZ_TENANT_POLICY_HISTORY_TTL_SECS` default. Tenant-scoped: other tenants'
+/// overrides are untouched.
+async fn handle_policy_history_ttl_clear(
+    State(state): State<AppState>,
+    Extension(tenant): Extension<String>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let tenant = tenant_str(tenant.as_str());
+    state
+        .store
+        .clear_policy_history_ttl(tenant)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let ttl = effective_policy_history_ttl(&state.store, tenant)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    Ok(Json(json!({
+        "tenant": tenant,
+        "ttl_secs": ttl.secs,
+        "ttl_source": ttl.source,
+    })))
 }
 
 // ── POST /security/policy/check ──────────────────────────────────────────────
@@ -2442,6 +2533,60 @@ v x = load(\"examples/data/seoul_air_2024.csv\") :: AQ
         assert_eq!(cleared["window_source"], json!("global"));
         assert_eq!(cleared["window_secs"], json!(tenant_dp_window_secs()));
         assert!(state.store.get_dp_window(&tenant).expect("read").is_none());
+    }
+
+    /// A tenant can override its own policy-history retention window; the global
+    /// default is the fallback (issue C2).
+    #[tokio::test]
+    async fn policy_history_ttl_endpoint_sets_and_clears_tenant_override() {
+        let state = unique_state("hist_ttl_endpoint");
+        let tenant = format!("hist-ttl-{}", std::process::id());
+        let other = format!("hist-ttl-other-{}", std::process::id());
+
+        // No override: the effective window is the global default.
+        let before = effective_policy_history_ttl(&state.store, &tenant).expect("resolve");
+        assert_eq!(before.source, "global");
+        assert_eq!(before.secs, state.store.policy_history_ttl_default());
+
+        // PUT stores a tenant-scoped override.
+        let body = handle_policy_history_ttl_set(
+            State(state.clone()),
+            Extension(tenant.clone()),
+            Json(PolicyHistoryTtlRequest { ttl_secs: 7200 }),
+        )
+        .await
+        .expect("set ttl")
+        .0;
+        assert_eq!(body["tenant"], json!(tenant));
+        assert_eq!(body["ttl_secs"], json!(7200));
+        assert_eq!(body["ttl_source"], json!("tenant"));
+        assert_eq!(
+            state.store.get_policy_history_ttl(&tenant).expect("read"),
+            Some(7200)
+        );
+
+        // Another tenant still resolves to the global default.
+        let other_ttl = effective_policy_history_ttl(&state.store, &other).expect("resolve other");
+        assert_eq!(other_ttl.source, "global");
+
+        // DELETE clears it and restores the global default.
+        let cleared =
+            handle_policy_history_ttl_clear(State(state.clone()), Extension(tenant.clone()))
+                .await
+                .expect("clear ttl")
+                .0;
+        assert_eq!(cleared["ttl_source"], json!("global"));
+        assert_eq!(
+            cleared["ttl_secs"],
+            json!(state.store.policy_history_ttl_default())
+        );
+        assert!(
+            state
+                .store
+                .get_policy_history_ttl(&tenant)
+                .expect("read")
+                .is_none()
+        );
     }
 
     // ── Per-tenant policy packs (issue C2) ────────────────────────────────────

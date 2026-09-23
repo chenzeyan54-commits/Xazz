@@ -105,6 +105,11 @@ fn ensure_schema(conn: &Connection) -> Result<(), String> {
             changed_by TEXT NOT NULL DEFAULT '',
             changed_at INTEGER NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS tenant_policy_history_config (
+            tenant TEXT PRIMARY KEY,
+            ttl_secs INTEGER NOT NULL DEFAULT 0,
+            updated_at INTEGER NOT NULL DEFAULT 0
+        );
         CREATE TABLE IF NOT EXISTS dp_reservation (
             tenant TEXT PRIMARY KEY,
             reservation_id TEXT NOT NULL,
@@ -182,7 +187,9 @@ pub struct Store {
     conn: Mutex<Option<Connection>>,
     /// Max policy-history rows retained per tenant (issue C2).
     history_max: usize,
-    /// Policy-history retention window in seconds (`0` = no time-based expiry).
+    /// Global policy-history retention window in seconds (`0` = no time-based
+    /// expiry). A stored per-tenant override (`tenant_policy_history_config`)
+    /// takes precedence over this default.
     history_ttl_secs: u64,
 }
 
@@ -615,6 +622,63 @@ impl Store {
         Ok(deleted > 0)
     }
 
+    /// The global policy-history retention window resolved at construction — issue C2.
+    ///
+    /// This is the fallback for tenants without a stored override.
+    pub fn policy_history_ttl_default(&self) -> u64 {
+        self.history_ttl_secs
+    }
+
+    /// Returns the tenant's stored policy-history retention-window override in
+    /// seconds, if any — issue C2.
+    ///
+    /// `None` means the tenant has no override and the global default applies.
+    /// `Some(0)` is an explicit per-tenant "no time-based expiry" setting and must
+    /// not be confused with the absence of an override.
+    pub fn get_policy_history_ttl(&self, tenant: &str) -> Result<Option<u64>, String> {
+        let guard = self.open()?;
+        let conn = guard.as_ref().expect("open guarantees Some");
+        read_policy_history_ttl(conn, tenant)
+    }
+
+    /// Stores a tenant's policy-history retention-window override — issue C2.
+    ///
+    /// The window is keyed by tenant, so one tenant's setting never changes
+    /// another's. Newly written changes are retained under the tenant's override
+    /// on the next write/read.
+    pub fn set_policy_history_ttl(&self, tenant: &str, ttl_secs: u64) -> Result<(), String> {
+        let guard = self.open()?;
+        let conn = guard.as_ref().expect("open guarantees Some");
+        conn.execute(
+            "INSERT INTO tenant_policy_history_config (tenant, ttl_secs, updated_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(tenant) DO UPDATE SET
+                 ttl_secs   = excluded.ttl_secs,
+                 updated_at = excluded.updated_at",
+            params![tenant, ttl_secs as i64, now_epoch()],
+        )
+        .map_err(|e| format!("failed to store tenant policy history ttl: {e}"))?;
+        Ok(())
+    }
+
+    /// Removes a tenant's policy-history retention-window override. Returns `true`
+    /// if one existed — issue C2.
+    ///
+    /// After removal the tenant falls back to the global
+    /// `XAZZ_TENANT_POLICY_HISTORY_TTL_SECS` default. Other tenants' overrides are
+    /// untouched.
+    pub fn clear_policy_history_ttl(&self, tenant: &str) -> Result<bool, String> {
+        let guard = self.open()?;
+        let conn = guard.as_ref().expect("open guarantees Some");
+        let deleted = conn
+            .execute(
+                "DELETE FROM tenant_policy_history_config WHERE tenant = ?1",
+                params![tenant],
+            )
+            .map_err(|e| format!("failed to clear tenant policy history ttl: {e}"))?;
+        Ok(deleted > 0)
+    }
+
     /// Returns the tenant's stored policy pack JSON, if any — issue C2.
     ///
     /// The pack is keyed by tenant, so one tenant's policy pack is never applied to
@@ -670,7 +734,13 @@ impl Store {
             changed_by,
             now,
         )?;
-        prune_policy_history(&tx, tenant, self.history_max, self.history_ttl_secs, now)?;
+        prune_policy_history(
+            &tx,
+            tenant,
+            self.history_max,
+            effective_history_ttl(&tx, tenant, self.history_ttl_secs)?,
+            now,
+        )?;
         tx.commit()
             .map_err(|e| format!("failed to commit policy transaction: {e}"))?;
         Ok(())
@@ -704,7 +774,13 @@ impl Store {
                 changed_by,
                 now,
             )?;
-            prune_policy_history(&tx, tenant, self.history_max, self.history_ttl_secs, now)?;
+            prune_policy_history(
+                &tx,
+                tenant,
+                self.history_max,
+                effective_history_ttl(&tx, tenant, self.history_ttl_secs)?,
+                now,
+            )?;
         }
         tx.commit()
             .map_err(|e| format!("failed to commit policy transaction: {e}"))?;
@@ -715,8 +791,9 @@ impl Store {
     ///
     /// History is tenant-scoped like the packs themselves, so one tenant's change
     /// trail is never visible to another. The rows are append-only up to the
-    /// retention cap (see [`resolve_policy_history_max`]) and retention window
-    /// (see [`resolve_policy_history_ttl`]), and survive pack
+    /// retention cap (see [`resolve_policy_history_max`]) and retention window —
+    /// the tenant's stored override when present, else the global
+    /// (see [`resolve_policy_history_ttl`]) — and survive pack
     /// replacement/deletion. `limit`/`offset` page the newest-first list; rows
     /// older than the retention window are filtered out even if a write has not
     /// pruned them yet.
@@ -728,7 +805,8 @@ impl Store {
     ) -> Result<Vec<PolicyChangeRecord>, String> {
         let guard = self.open()?;
         let conn = guard.as_ref().expect("open guarantees Some");
-        let cutoff = history_cutoff(self.history_ttl_secs, now_epoch());
+        let ttl = effective_history_ttl(conn, tenant, self.history_ttl_secs)?;
+        let cutoff = history_cutoff(ttl, now_epoch());
         let mut stmt = conn
             .prepare(
                 "SELECT id, tenant, action, old_policy_json, new_policy_json, changed_by, changed_at
@@ -771,6 +849,27 @@ fn history_cutoff(ttl_secs: u64, now: i64) -> i64 {
     } else {
         0
     }
+}
+
+/// Reads a tenant's stored policy-history retention-window override, if any.
+fn read_policy_history_ttl(conn: &Connection, tenant: &str) -> Result<Option<u64>, String> {
+    conn.query_row(
+        "SELECT ttl_secs FROM tenant_policy_history_config WHERE tenant = ?1",
+        params![tenant],
+        |row| row.get::<_, i64>(0),
+    )
+    .optional()
+    .map(|opt| opt.map(|secs| secs.max(0) as u64))
+    .map_err(|e| format!("failed to read tenant policy history ttl: {e}"))
+}
+
+/// Resolves a tenant's effective policy-history retention window.
+///
+/// A stored per-tenant override takes precedence over the global `default_ttl`.
+/// Called with the connection bound to the surrounding write transaction so the
+/// retained rows and the change that triggers pruning stay consistent.
+fn effective_history_ttl(conn: &Connection, tenant: &str, default_ttl: u64) -> Result<u64, String> {
+    Ok(read_policy_history_ttl(conn, tenant)?.unwrap_or(default_ttl))
 }
 
 /// Reads a tenant's stored pack within a transaction, if present.
@@ -1342,6 +1441,102 @@ mod tests {
                 .len(),
             1
         );
+
+        let _ = std::fs::remove_dir_all(db.parent().unwrap());
+    }
+
+    /// A per-tenant retention-window override is stored/read/cleared in isolation
+    /// and is distinct from the global default (issue C2).
+    #[test]
+    fn policy_history_ttl_override_is_per_tenant_and_clearable() {
+        let db = unique_db("hist_ttl_override");
+        // Global window disabled; only overrides can expire rows.
+        let store = Store::open_at(&db);
+        assert_eq!(store.policy_history_ttl_default(), 0);
+
+        assert_eq!(store.get_policy_history_ttl("a").expect("read a"), None);
+        store.set_policy_history_ttl("a", 3600).expect("set a");
+        store.set_policy_history_ttl("b", 0).expect("set b");
+
+        assert_eq!(
+            store.get_policy_history_ttl("a").expect("read a"),
+            Some(3600)
+        );
+        // An explicit `0` override differs from having no override.
+        assert_eq!(store.get_policy_history_ttl("b").expect("read b"), Some(0));
+        assert_eq!(store.get_policy_history_ttl("c").expect("read c"), None);
+
+        assert!(store.clear_policy_history_ttl("a").expect("clear a"));
+        assert_eq!(store.get_policy_history_ttl("a").expect("read a"), None);
+        assert!(!store.clear_policy_history_ttl("a").expect("clear a again"));
+        assert_eq!(store.get_policy_history_ttl("b").expect("read b"), Some(0));
+
+        let _ = std::fs::remove_dir_all(db.parent().unwrap());
+    }
+
+    /// A per-tenant retention window expires only that tenant's rows: reads hide
+    /// them and the next change prunes them from disk, while another tenant with
+    /// no override keeps its aged rows (issue C2).
+    #[test]
+    fn policy_history_ttl_override_expires_only_that_tenant() {
+        let db = unique_db("hist_ttl_tenant");
+        // Global window disabled, so only a's override can expire rows.
+        let store = Store::open_at(&db);
+        store
+            .set_policy_history_ttl("a", 3600)
+            .expect("override a ttl");
+
+        for i in 1..=3 {
+            store
+                .set_tenant_policy("a", &format!(r#"{{"id":"a-{i}"}}"#), "a")
+                .expect("set a");
+        }
+        store
+            .set_tenant_policy("b", r#"{"id":"b-1"}"#, "b")
+            .expect("set b");
+
+        // Age both tenants' rows past the one-hour window.
+        {
+            let conn = Connection::open(&db).expect("open raw");
+            conn.execute(
+                "UPDATE tenant_policy_history SET changed_at = ?1
+                 WHERE id <= 2",
+                params![now_epoch() - 7200],
+            )
+            .expect("age rows");
+        }
+
+        // a's override hides the aged rows; b's disabled global window keeps them.
+        let hist_a = store.list_policy_history("a", 100, 0).expect("history a");
+        assert_eq!(hist_a.len(), 1, "a's override expires aged rows");
+        assert_eq!(
+            hist_a[0].new_policy_json.as_deref(),
+            Some(r#"{"id":"a-3"}"#)
+        );
+        assert_eq!(
+            store
+                .list_policy_history("b", 100, 0)
+                .expect("history b")
+                .len(),
+            1,
+            "b has no override, so its aged row survives"
+        );
+
+        // The next change prunes a's expired rows using its override.
+        store
+            .set_tenant_policy("a", r#"{"id":"a-4"}"#, "a")
+            .expect("set a");
+        {
+            let conn = Connection::open(&db).expect("open raw");
+            let remaining: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM tenant_policy_history WHERE tenant = 'a'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("count a rows");
+            assert_eq!(remaining, 2, "expired rows are deleted on write");
+        }
 
         let _ = std::fs::remove_dir_all(db.parent().unwrap());
     }
