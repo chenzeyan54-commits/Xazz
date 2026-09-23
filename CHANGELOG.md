@@ -9,6 +9,18 @@ Versioning: [Semantic Versioning](https://semver.org/)
 
 ## [Unreleased]
 
+### Added — C2 정책 이력 정기 만료 스윕
+
+- **유휴 테넌트 만료 행 물리 삭제** — 기존에는 정책 팩 변경(write) 트랜잭션에서만
+  만료 행을 prune해서, 변경이 없는 테넌트의 만료 행이 디스크에 잔존했다(read 필터로만
+  숨김). `Store::sweep_expired_policy_history()`가 전 테넌트를 순회하며 **테넌트별
+  유효 보존 윈도**(override 우선, 없으면 전역 기본값)를 해석해 만료 행을 삭제한다.
+  명시적 `0` override(만료 비활성)인 테넌트는 건드리지 않는다
+- **주기 실행** — 서버가 `XAZZ_POLICY_HISTORY_SWEEP_SECS`(기본 3600초, `0`=비활성)
+  간격으로 백그라운드 스윕을 돌린다. 삭제 행이 있으면 로그로 보고
+- 검증: `resolve_policy_history_sweep` 파서 테스트 + 유휴 테넌트 스윕/명시적 `0`
+  override 보호/재스윕 no-op 회귀 테스트 (xazz-server 77 tests)
+
 ### Added — D3 스윕 tiebreak 기준 (issue #64)
 
 - **`train(..., tiebreak: "epochs" | "lr" | "batch")`** — 스윕 리포트 정렬에서

@@ -34,6 +34,11 @@ const POLICY_HISTORY_MAX_ENV: &str = "XAZZ_TENANT_POLICY_HISTORY_MAX";
 /// Environment override for the per-tenant policy-history retention window
 /// (seconds). Unset or `0` disables time-based expiry, leaving only the count cap.
 const POLICY_HISTORY_TTL_ENV: &str = "XAZZ_TENANT_POLICY_HISTORY_TTL_SECS";
+/// Default interval between periodic policy-history retention sweeps (seconds).
+/// `0` disables the periodic sweep (issue C2).
+const DEFAULT_POLICY_HISTORY_SWEEP_SECS: u64 = 3600;
+/// Environment override for the periodic policy-history sweep interval.
+pub const POLICY_HISTORY_SWEEP_ENV: &str = "XAZZ_POLICY_HISTORY_SWEEP_SECS";
 
 /// Parses the per-tenant policy-history retention cap (issue C2).
 ///
@@ -52,6 +57,19 @@ pub fn resolve_policy_history_max(raw: Option<&str>) -> usize {
 /// count cap ([`resolve_policy_history_max`]) still bounds growth.
 pub fn resolve_policy_history_ttl(raw: Option<&str>) -> u64 {
     raw.and_then(|v| v.parse::<u64>().ok()).unwrap_or(0)
+}
+
+/// Parses the periodic policy-history sweep interval in seconds (issue C2).
+///
+/// `0` disables the periodic sweep. Invalid values fall back to
+/// [`DEFAULT_POLICY_HISTORY_SWEEP_SECS`] so a typo cannot silently stop cleaning.
+pub fn resolve_policy_history_sweep(raw: Option<&str>) -> u64 {
+    match raw {
+        None => DEFAULT_POLICY_HISTORY_SWEEP_SECS,
+        Some(v) => v
+            .parse::<u64>()
+            .unwrap_or(DEFAULT_POLICY_HISTORY_SWEEP_SECS),
+    }
 }
 
 /// Current Unix epoch seconds.
@@ -837,6 +855,53 @@ impl Store {
         }
         Ok(out)
     }
+
+    /// Physically deletes expired policy-history rows for every tenant — periodic
+    /// sweep (issue C2).
+    ///
+    /// Pruning normally runs inside a pack change, so an idle tenant whose
+    /// retention window elapsed keeps expired rows on disk (hidden only by the
+    /// read filter). This sweep removes them without waiting for a write,
+    /// resolving each tenant's effective window (stored override first, else the
+    /// global default) so an explicit `0` override is never expired. Tenants with
+    /// no window are left untouched. Returns the number of rows removed.
+    pub fn sweep_expired_policy_history(&self) -> Result<usize, String> {
+        let guard = self.open()?;
+        let conn = guard.as_ref().expect("open guarantees Some");
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| format!("failed to begin policy sweep transaction: {e}"))?;
+        let now = now_epoch();
+        let tenants = {
+            let mut stmt = tx
+                .prepare("SELECT DISTINCT tenant FROM tenant_policy_history")
+                .map_err(|e| format!("failed to list policy-history tenants: {e}"))?;
+            let rows = stmt
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(|e| format!("failed to query policy-history tenants: {e}"))?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r.map_err(|e| format!("failed to read policy-history tenant: {e}"))?);
+            }
+            out
+        };
+        let mut removed = 0usize;
+        for tenant in tenants {
+            let ttl = effective_history_ttl(&tx, &tenant, self.history_ttl_secs)?;
+            if ttl == 0 {
+                continue;
+            }
+            removed += tx
+                .execute(
+                    "DELETE FROM tenant_policy_history WHERE tenant = ?1 AND changed_at < ?2",
+                    params![tenant, history_cutoff(ttl, now)],
+                )
+                .map_err(|e| format!("failed to sweep policy history: {e}"))?;
+        }
+        tx.commit()
+            .map_err(|e| format!("failed to commit policy sweep: {e}"))?;
+        Ok(removed)
+    }
 }
 
 /// Oldest `changed_at` still retained under a retention window (`0` = no limit).
@@ -1338,6 +1403,85 @@ mod tests {
     fn history_cutoff_keeps_all_rows_when_disabled() {
         assert_eq!(history_cutoff(0, 1_000_000), 0);
         assert_eq!(history_cutoff(60, 1_000_000), 999_940);
+    }
+
+    /// The sweep-interval parser defaults to cleaning and honours an opt-out
+    /// (issue C2).
+    #[test]
+    fn policy_history_sweep_resolver_defaults_on_and_allows_disable() {
+        assert_eq!(
+            resolve_policy_history_sweep(None),
+            DEFAULT_POLICY_HISTORY_SWEEP_SECS
+        );
+        assert_eq!(resolve_policy_history_sweep(Some("60")), 60);
+        assert_eq!(resolve_policy_history_sweep(Some("0")), 0);
+        assert_eq!(
+            resolve_policy_history_sweep(Some("not-a-number")),
+            DEFAULT_POLICY_HISTORY_SWEEP_SECS
+        );
+    }
+
+    /// The sweep physically removes expired rows for idle tenants without a
+    /// write, while an explicit `0` override protects that tenant (issue C2).
+    #[test]
+    fn policy_history_sweep_removes_expired_rows_for_idle_tenants() {
+        let db = unique_db("hist_sweep");
+        let store = Store::open_at_with_history(&db, DEFAULT_POLICY_HISTORY_MAX, 3600);
+
+        for i in 1..=2 {
+            store
+                .set_tenant_policy("a", &format!(r#"{{"id":"a-{i}"}}"#), "a")
+                .expect("set a");
+        }
+        store
+            .set_tenant_policy("b", r#"{"id":"b-1"}"#, "b")
+            .expect("set b");
+        // Tenant c disables time-based expiry with an explicit `0` override.
+        store.set_policy_history_ttl("c", 0).expect("override c");
+        store
+            .set_tenant_policy("c", r#"{"id":"c-1"}"#, "c")
+            .expect("set c");
+
+        // Age every row past the one-hour window.
+        {
+            let conn = Connection::open(&db).expect("open raw");
+            conn.execute(
+                "UPDATE tenant_policy_history SET changed_at = ?1",
+                params![now_epoch() - 7200],
+            )
+            .expect("age rows");
+        }
+
+        // No write happens: the sweep alone must clean up the expired rows.
+        let removed = store.sweep_expired_policy_history().expect("sweep");
+        assert_eq!(removed, 3, "a (2) + b (1) expired rows are removed");
+
+        {
+            let conn = Connection::open(&db).expect("open raw");
+            let count = |tenant: &str| -> i64 {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM tenant_policy_history WHERE tenant = ?1",
+                    params![tenant],
+                    |row| row.get(0),
+                )
+                .expect("count rows")
+            };
+            assert_eq!(count("a"), 0);
+            assert_eq!(count("b"), 0);
+            assert_eq!(
+                count("c"),
+                1,
+                "an explicit 0 override disables expiry for c"
+            );
+        }
+
+        // A second sweep has nothing left to remove.
+        assert_eq!(
+            store.sweep_expired_policy_history().expect("sweep again"),
+            0
+        );
+
+        let _ = std::fs::remove_dir_all(db.parent().unwrap());
     }
 
     /// Each change prunes the tenant's history to the newest `max` rows,

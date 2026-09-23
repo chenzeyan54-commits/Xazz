@@ -401,6 +401,7 @@ async fn main() {
         println!("[xazz-server] 📁 Serving IDE from {:?}", web_root);
     }
 
+    let store = Arc::new(store::Store::new());
     let app = Router::new()
         .route("/execute", post(handle_execute))
         .route("/schema", post(handle_schema))
@@ -435,7 +436,7 @@ async fn main() {
         .route("/catalog", post(handle_catalog))
         .with_state(AppState {
             exec_permits: Arc::new(Semaphore::new(MAX_CONCURRENT_EXECUTIONS)),
-            store: Arc::new(store::Store::new()),
+            store: store.clone(),
             tenant_locks: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         })
         .layer(cors);
@@ -464,6 +465,32 @@ async fn main() {
             clean_stale_uploads();
         }
     });
+
+    // ── Periodic policy-history retention sweep (issue C2) ─────────────────────
+    // Expired rows are normally pruned inside a pack change, so an idle tenant's
+    // rows would otherwise linger on disk (hidden only by the read filter). Sweep
+    // every tenant on an interval (`XAZZ_POLICY_HISTORY_SWEEP_SECS`, default 1h;
+    // `0` disables).
+    let sweep_secs = store::resolve_policy_history_sweep(
+        std::env::var(store::POLICY_HISTORY_SWEEP_ENV)
+            .ok()
+            .as_deref(),
+    );
+    if sweep_secs > 0 {
+        let store = store.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(sweep_secs)).await;
+                match store.sweep_expired_policy_history() {
+                    Ok(0) => {}
+                    Ok(n) => {
+                        println!("[xazz-server] 🧹 policy-history sweep removed {n} expired row(s)")
+                    }
+                    Err(e) => eprintln!("[xazz-server] policy-history sweep failed: {e}"),
+                }
+            }
+        });
+    }
 
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
