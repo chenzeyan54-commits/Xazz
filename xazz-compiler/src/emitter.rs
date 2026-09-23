@@ -158,6 +158,8 @@ fn generate_rust_src(
         }
         out.push_str(&emit_extract_xy_fn());
         out.push('\n');
+        out.push_str(&emit_dl_metrics_fn());
+        out.push('\n');
     }
 
     // fn main()
@@ -1098,6 +1100,46 @@ fn make_both_tensors(
     .to_string()
 }
 
+/// Emitted regression-metric helper used by the sweep emitter to select the best
+/// combination by `metric:` (D3), mirroring `xazz-exec`'s `regression_metrics`.
+fn emit_dl_metrics_fn() -> String {
+    r#"/// Mean absolute error and R² over a prediction/target slice (D3 sweep metrics).
+///
+/// R² is `1 - SS_res / SS_tot`; zero-variance targets report `0.0` (undefined)
+/// rather than NaN so sweep ranking stays well-defined.
+fn xz_regression_metrics(preds: &[f32], targets: &[f32]) -> (f64, f64) {
+    let n = preds.len().min(targets.len());
+    if n == 0 {
+        return (f64::NAN, f64::NAN);
+    }
+    let mut abs_sum = 0.0f64;
+    let mut mean_t = 0.0f64;
+    for i in 0..n {
+        abs_sum += (preds[i] as f64 - targets[i] as f64).abs();
+        mean_t += targets[i] as f64;
+    }
+    let mae = abs_sum / n as f64;
+    mean_t /= n as f64;
+
+    let mut ss_res = 0.0f64;
+    let mut ss_tot = 0.0f64;
+    for i in 0..n {
+        let p = preds[i] as f64;
+        let t = targets[i] as f64;
+        ss_res += (t - p).powi(2);
+        ss_tot += (t - mean_t).powi(2);
+    }
+    let r2 = if ss_tot > 0.0 {
+        1.0 - ss_res / ss_tot
+    } else {
+        0.0
+    };
+    (mae, r2)
+}
+"#
+    .to_string()
+}
+
 /// `run <src> |> train(<Model>, ...)` → main() training code block.
 fn emit_dl_train_call(
     source_var: &str,
@@ -1345,8 +1387,10 @@ fn emit_dl_predict_call(
 /// `run <src> |> train(<Model>, epochs: [..], lr: [..], ...)` → grid-search code block.
 ///
 /// Emits the same normalization preamble as the single-run path, then a loop over
-/// the cartesian-product combinations; each combo saves its own checkpoint and the
-/// lowest training loss is reported as the best.
+/// the cartesian-product combinations. Each combo is scored on the training (and,
+/// when `validation_split` is set, validation) split by the
+/// [`TrainConfig::sweep_metric`] (`mse`/`mae`/`r2`), early stopping is applied on
+/// the validation loss, and the best-scoring combo is reported.
 fn emit_dl_sweep_call(
     source_var: &str,
     model_name: &str,
@@ -1368,6 +1412,11 @@ fn emit_dl_sweep_call(
         })
         .collect::<Vec<_>>()
         .join(", ");
+    let metric_id = config.sweep_metric.id();
+    let patience_expr = match config.early_stopping_patience {
+        Some(p) if p > 0 => format!("Some({p})"),
+        _ => "None".to_string(),
+    };
 
     format!(
         r#"    // ── Deep Learning (sweep): run {source_var} |> train({model_name}, target: "{target}") ──────
@@ -1408,14 +1457,22 @@ fn emit_dl_sweep_call(
             .map(|&t| if t.is_finite() {{ t as f32 }} else {{ tmean as f32 }})
             .collect();
 
-        let train_n = n - ((n as f64 * {val_split}) as usize);
+        // Validation split drives metric selection + early stopping (D3).
+        let val_n = (n as f64 * {val_split}) as usize;
+        let train_n = n - val_n;
+
         let combos: Vec<(usize, f64, usize)> = vec![{combo_list}];
+        let metric = "{metric_id}";
+        let patience: Option<usize> = {patience_expr};
         let mut best: Option<(f64, usize, f64, usize)> = None;
         for (epochs, lr, batch_size) in combos {{
             let device: Device<TrainBackend> = Default::default();
             let mut model = {model_name}::<TrainBackend>::new(&device, feature_count);
             let mut optim = AdamConfig::new().init::<TrainBackend, _>();
-            let mut last_loss = 0f32;
+            let mut final_train_loss = f64::NAN;
+            let mut final_val_loss: Option<f64> = None;
+            let mut best_val_loss = f64::INFINITY;
+            let mut epochs_no_improve = 0usize;
             for epoch in 0..epochs {{
                 let mut loss_sum = 0f32;
                 let mut steps = 0usize;
@@ -1432,12 +1489,58 @@ fn emit_dl_sweep_call(
                     loss_sum += lv;
                     steps += 1;
                 }}
-                last_loss = if steps > 0 {{ loss_sum / steps as f32 }} else {{ 0.0 }};
+                final_train_loss = if steps > 0 {{ (loss_sum / steps as f32) as f64 }} else {{ f64::NAN }};
+
+                // Validation loss for MSE selection / early stopping (D3).
+                if val_n > 0 {{
+                    let (x, y) = make_both_tensors(&xs, &ys, feature_count, train_n, n, &device);
+                    let vout = model.forward(x);
+                    let vloss = ((vout - y).powf_scalar(2.0)).mean();
+                    final_val_loss = vloss.into_data().to_vec::<f32>().map(|v| v[0] as f64).ok();
+                }}
+                if let Some(v) = final_val_loss {{
+                    if v < best_val_loss {{
+                        best_val_loss = v;
+                        epochs_no_improve = 0;
+                    }} else {{
+                        epochs_no_improve += 1;
+                    }}
+                }}
                 println!(
                     "[Epoch {{epoch:>3}}/{{}}]  train_loss(MSE) = {{:.6}}",
-                    epochs, last_loss
+                    epochs, final_train_loss
                 );
+                if let Some(p) = patience {{
+                    if val_n > 0 && epochs_no_improve >= p {{
+                        println!(
+                            "[xazz] early stop (epochs={{}} lr={{}} batch={{}}): no val_loss improvement for {{}} epoch(s)",
+                            epochs, lr, batch_size, p
+                        );
+                        break;
+                    }}
+                }}
             }}
+
+            // Full-set regression metrics for metric-based selection (D3).
+            let (xall, _) = make_both_tensors(&xs, &ys, feature_count, 0, n, &device);
+            let preds = model.forward(xall).into_data().to_vec::<f32>().unwrap_or_default();
+            let (train_mae, train_r2, val_mae, val_r2) = if preds.len() == n {{
+                let (train_mae, train_r2) = xz_regression_metrics(&preds[..train_n], &ys[..train_n]);
+                if val_n > 0 {{
+                    let (val_mae, val_r2) = xz_regression_metrics(&preds[train_n..], &ys[train_n..]);
+                    (train_mae, train_r2, val_mae, val_r2)
+                }} else {{
+                    (train_mae, train_r2, f64::NAN, f64::NAN)
+                }}
+            }} else {{
+                (f64::NAN, f64::NAN, f64::NAN, f64::NAN)
+            }};
+            let score = match metric {{
+                "mae" => if val_n > 0 {{ val_mae }} else {{ train_mae }},
+                "r2" => -if val_n > 0 {{ val_r2 }} else {{ train_r2 }},
+                _ => final_val_loss.unwrap_or(final_train_loss),
+            }};
+            let score = if score.is_finite() {{ score }} else {{ f64::INFINITY }};
 
             let valid = model.valid();
             let recorder = PrettyJsonFileRecorder::<FullPrecisionSettings>::new();
@@ -1447,17 +1550,17 @@ fn emit_dl_sweep_call(
                 &recorder,
             )?;
             println!(
-                "[xazz] combo epochs={{}} lr={{}} batch={{}} train_loss={{:.6}}",
-                epochs, lr, batch_size, last_loss
+                "[xazz] combo epochs={{}} lr={{}} batch={{}} score={{:.6}}",
+                epochs, lr, batch_size, score
             );
-            if best.map_or(true, |(loss, _, _, _)| (last_loss as f64) < loss) {{
-                best = Some((last_loss as f64, epochs, lr, batch_size));
+            if best.map_or(true, |(s, _, _, _)| score < s) {{
+                best = Some((score, epochs, lr, batch_size));
             }}
         }}
-        if let Some((loss, epochs, lr, batch_size)) = best {{
+        if let Some((score, epochs, lr, batch_size)) = best {{
             println!(
-                "[xazz] ✅ best combo: epochs={{}} lr={{}} batch={{}} train_loss={{:.6}}",
-                epochs, lr, batch_size, loss
+                "[xazz] ✅ best combo: epochs={{}} lr={{}} batch={{}} score={{:.6}}",
+                epochs, lr, batch_size, score
             );
         }}
     }}
@@ -1942,6 +2045,78 @@ mod tests {
         );
         assert!(out.contains("(5,"), "두 번째 에폭 조합 누락: {out}");
         assert!(out.contains("best combo"), "최적 조합 출력 누락: {out}");
+    }
+
+    /// D3 sweep: the emitted selection reflects `metric:` instead of hard-coded
+    /// train MSE — the metric helper is emitted and each combo is scored by the
+    /// requested metric (R² negated so minimising the score maximises R²).
+    #[test]
+    fn emit_rust_sweep_metric_selects_by_metric() {
+        let out = emit(
+            "type S = { a: float, y: float };
+             model M { Dense(4) -> Dense(1) }
+             v data = load(\"x.csv\") :: S;
+             run data |> train(M, target: \"y\", epochs: [3, 5], metric: \"r2\");",
+        );
+        assert!(
+            out.contains("let metric = \"r2\";"),
+            "metric 선택값이 emit되지 않음: {out}"
+        );
+        assert!(
+            out.contains("fn xz_regression_metrics("),
+            "회귀 지표 헬퍼 누락: {out}"
+        );
+        assert!(
+            out.contains("\"r2\" => -if val_n > 0 { val_r2 } else { train_r2 },"),
+            "R² 점수 부호 처리 누락: {out}"
+        );
+        assert!(
+            out.contains("best.map_or(true, |(s, _, _, _)| score < s)"),
+            "metric 기반 최적 조합 비교 누락: {out}"
+        );
+    }
+
+    /// D3 sweep: `validation_split:` + `patience:` emit validation-loss tracking
+    /// and early stopping inside the combo loop.
+    #[test]
+    fn emit_rust_sweep_early_stopping_patience() {
+        let out = emit(
+            "type S = { a: float, y: float };
+             model M { Dense(4) -> Dense(1) }
+             v data = load(\"x.csv\") :: S;
+             run data |> train(M, target: \"y\", epochs: [3, 5], validation_split: 0.2, patience: 3);",
+        );
+        assert!(
+            out.contains("let val_n = (n as f64 * 0.2) as usize;"),
+            "검증 분할 emit 누락: {out}"
+        );
+        assert!(
+            out.contains("let patience: Option<usize> = Some(3);"),
+            "patience emit 누락: {out}"
+        );
+        assert!(
+            out.contains("if val_n > 0 && epochs_no_improve >= p"),
+            "조기 종료 조건 누락: {out}"
+        );
+        assert!(
+            out.contains("final_val_loss = vloss.into_data().to_vec::<f32>()"),
+            "검증 손실 계산 누락: {out}"
+        );
+    }
+
+    /// No `patience:` leaves early stopping disabled in the emitted sweep.
+    #[test]
+    fn emit_rust_sweep_without_patience_disables_early_stop() {
+        let out = emit(
+            "type S = { a: float, y: float };
+             model M { Dense(4) -> Dense(1) }
+             v data = load(\"x.csv\") :: S;
+             run data |> train(M, target: \"y\", epochs: [3, 5]);",
+        );
+        assert!(
+            out.contains("let patience: Option<usize> = None;"),
+            "patience 비활성 emit 누락: {out}"
+        );
     }
 
     #[test]
