@@ -557,3 +557,24 @@ test('the ledger re-reads the server when its window rolls over', async ({ page 
   await expect(page.getByRole('region', { name: 'Differential-privacy ledger' })).toContainText('60s · tenant')
   await expect.poll(() => reads, { timeout: 6000 }).toBeGreaterThanOrEqual(2)
 })
+
+test('a server clock behind the browser does not make the ledger re-read in a loop', async ({ page }) => {
+  let reads = 0
+  const stuck = Math.floor(Date.now() / 1000) - 5 // server has not rolled yet
+  await mockServer(page, {
+    'GET /dp/budget': () => {
+      reads += 1
+      return { ...defaults()['GET /dp/budget'], window_secs: 60, window_source: 'tenant', resets_at: stuck }
+    },
+  })
+  await openMonitor(page)
+  await page.waitForTimeout(2500)
+  expect(reads).toBeLessThanOrEqual(2)
+})
+
+test('a refused policy check reports the server answer, not an offline server', async ({ page }) => {
+  await mockServer(page, { 'POST /security/policy/check': { http: 401, text: 'invalid tenant token' } })
+  await openMonitor(page)
+  await page.getByRole('button', { name: 'Check policy' }).click()
+  await expect(page.locator('.live-message')).toContainText('xazz-server answered 401: invalid tenant token')
+})

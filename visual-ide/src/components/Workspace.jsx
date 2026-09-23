@@ -183,6 +183,13 @@ function DownloadDemoCsv({ rows }) {
   )
 }
 
+// "The server refused" and "there is no server" need different next actions.
+function serverFailure(what, err) {
+  return err instanceof ApiError
+    ? `${what} failed · xazz-server answered ${err.status}: ${err.message}`
+    : `${what} unavailable · xazz-server offline?`
+}
+
 // Process axis for a Full Run that returned no process evidence: a dropped request
 // (stop / timeout) may still be running; a refused or unreachable one never started.
 function processWithoutEvidence(execError) {
@@ -1464,14 +1471,17 @@ function RunOverlay({ startedAt, onViewLogs, onStop }) {
     ['result', 'pending'],
   ]
   return (
-    <div className="run-overlay" role="status" aria-live="polite">
+    <div className="run-overlay">
       <div className="run-overlay__pulse">
         <LoaderCircle aria-hidden="true" />
       </div>
       <div>
-        <span className="eyebrow">{t('progress.eyebrow')}</span>
-        <strong>{t('progress.title')}</strong>
-        {/* role=timer is aria-live off: the status region must not re-read every second. */}
+        {/* Only the fixed heading is live: an atomic region around the ticking timer
+            would be re-read every second (WebKit ignores a nested aria-live off). */}
+        <div role="status" aria-live="polite">
+          <span className="eyebrow">{t('progress.eyebrow')}</span>
+          <strong>{t('progress.title')}</strong>
+        </div>
         <p className="run-overlay__elapsed" role="timer">
           {t('progress.elapsed').replace('{s}', elapsed)}
         </p>
@@ -1576,7 +1586,9 @@ export function Workspace({ initialState = 'ready', onStateChange, onHome }) {
 
   useEffect(() => {
     setRunState(initialState)
-    if (initialState === 'error') {
+    // The URL mirrors run state; a Full Run that returned no evidence also lands on
+    // 'error' here, and must not jump to the prototype's failed step.
+    if (initialState === 'error' && !execError) {
       setSelectedId('fill')
       setTab('logs')
     } else if (initialState === 'success') {
@@ -1651,7 +1663,7 @@ export function Workspace({ initialState = 'ready', onStateChange, onHome }) {
         setLiveMessage(`xazz-server unreachable · ${API_BASE_URL}`)
       }
       // No process evidence came back, so the canvas keeps its selection instead of
-      // pointing at a failed step (see evidenceState below).
+      // pointing at a failed step (see evidenceState and the initialState effect).
       setExecuting(false)
       setRunState('error')
       setTab('logs')
@@ -1690,16 +1702,16 @@ export function Workspace({ initialState = 'ready', onStateChange, onHome }) {
     setGuardrailSource(dagCode)
     try {
       const report = await checkPolicy(dagCode)
-      if (report && report.policy) {
+      if (report?.policy) {
         setPolicyReport(report.policy)
         setLiveMessage(
           report.policy.safe_to_execute
             ? `Guardrail check passed · ${report.policy.violations?.length ?? 0} violation(s)`
             : `Guardrail blocked · ${report.policy.violations?.length ?? 0} violation(s)`,
         )
-      } else {
-        setLiveMessage('Guardrail check unavailable · server offline?')
       }
+    } catch (err) {
+      setLiveMessage(serverFailure('Guardrail check', err))
     } finally {
       setGuardrailChecking(false)
     }
@@ -1718,8 +1730,8 @@ export function Workspace({ initialState = 'ready', onStateChange, onHome }) {
             : 'Remediation generated · manual review still required',
         )
       }
-    } catch {
-      setLiveMessage('Remediation unavailable · server offline?')
+    } catch (err) {
+      setLiveMessage(serverFailure('Remediation', err))
     }
   }
 

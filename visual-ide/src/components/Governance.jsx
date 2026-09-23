@@ -177,10 +177,15 @@ function DpLedgerPanel({ revision }) {
   const windowed = Number(data?.window_secs) > 0 && Number(data?.resets_at) > 0
   const now = useNow(windowed)
   // Past resets_at the shown spend belongs to the previous window; read the new one.
+  // Once per boundary: a browser clock ahead of the server gets the same resets_at
+  // back, and re-reading it on every answer would loop.
   const rolled = windowed && now >= data.resets_at * 1000
+  const reloadedFor = useRef(null)
   useEffect(() => {
-    if (rolled) reload()
-  }, [rolled, reload])
+    if (!rolled || reloadedFor.current === data.resets_at) return
+    reloadedFor.current = data.resets_at
+    reload()
+  }, [rolled, reload, data?.resets_at])
 
   const reset = async () => {
     setBusy(true)

@@ -114,14 +114,10 @@ export async function executeCode(code, { timeoutMs = 5 * 60 * 1000, signal } = 
  * POST /security/policy/check — 실행하지 않고 정적 가드레일 검사만 수행한다 (issue #2).
  *
  * 위반이 있어도 HTTP 200 이다 — 검사 자체는 성공했고, 판정은 `safe_to_execute`
- * 에 담긴다. 편집 중 실시간 표시에 쓰도록 실패는 null 로 돌려준다.
+ * 에 담긴다. 서버 거부(ApiError: 401, 정책 로드 실패 500)와 연결 실패는 호출부가 구분한다.
  */
-export async function checkPolicy(code) {
-  try {
-    return await request('/security/policy/check', { method: 'POST', json: { code } })
-  } catch {
-    return null
-  }
+export function checkPolicy(code) {
+  return request('/security/policy/check', { method: 'POST', json: { code } })
 }
 
 /**
