@@ -128,6 +128,15 @@ fn ensure_schema(conn: &Connection) -> Result<(), String> {
             ttl_secs INTEGER NOT NULL DEFAULT 0,
             updated_at INTEGER NOT NULL DEFAULT 0
         );
+        CREATE TABLE IF NOT EXISTS tenant_policy_history_config_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tenant TEXT NOT NULL,
+            action TEXT NOT NULL,
+            old_ttl_secs INTEGER,
+            new_ttl_secs INTEGER,
+            changed_by TEXT NOT NULL DEFAULT '',
+            changed_at INTEGER NOT NULL
+        );
         CREATE TABLE IF NOT EXISTS dp_reservation (
             tenant TEXT PRIMARY KEY,
             reservation_id TEXT NOT NULL,
@@ -179,6 +188,29 @@ pub struct PolicyChangeRecord {
     pub old_policy_json: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub new_policy_json: Option<String>,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub changed_by: String,
+    /// Unix epoch seconds
+    pub changed_at: i64,
+}
+
+/// One append-only record of a per-tenant policy-history retention-window
+/// override change (issue C2).
+///
+/// `action` is `"set"` (create/replace the override) or `"clear"` (remove it,
+/// restoring the global default). `old_ttl_secs` is the override in effect before
+/// the change (absent for the first set), and `new_ttl_secs` is the override after
+/// it (absent for a clear). `changed_by` is the authenticated tenant that
+/// performed the self-service change.
+#[derive(Debug, Clone, Serialize)]
+pub struct PolicyHistoryTtlChangeRecord {
+    pub id: i64,
+    pub tenant: String,
+    pub action: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub old_ttl_secs: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub new_ttl_secs: Option<u64>,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub changed_by: String,
     /// Unix epoch seconds
@@ -659,42 +691,124 @@ impl Store {
         read_policy_history_ttl(conn, tenant)
     }
 
-    /// Stores a tenant's policy-history retention-window override — issue C2.
+    /// Stores a tenant's policy-history retention-window override and appends an
+    /// append-only change record — issue C2.
     ///
     /// The window is keyed by tenant, so one tenant's setting never changes
-    /// another's. Newly written changes are retained under the tenant's override
-    /// on the next write/read.
-    pub fn set_policy_history_ttl(&self, tenant: &str, ttl_secs: u64) -> Result<(), String> {
+    /// another's. The previous override (if any) is captured in the same
+    /// transaction, so the audit trail is never out of sync with the stored
+    /// override. `changed_by` is the authenticated tenant performing the
+    /// self-service change.
+    pub fn set_policy_history_ttl(
+        &self,
+        tenant: &str,
+        ttl_secs: u64,
+        changed_by: &str,
+    ) -> Result<(), String> {
         let guard = self.open()?;
         let conn = guard.as_ref().expect("open guarantees Some");
-        conn.execute(
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| format!("failed to begin policy history ttl transaction: {e}"))?;
+        let now = now_epoch();
+        let previous = read_policy_history_ttl(&tx, tenant)?;
+        tx.execute(
             "INSERT INTO tenant_policy_history_config (tenant, ttl_secs, updated_at)
              VALUES (?1, ?2, ?3)
              ON CONFLICT(tenant) DO UPDATE SET
                  ttl_secs   = excluded.ttl_secs,
                  updated_at = excluded.updated_at",
-            params![tenant, ttl_secs as i64, now_epoch()],
+            params![tenant, ttl_secs as i64, now],
         )
         .map_err(|e| format!("failed to store tenant policy history ttl: {e}"))?;
+        insert_policy_history_ttl_change(
+            &tx,
+            tenant,
+            "set",
+            previous,
+            Some(ttl_secs),
+            changed_by,
+            now,
+        )?;
+        prune_policy_history_ttl_history(&tx, tenant, self.history_max)?;
+        tx.commit()
+            .map_err(|e| format!("failed to commit policy history ttl transaction: {e}"))?;
         Ok(())
     }
 
-    /// Removes a tenant's policy-history retention-window override. Returns `true`
-    /// if one existed — issue C2.
+    /// Removes a tenant's policy-history retention-window override and appends an
+    /// append-only change record. Returns `true` if one existed — issue C2.
     ///
     /// After removal the tenant falls back to the global
     /// `XAZZ_TENANT_POLICY_HISTORY_TTL_SECS` default. Other tenants' overrides are
-    /// untouched.
-    pub fn clear_policy_history_ttl(&self, tenant: &str) -> Result<bool, String> {
+    /// untouched. The removal and its change record commit together; a clear that
+    /// removes nothing records nothing.
+    pub fn clear_policy_history_ttl(&self, tenant: &str, changed_by: &str) -> Result<bool, String> {
         let guard = self.open()?;
         let conn = guard.as_ref().expect("open guarantees Some");
-        let deleted = conn
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| format!("failed to begin policy history ttl transaction: {e}"))?;
+        let now = now_epoch();
+        let previous = read_policy_history_ttl(&tx, tenant)?;
+        let deleted = tx
             .execute(
                 "DELETE FROM tenant_policy_history_config WHERE tenant = ?1",
                 params![tenant],
             )
             .map_err(|e| format!("failed to clear tenant policy history ttl: {e}"))?;
+        if deleted > 0 {
+            insert_policy_history_ttl_change(
+                &tx, tenant, "clear", previous, None, changed_by, now,
+            )?;
+            prune_policy_history_ttl_history(&tx, tenant, self.history_max)?;
+        }
+        tx.commit()
+            .map_err(|e| format!("failed to commit policy history ttl transaction: {e}"))?;
         Ok(deleted > 0)
+    }
+
+    /// Lists a tenant's policy-history retention-window override change history,
+    /// newest-first — issue C2.
+    ///
+    /// History is tenant-scoped like the overrides themselves, so one tenant's
+    /// change trail is never visible to another. The rows are append-only up to
+    /// the retention cap (see [`resolve_policy_history_max`]) and survive
+    /// override replacement/removal. `limit`/`offset` page the newest-first list.
+    pub fn list_policy_history_ttl_history(
+        &self,
+        tenant: &str,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<PolicyHistoryTtlChangeRecord>, String> {
+        let guard = self.open()?;
+        let conn = guard.as_ref().expect("open guarantees Some");
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, tenant, action, old_ttl_secs, new_ttl_secs, changed_by, changed_at
+                 FROM tenant_policy_history_config_history
+                 WHERE tenant = ?1
+                 ORDER BY id DESC LIMIT ?2 OFFSET ?3",
+            )
+            .map_err(|e| format!("failed to prepare policy history ttl history: {e}"))?;
+        let rows = stmt
+            .query_map(params![tenant, limit as i64, offset as i64], |row| {
+                Ok(PolicyHistoryTtlChangeRecord {
+                    id: row.get(0)?,
+                    tenant: row.get(1)?,
+                    action: row.get(2)?,
+                    old_ttl_secs: row.get::<_, Option<i64>>(3)?.map(|v| v.max(0) as u64),
+                    new_ttl_secs: row.get::<_, Option<i64>>(4)?.map(|v| v.max(0) as u64),
+                    changed_by: row.get(5)?,
+                    changed_at: row.get(6)?,
+                })
+            })
+            .map_err(|e| format!("failed to query policy history ttl history: {e}"))?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(|e| format!("failed to read policy history ttl history row: {e}"))?);
+        }
+        Ok(out)
     }
 
     /// Returns the tenant's stored policy pack JSON, if any — issue C2.
@@ -1009,6 +1123,62 @@ fn prune_policy_history(
         params![tenant, max as i64],
     )
     .map_err(|e| format!("failed to prune policy history: {e}"))?;
+    Ok(())
+}
+
+/// Appends one policy-history retention-window override change row (never
+/// updates/deletes) — issue C2.
+fn insert_policy_history_ttl_change(
+    conn: &Connection,
+    tenant: &str,
+    action: &str,
+    old_ttl_secs: Option<u64>,
+    new_ttl_secs: Option<u64>,
+    changed_by: &str,
+    changed_at: i64,
+) -> Result<(), String> {
+    conn.execute(
+        "INSERT INTO tenant_policy_history_config_history
+             (tenant, action, old_ttl_secs, new_ttl_secs, changed_by, changed_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            tenant,
+            action,
+            old_ttl_secs.map(|v| v as i64),
+            new_ttl_secs.map(|v| v as i64),
+            changed_by,
+            changed_at
+        ],
+    )
+    .map_err(|e| format!("failed to record policy history ttl change: {e}"))?;
+    Ok(())
+}
+
+/// Trims a tenant's policy-history retention-window override change history to its
+/// count cap (issue C2).
+///
+/// Runs in the same transaction as the change that triggered it, so the table
+/// never grows unbounded while the newest rows (the ones the audit endpoint
+/// serves) are preserved. Only the count cap applies — the override's own window
+/// must not expire the audit trail of who set it. Other tenants are never touched.
+fn prune_policy_history_ttl_history(
+    conn: &Connection,
+    tenant: &str,
+    max: usize,
+) -> Result<(), String> {
+    if max == 0 {
+        return Ok(());
+    }
+    conn.execute(
+        "DELETE FROM tenant_policy_history_config_history
+         WHERE tenant = ?1
+           AND id NOT IN (
+               SELECT id FROM tenant_policy_history_config_history
+               WHERE tenant = ?1 ORDER BY id DESC LIMIT ?2
+           )",
+        params![tenant, max as i64],
+    )
+    .map_err(|e| format!("failed to prune policy history ttl history: {e}"))?;
     Ok(())
 }
 
@@ -1437,7 +1607,9 @@ mod tests {
             .set_tenant_policy("b", r#"{"id":"b-1"}"#, "b")
             .expect("set b");
         // Tenant c disables time-based expiry with an explicit `0` override.
-        store.set_policy_history_ttl("c", 0).expect("override c");
+        store
+            .set_policy_history_ttl("c", 0, "c")
+            .expect("override c");
         store
             .set_tenant_policy("c", r#"{"id":"c-1"}"#, "c")
             .expect("set c");
@@ -1599,8 +1771,8 @@ mod tests {
         assert_eq!(store.policy_history_ttl_default(), 0);
 
         assert_eq!(store.get_policy_history_ttl("a").expect("read a"), None);
-        store.set_policy_history_ttl("a", 3600).expect("set a");
-        store.set_policy_history_ttl("b", 0).expect("set b");
+        store.set_policy_history_ttl("a", 3600, "a").expect("set a");
+        store.set_policy_history_ttl("b", 0, "b").expect("set b");
 
         assert_eq!(
             store.get_policy_history_ttl("a").expect("read a"),
@@ -1610,12 +1782,123 @@ mod tests {
         assert_eq!(store.get_policy_history_ttl("b").expect("read b"), Some(0));
         assert_eq!(store.get_policy_history_ttl("c").expect("read c"), None);
 
-        assert!(store.clear_policy_history_ttl("a").expect("clear a"));
+        assert!(store.clear_policy_history_ttl("a", "a").expect("clear a"));
         assert_eq!(store.get_policy_history_ttl("a").expect("read a"), None);
-        assert!(!store.clear_policy_history_ttl("a").expect("clear a again"));
+        assert!(
+            !store
+                .clear_policy_history_ttl("a", "a")
+                .expect("clear a again")
+        );
         assert_eq!(store.get_policy_history_ttl("b").expect("read b"), Some(0));
 
         let _ = std::fs::remove_dir_all(db.parent().unwrap());
+    }
+
+    /// Every set/clear of a per-tenant retention-window override appends a
+    /// who/when/previous-value record, scoped to the tenant (issue C2).
+    #[test]
+    fn policy_history_ttl_change_history_records_set_and_clear() {
+        let db = unique_db("hist_ttl_change");
+        let store = Store::open_at(&db);
+
+        assert!(
+            store
+                .list_policy_history_ttl_history("a", 100, 0)
+                .expect("empty")
+                .is_empty()
+        );
+
+        store.set_policy_history_ttl("a", 3600, "a").expect("set 1");
+        store
+            .set_policy_history_ttl("a", 0, "admin")
+            .expect("set 2");
+        store.set_policy_history_ttl("b", 60, "b").expect("set b");
+
+        let hist = store
+            .list_policy_history_ttl_history("a", 100, 0)
+            .expect("history a");
+        assert_eq!(hist.len(), 2, "newest-first set records");
+        assert_eq!(hist[0].action, "set");
+        assert_eq!(hist[0].old_ttl_secs, Some(3600));
+        assert_eq!(hist[0].new_ttl_secs, Some(0));
+        assert_eq!(hist[0].changed_by, "admin");
+        assert_eq!(hist[1].action, "set");
+        assert_eq!(
+            hist[1].old_ttl_secs, None,
+            "first set has no previous value"
+        );
+        assert_eq!(hist[1].new_ttl_secs, Some(3600));
+        assert_eq!(hist[1].changed_by, "a");
+
+        assert!(store.clear_policy_history_ttl("a", "a").expect("clear a"));
+        let hist = store
+            .list_policy_history_ttl_history("a", 100, 0)
+            .expect("history a after clear");
+        assert_eq!(hist.len(), 3);
+        assert_eq!(hist[0].action, "clear");
+        assert_eq!(hist[0].old_ttl_secs, Some(0));
+        assert_eq!(hist[0].new_ttl_secs, None, "a clear has no new value");
+
+        // A clear that removes nothing records nothing.
+        assert!(
+            !store
+                .clear_policy_history_ttl("a", "a")
+                .expect("clear a again")
+        );
+        assert_eq!(
+            store
+                .list_policy_history_ttl_history("a", 100, 0)
+                .expect("history a after no-op")
+                .len(),
+            3
+        );
+
+        // History is tenant-scoped.
+        assert_eq!(
+            store
+                .list_policy_history_ttl_history("b", 100, 0)
+                .expect("history b")
+                .len(),
+            1
+        );
+
+        let _ = std::fs::remove_dir_all(db.parent().unwrap());
+    }
+
+    /// The retention-window change history is capped per tenant and pages
+    /// newest-first (issue C2).
+    #[test]
+    fn policy_history_ttl_change_history_is_pruned_and_paginates() {
+        let dir = std::env::temp_dir().join(format!(
+            "xazz_store_hist_ttl_cap_{}_{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let db = dir.join("xazz.db");
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Store::open_at_with_history_max(&db, 2);
+
+        for i in 1..=4 {
+            store.set_policy_history_ttl("a", i, "a").expect("set a");
+        }
+
+        let hist = store
+            .list_policy_history_ttl_history("a", 100, 0)
+            .expect("history a");
+        assert_eq!(hist.len(), 2, "cap keeps the newest 2");
+        assert_eq!(hist[0].new_ttl_secs, Some(4));
+        assert_eq!(hist[1].new_ttl_secs, Some(3));
+
+        let page = store
+            .list_policy_history_ttl_history("a", 1, 1)
+            .expect("page");
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].new_ttl_secs, Some(3));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A per-tenant retention window expires only that tenant's rows: reads hide
@@ -1627,7 +1910,7 @@ mod tests {
         // Global window disabled, so only a's override can expire rows.
         let store = Store::open_at(&db);
         store
-            .set_policy_history_ttl("a", 3600)
+            .set_policy_history_ttl("a", 3600, "a")
             .expect("override a ttl");
 
         for i in 1..=3 {

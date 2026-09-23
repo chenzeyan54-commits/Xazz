@@ -16,6 +16,7 @@
 //!   GET  /security/policy/history/ttl                      → per-tenant effective history retention window (C2)
 //!   PUT  /security/policy/history/ttl                      → per-tenant history retention window (C2)
 //!   DELETE /security/policy/history/ttl                    → clear the tenant's retention override (C2)
+//!   GET  /security/policy/history/ttl/history?limit=&offset= → tenant's retention-override change audit (C2)
 //!   POST /security/policy/check { "code": "<xzz DSL>" }    → static guardrail inspection report
 //!   POST /security/remediate    { "code": "<xzz DSL>" }    → safe code auto-remediation (deterministic + sLM)
 //!   GET  /runs                                → run history (SQLite, issue C1)
@@ -425,6 +426,10 @@ async fn main() {
             get(handle_policy_history_ttl_get)
                 .put(handle_policy_history_ttl_set)
                 .delete(handle_policy_history_ttl_clear),
+        )
+        .route(
+            "/security/policy/history/ttl/history",
+            get(handle_policy_history_ttl_history),
         )
         .route("/security/remediate", post(handle_remediate))
         .route("/security/inference/check", post(handle_inference_check))
@@ -1543,7 +1548,7 @@ async fn handle_policy_history_ttl_set(
     let tenant = tenant_str(tenant.as_str());
     state
         .store
-        .set_policy_history_ttl(tenant, payload.ttl_secs)
+        .set_policy_history_ttl(tenant, payload.ttl_secs, tenant)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
     Ok(Json(json!({
         "tenant": tenant,
@@ -1564,7 +1569,7 @@ async fn handle_policy_history_ttl_clear(
     let tenant = tenant_str(tenant.as_str());
     state
         .store
-        .clear_policy_history_ttl(tenant)
+        .clear_policy_history_ttl(tenant, tenant)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
     let ttl = effective_policy_history_ttl(&state.store, tenant)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
@@ -1572,6 +1577,53 @@ async fn handle_policy_history_ttl_clear(
         "tenant": tenant,
         "ttl_secs": ttl.secs,
         "ttl_source": ttl.source,
+    })))
+}
+
+/// Returns the authenticated tenant's append-only retention-override change
+/// history — issue C2.
+///
+/// Each entry records the action (`set`/`clear`), the previous and new override
+/// (in seconds), who changed it, and when — so a change to the tenant's
+/// policy-history retention window is auditable even though
+/// `tenant_policy_history_config` only keeps the latest state. `?limit=&offset=`
+/// page the newest-first list.
+async fn handle_policy_history_ttl_history(
+    Extension(tenant): Extension<String>,
+    State(state): State<AppState>,
+    Query(page): Query<PolicyHistoryQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let tenant = tenant_str(tenant.as_str());
+    let limit = page.limit();
+    let offset = page.offset();
+    let records = state
+        .store
+        .list_policy_history_ttl_history(tenant, limit, offset)
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": e })),
+            )
+        })?;
+    let history: Vec<Value> = records
+        .into_iter()
+        .map(|r| {
+            json!({
+                "id": r.id,
+                "tenant": r.tenant,
+                "action": r.action,
+                "old_ttl_secs": r.old_ttl_secs,
+                "new_ttl_secs": r.new_ttl_secs,
+                "changed_by": r.changed_by,
+                "changed_at": r.changed_at,
+            })
+        })
+        .collect();
+    Ok(Json(json!({
+        "tenant": tenant,
+        "limit": limit,
+        "offset": offset,
+        "history": history,
     })))
 }
 
@@ -2670,7 +2722,7 @@ v x = load(\"examples/data/seoul_air_2024.csv\") :: AQ
         // With an override: reports the tenant value and source.
         state
             .store
-            .set_policy_history_ttl(&tenant, 1800)
+            .set_policy_history_ttl(&tenant, 1800, &tenant)
             .expect("set");
         let tenant_view =
             handle_policy_history_ttl_get(State(state.clone()), Extension(tenant.clone()))
@@ -2679,6 +2731,54 @@ v x = load(\"examples/data/seoul_air_2024.csv\") :: AQ
                 .0;
         assert_eq!(tenant_view["ttl_source"], json!("tenant"));
         assert_eq!(tenant_view["ttl_secs"], json!(1800));
+    }
+
+    /// `GET /security/policy/history/ttl/history` exposes the tenant's
+    /// retention-override change audit, newest-first (issue C2).
+    #[tokio::test]
+    async fn policy_history_ttl_change_history_endpoint_lists_changes() {
+        let state = unique_state("hist_ttl_hist_endpoint");
+        let tenant = format!("hist-ttl-hist-{}", std::process::id());
+
+        let empty = handle_policy_history_ttl_history(
+            Extension(tenant.clone()),
+            State(state.clone()),
+            Query(PolicyHistoryQuery {
+                limit: None,
+                offset: None,
+            }),
+        )
+        .await
+        .expect("history")
+        .0;
+        assert_eq!(empty["tenant"], json!(tenant));
+        assert_eq!(empty["history"], json!([]));
+
+        let _ = handle_policy_history_ttl_set(
+            State(state.clone()),
+            Extension(tenant.clone()),
+            Json(PolicyHistoryTtlRequest { ttl_secs: 3600 }),
+        )
+        .await
+        .expect("set ttl");
+
+        let listed = handle_policy_history_ttl_history(
+            Extension(tenant.clone()),
+            State(state.clone()),
+            Query(PolicyHistoryQuery {
+                limit: None,
+                offset: None,
+            }),
+        )
+        .await
+        .expect("history")
+        .0;
+        let history = listed["history"].as_array().expect("history array");
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0]["action"], json!("set"));
+        assert_eq!(history[0]["old_ttl_secs"], Value::Null);
+        assert_eq!(history[0]["new_ttl_secs"], json!(3600));
+        assert_eq!(history[0]["changed_by"], json!(tenant));
     }
 
     /// `GET /security/policy/history` exposes the tenant's effective retention
@@ -2710,7 +2810,7 @@ v x = load(\"examples/data/seoul_air_2024.csv\") :: AQ
         // Tenant override is reflected in the same response.
         state
             .store
-            .set_policy_history_ttl(&tenant, 900)
+            .set_policy_history_ttl(&tenant, 900, &tenant)
             .expect("set");
         let overridden = handle_policy_history(
             Extension(tenant.clone()),
