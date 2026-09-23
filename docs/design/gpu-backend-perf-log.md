@@ -201,3 +201,54 @@ XAZZ_BACKEND=onnx XAZZ_ORT_EP=auto xazz run model.xzz
 - **warmup 후 steady-state** 측정(캐시 채운 뒤 반복 추론), init/export 비용은
   첫 호출로 분리 기록.
 - `[xazz:timing]`(파이프라인)과 device probe/체크포인트 로드 시간을 구분해 로깅.
+
+---
+
+## 9. 이어서 — 측정 왜곡 제거 (NEXT GPU 벤치 unblock)
+
+6절 후속과 "발견한 후속"에 남아 있던 벤치 왜곡 요소를 정리했다. 구현은 여전히
+`xazz-exec`.
+
+### 9.1 변경
+
+| # | 문제 | 변경 |
+|---|---|---|
+| 1 | `train_on_device`의 GPU→디스크→CPU 왕복 | `BinBytesRecorder`(bincode) 인메모리 전송 `materialize_cpu_model`. 디스크 체크포인트는 pretty-JSON 유지 |
+| 2 | 스윕 조합마다 저장/매니페스트/왕복 | `train_unpersisted`(+`persist:` 인자) 도입, 스윕은 조합에 unpersisted·우승만 저장. ONNX도 조합별 export 제거 |
+| 3 | 추론 `[n, feature]` 단일 업로드 | `XAZZ_INFER_CHUNK` + `chunk_ranges`/`forward_predictions`, wgpu/cuda/CPU·ONNX 공통 |
+| 4 | 단일슬롯 추론 캐시 | `dl::LruCache` + `XAZZ_INFER_CACHE_SLOTS`(기본 4) |
+| 5 | device/EP 선택 3종 분리 | 통합 `XAZZ_DEVICE` + `parse_device_spec`, 레거시 변수 폴백 |
+
+### 9.2 검증
+
+| 구성 | 명령 | 결과 |
+|---|---|---|
+| default 테스트 | `cargo test -p xazz-exec` | 83 통과 (신규 5종 포함) |
+| wgpu | `cargo clippy -p xazz-exec --features wgpu --all-targets -- -D warnings` | 통과 |
+| cuda | `... --features cuda ...` | 통과 |
+| onnx / onnx-cuda | `... --features onnx` / `onnx-cuda ...` | 통과 |
+| workspace | `cargo clippy --workspace --all-targets -- -D warnings` | 통과 |
+
+추가 단위 테스트: `chunk_ranges` 경계, `LruCache` 승격/퇴출/최소 용량,
+`train_on_device`(CPU 백엔드로 인메모리 핸드오프 경로), `train_unpersisted`
+(체크포인트 미기록), `parse_device_spec` 별칭/오류.
+
+> 한계: 이 WSL은 zig C++ 툴체인이라 wgpu test 바이너리 **링크가 극단적으로
+> 느리고**(수 분+) CUDA/ONNX 실기 링크는 불가하다. 실기 acceptance는 표준
+> 툴체인(Windows/macOS)에서 `-- --ignored`로 실행한다.
+
+### 9.3 사용법 (벤치)
+
+```bash
+# 통합 device 선택 (wgpu: dGPU vs iGPU 비교)
+XAZZ_BACKEND=wgpu XAZZ_DEVICE=dgpu:0 xazz run model.xzz
+XAZZ_BACKEND=wgpu XAZZ_DEVICE=igpu:0 xazz run model.xzz
+
+# CUDA / ONNX EP
+XAZZ_BACKEND=cuda XAZZ_DEVICE=cuda:0 xazz run model.xzz
+XAZZ_BACKEND=onnx XAZZ_DEVICE=cuda:0 xazz run model.xzz
+
+# 청크/캐시 슬롯 튜닝 (기본 4096행 / 4슬롯)
+XAZZ_INFER_CHUNK=8192 XAZZ_INFER_CACHE_SLOTS=8 xazz run model.xzz
+```
+

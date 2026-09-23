@@ -20,7 +20,7 @@ use burn::{
         conv::{Conv1d, Conv1dConfig},
     },
     optim::{AdamConfig, GradientsParams, Optimizer},
-    record::{FullPrecisionSettings, PrettyJsonFileRecorder},
+    record::{BinBytesRecorder, FullPrecisionSettings, PrettyJsonFileRecorder, Recorder},
     tensor::{
         Device, Tensor, TensorData,
         activation::{relu, sigmoid, softmax, tanh},
@@ -738,6 +738,66 @@ pub fn artifact_key(path: &str) -> ArtifactKey {
     }
 }
 
+/// Inference-cache slot count from `XAZZ_INFER_CACHE_SLOTS` (default 4).
+///
+/// A single slot thrashes when a workload alternates between models; a small
+/// bounded LRU keeps the most recently used inference modules resident while
+/// never growing without bound. Set to `1` to reproduce the old single-slot
+/// behaviour, or higher for model-round-robin workloads.
+pub fn infer_cache_slots() -> usize {
+    std::env::var("XAZZ_INFER_CACHE_SLOTS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(4)
+}
+
+/// Bounded least-recently-used cache for backend inference artifacts (issue
+/// D1/D2). The most recently used entry is kept at index 0.
+pub struct LruCache<K, V> {
+    capacity: usize,
+    entries: Vec<(K, V)>,
+}
+
+impl<K: PartialEq, V> LruCache<K, V> {
+    /// Creates a cache holding at most `capacity` entries (minimum 1).
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            capacity: capacity.max(1),
+            entries: Vec::new(),
+        }
+    }
+
+    /// Returns the value for `key`, promoting it to most-recently-used, loading
+    /// and inserting it via `load` on a miss.
+    pub fn get_or_insert_with(
+        &mut self,
+        key: K,
+        load: impl FnOnce() -> Result<V, String>,
+    ) -> Result<&mut V, String> {
+        match self.entries.iter().position(|(k, _)| *k == key) {
+            Some(pos) => {
+                if pos != 0 {
+                    let entry = self.entries.remove(pos);
+                    self.entries.insert(0, entry);
+                }
+            }
+            None => {
+                let value = load()?;
+                self.entries.insert(0, (key, value));
+                self.entries.truncate(self.capacity);
+            }
+        }
+        Ok(&mut self.entries[0].1)
+    }
+
+    /// Number of resident entries (test-only helper).
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
 /// Reads and validates the sidecar manifest for a checkpoint.
 ///
 /// Returns `Ok(None)` when the manifest is absent — a legacy checkpoint written
@@ -840,8 +900,30 @@ pub fn train(
     layers: &[LayerKind],
     config: &TrainConfig,
 ) -> Result<TrainedModel, String> {
+    train_cpu(df, model_name, layers, config, true)
+}
+
+/// Like [`train`], but does not persist the checkpoint — used by the sweep grid
+/// so only the winning combination is written (issue D1/D3).
+pub fn train_unpersisted(
+    df: &DataFrame,
+    model_name: &str,
+    layers: &[LayerKind],
+    config: &TrainConfig,
+) -> Result<TrainedModel, String> {
+    train_cpu(df, model_name, layers, config, false)
+}
+
+/// CPU training core shared by [`train`] and [`train_unpersisted`].
+fn train_cpu(
+    df: &DataFrame,
+    model_name: &str,
+    layers: &[LayerKind],
+    config: &TrainConfig,
+    persist: bool,
+) -> Result<TrainedModel, String> {
     let device: Device<NdArray<f32>> = Default::default();
-    let raw = train_impl::<NdArray<f32>>(df, model_name, layers, config, &device)?;
+    let raw = train_impl::<NdArray<f32>>(df, model_name, layers, config, &device, persist)?;
     Ok(TrainedModel {
         model: raw.model,
         report: raw.report,
@@ -877,8 +959,9 @@ where
 ///
 /// GPU providers whose default device is the CPU (e.g. `burn-tch`'s
 /// `LibTorchDevice::default()` is `Cpu`) pass their device here so training runs
-/// on the intended accelerator. The returned artifact is still the portable CPU
-/// [`TrainedModel`] (round-tripped through the backend-neutral record format).
+/// on the intended accelerator. The returned artifact is the portable CPU
+/// [`TrainedModel`], transferred from the device **in memory** (issue D1/D2), so
+/// no checkpoint save→load disk round-trip is added to training time.
 pub fn train_on_device<B>(
     df: &DataFrame,
     model_name: &str,
@@ -892,37 +975,108 @@ where
     Autodiff<B>: BackendTypes<Device = Device<B>>,
     Mlp<Autodiff<B>>: AutodiffModule<Autodiff<B>, InnerModule = Mlp<B>>,
 {
-    let raw = train_impl::<B>(df, model_name, layers, config, device)?;
+    train_on_device_with(df, model_name, layers, config, device, true)
+}
+
+/// Like [`train_on_device`], but does not persist the checkpoint — used by the
+/// sweep grid so only the winning combination is written (issue D1/D3).
+pub fn train_on_device_unpersisted<B>(
+    df: &DataFrame,
+    model_name: &str,
+    layers: &[LayerKind],
+    config: &TrainConfig,
+    device: &Device<B>,
+) -> Result<TrainedModel, String>
+where
+    B: Backend,
+    Autodiff<B>: AutodiffBackend,
+    Autodiff<B>: BackendTypes<Device = Device<B>>,
+    Mlp<Autodiff<B>>: AutodiffModule<Autodiff<B>, InnerModule = Mlp<B>>,
+{
+    train_on_device_with(df, model_name, layers, config, device, false)
+}
+
+/// Shared device-training core: train on `device`, then materialise the portable
+/// CPU artifact in memory. `persist` controls the on-disk checkpoint write.
+fn train_on_device_with<B>(
+    df: &DataFrame,
+    model_name: &str,
+    layers: &[LayerKind],
+    config: &TrainConfig,
+    device: &Device<B>,
+    persist: bool,
+) -> Result<TrainedModel, String>
+where
+    B: Backend,
+    Autodiff<B>: AutodiffBackend,
+    Autodiff<B>: BackendTypes<Device = Device<B>>,
+    Mlp<Autodiff<B>>: AutodiffModule<Autodiff<B>, InnerModule = Mlp<B>>,
+{
+    let raw = train_impl::<B>(df, model_name, layers, config, device, persist)?;
+    materialize_cpu_model(raw, layers)
+}
+
+/// Transfers a device-trained `Mlp<B>` to the portable CPU artifact **in
+/// memory** via Burn's bincode byte recorder, instead of reloading the
+/// pretty-JSON checkpoint from disk (issue D1/D2). The on-disk checkpoint, when
+/// written, stays the pretty-JSON format consumed by `predict`.
+fn materialize_cpu_model<B: Backend>(
+    raw: RawTrained<B>,
+    layers: &[LayerKind],
+) -> Result<TrainedModel, String> {
+    let RawTrained {
+        model,
+        report,
+        feature_names,
+        fmean,
+        fstd,
+        target,
+    } = raw;
+    let recorder = BinBytesRecorder::<FullPrecisionSettings>::default();
+    let bytes = recorder.record(model.into_record(), ()).map_err(|e| {
+        format!(
+            "{}: {e}",
+            tr("checkpoint transfer failed", "체크포인트 전송 실패")
+        )
+    })?;
     let device: Device<NdArray<f32>> = Default::default();
-    let template = build_mlp::<NdArray<f32>>(layers, raw.report.input_dim, &device)?;
-    let recorder = PrettyJsonFileRecorder::<FullPrecisionSettings>::new();
-    let mut model = template
-        .load_file(raw.report.checkpoint_path.as_str(), &recorder, &device)
-        .map_err(|e| {
+    let record: <Mlp<NdArray<f32>> as Module<NdArray<f32>>>::Record =
+        recorder.load(bytes, &device).map_err(|e| {
             format!(
                 "{}: {e}",
-                tr("checkpoint load failed", "체크포인트 로드 실패")
+                tr(
+                    "checkpoint transfer load failed",
+                    "체크포인트 전송 로드 실패"
+                )
             )
         })?;
+    let template = build_mlp::<NdArray<f32>>(layers, report.input_dim, &device)?;
+    let mut model = template.load_record(record);
     model.training = false;
     Ok(TrainedModel {
         model,
-        report: raw.report,
+        report,
         layers: layers.to_vec(),
-        feature_names: raw.feature_names,
-        fmean: raw.fmean,
-        fstd: raw.fstd,
-        target: raw.target,
+        feature_names,
+        fmean,
+        fstd,
+        target,
     })
 }
 
 /// Backend-agnostic training core: trains `Mlp<B>` and returns its report and stats.
+///
+/// `persist` controls whether the checkpoint (Burn record) and its sidecar
+/// manifest are written to disk. The sweep grid passes `false` for every
+/// combination and materialises only the winner, so a GPU provider does not pay
+/// a checkpoint save per combination (issue D1/D3).
 fn train_impl<B>(
     df: &DataFrame,
     model_name: &str,
     layers: &[LayerKind],
     config: &TrainConfig,
     device: &Device<B>,
+    persist: bool,
 ) -> Result<RawTrained<B>, String>
 where
     B: Backend,
@@ -1217,16 +1371,18 @@ where
         )
     })?;
     let ckpt = format!("{ckpt_dir}/{model_name}");
-    let recorder = PrettyJsonFileRecorder::<FullPrecisionSettings>::new();
-    valid_model
-        .clone()
-        .save_file(&ckpt, &recorder)
-        .map_err(|e| {
-            format!(
-                "{}: {e}",
-                tr("checkpoint save failed", "체크포인트 저장 실패")
-            )
-        })?;
+    if persist {
+        let recorder = PrettyJsonFileRecorder::<FullPrecisionSettings>::new();
+        valid_model
+            .clone()
+            .save_file(&ckpt, &recorder)
+            .map_err(|e| {
+                format!(
+                    "{}: {e}",
+                    tr("checkpoint save failed", "체크포인트 저장 실패")
+                )
+            })?;
+    }
 
     let report = TrainReport {
         model_name: model_name.to_string(),
@@ -1253,9 +1409,12 @@ where
     };
 
     // Versioned sidecar manifest (D3) — written next to the Burn record so a
-    // later load can validate format compatibility and model shape.
-    let manifest = CheckpointManifest::from_report(&report, layers);
-    save_checkpoint_manifest(&report.checkpoint_path, &manifest)?;
+    // later load can validate format compatibility and model shape. Skipped for
+    // unpersisted sweep combinations; the winner is written once by `sweep`.
+    if persist {
+        let manifest = CheckpointManifest::from_report(&report, layers);
+        save_checkpoint_manifest(&report.checkpoint_path, &manifest)?;
+    }
 
     Ok(RawTrained {
         model: valid_model,
@@ -1341,6 +1500,65 @@ fn attach_prediction(
     Ok(out)
 }
 
+/// Default number of rows per inference chunk.
+///
+/// Uploading `[n, feature_count]` in one tensor can exhaust device memory (or
+/// stall on a single large transfer) for big frames. Chunking bounds the peak
+/// device footprint without changing the result. Override with
+/// `XAZZ_INFER_CHUNK` (0 = upload everything at once).
+const DEFAULT_INFER_CHUNK: usize = 4096;
+
+/// Rows per inference chunk from `XAZZ_INFER_CHUNK` (default
+/// [`DEFAULT_INFER_CHUNK`]; `0` disables chunking).
+pub(crate) fn infer_chunk_size() -> usize {
+    std::env::var("XAZZ_INFER_CHUNK")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(DEFAULT_INFER_CHUNK)
+}
+
+/// Splits `n` rows into `[start, end)` ranges of at most `chunk` rows. A `chunk`
+/// of 0 yields a single range covering all rows.
+pub(crate) fn chunk_ranges(n: usize, chunk: usize) -> Vec<(usize, usize)> {
+    if n == 0 {
+        return Vec::new();
+    }
+    let step = if chunk == 0 { n } else { chunk };
+    let mut ranges = Vec::new();
+    let mut start = 0;
+    while start < n {
+        let end = (start + step).min(n);
+        ranges.push((start, end));
+        start = end;
+    }
+    ranges
+}
+
+/// Runs the forward pass over `xs` (row-major `[n, feature_count]`) in chunks and
+/// returns every prediction in input order.
+fn forward_predictions<B: Backend>(
+    model: &Mlp<B>,
+    xs: &[f32],
+    n: usize,
+    feature_count: usize,
+    device: &Device<B>,
+) -> Vec<f32> {
+    let mut preds = Vec::with_capacity(n);
+    for (start, end) in chunk_ranges(n, infer_chunk_size()) {
+        let rows = end - start;
+        let slice = xs[start * feature_count..end * feature_count].to_vec();
+        let x = Tensor::<B, 2>::from_data(TensorData::new(slice, [rows, feature_count]), device);
+        preds.extend(
+            model
+                .forward(x)
+                .into_data()
+                .to_vec::<f32>()
+                .unwrap_or_default(),
+        );
+    }
+    preds
+}
+
 /// `dataset |> predict(model_var, as: "col")` — adds a prediction column using the trained model.
 ///
 /// Default prediction column name: `<target>_pred`. Runs on the CPU reference
@@ -1353,11 +1571,9 @@ pub fn predict(
     let (xs, n, feature_count) = prepare_inference_input(trained, df)?;
 
     let device: Device<Plain> = Default::default();
-    let x = Tensor::<Plain, 2>::from_data(TensorData::new(xs, [n, feature_count]), &device);
     let mut infer_model = trained.model.clone();
     infer_model.training = false;
-    let pred_t = infer_model.forward(x);
-    let preds = pred_t.into_data().to_vec::<f32>().unwrap_or_default();
+    let preds = forward_predictions(&infer_model, &xs, n, feature_count, &device);
 
     attach_prediction(trained, df, &preds, as_col)
 }
@@ -1432,9 +1648,7 @@ where
 {
     let (xs, n, feature_count) = prepare_inference_input(trained, df)?;
 
-    let x = Tensor::<B, 2>::from_data(TensorData::new(xs, [n, feature_count]), device);
-    let pred_t = model.forward(x);
-    let preds = pred_t.into_data().to_vec::<f32>().unwrap_or_default();
+    let preds = forward_predictions(model, &xs, n, feature_count, device);
 
     attach_prediction(trained, df, &preds, as_col)
 }
@@ -1471,6 +1685,44 @@ mod tests {
             vocab,
             embed_dim: 2,
         }
+    }
+
+    #[test]
+    fn chunk_ranges_splits_and_handles_edges() {
+        // Exact multiple, remainder, single chunk, and disabled (0).
+        assert_eq!(chunk_ranges(6, 2), vec![(0, 2), (2, 4), (4, 6)]);
+        assert_eq!(chunk_ranges(5, 2), vec![(0, 2), (2, 4), (4, 5)]);
+        assert_eq!(chunk_ranges(3, 10), vec![(0, 3)]);
+        assert_eq!(chunk_ranges(3, 0), vec![(0, 3)]);
+        assert_eq!(chunk_ranges(0, 2), Vec::<(usize, usize)>::new());
+    }
+
+    #[test]
+    fn lru_cache_promotes_and_evicts() {
+        let mut cache: LruCache<u32, String> = LruCache::new(2);
+        assert_eq!(cache.get_or_insert_with(1, || Ok("a".into())).unwrap(), "a");
+        assert_eq!(cache.get_or_insert_with(2, || Ok("b".into())).unwrap(), "b");
+        // Touch 1 so it becomes most-recently-used, then insert 3 → 2 is evicted.
+        assert_eq!(
+            cache.get_or_insert_with(1, || Ok("reload".into())).unwrap(),
+            "a"
+        );
+        assert_eq!(cache.get_or_insert_with(3, || Ok("c".into())).unwrap(), "c");
+        assert_eq!(cache.len(), 2);
+        // 2 was evicted, so its loader runs again.
+        assert_eq!(
+            cache.get_or_insert_with(2, || Ok("b2".into())).unwrap(),
+            "b2"
+        );
+        assert_eq!(cache.len(), 2);
+    }
+
+    #[test]
+    fn lru_cache_minimum_capacity_is_one() {
+        let mut cache: LruCache<u32, u32> = LruCache::new(0);
+        assert_eq!(*cache.get_or_insert_with(1, || Ok(10)).unwrap(), 10);
+        assert_eq!(*cache.get_or_insert_with(2, || Ok(20)).unwrap(), 20);
+        assert_eq!(cache.len(), 1);
     }
 
     #[test]

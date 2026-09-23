@@ -20,7 +20,7 @@ use protobuf::Message;
 use rlx_onnx_proto::onnx;
 use xazz_core::i18n::tr;
 
-use crate::backend::{OrtEpKind, OrtEpSpec, parse_ort_ep_spec};
+use crate::backend::{DeviceSpec, OrtEpKind, OrtEpSpec, parse_device_spec, parse_ort_ep_spec};
 
 use super::{Activation, LayerOp, Plain, TrainedModel};
 
@@ -441,14 +441,41 @@ fn ort_device_index() -> i32 {
         .unwrap_or(0)
 }
 
-/// Resolves the ONNX execution-provider list from `XAZZ_ORT_EP`.
+/// Resolves the ONNX execution-provider list.
 ///
-/// `auto` (default) registers every GPU EP compiled into this build, in
-/// preference order, and degrades silently to the next provider or CPU. An
-/// explicit list (`cpu,cuda,...`) is fail-closed: a requested-but-unavailable EP
-/// errors instead of silently running on CPU, so a GPU benchmark cannot
-/// accidentally measure the CPU provider.
+/// The unified `XAZZ_DEVICE` selector takes precedence (`auto|cpu|cuda[:N]|
+/// tensorrt[:N]|directml[:N]|coreml`), with the legacy `XAZZ_ORT_EP` list as the
+/// fallback. `auto` (default) registers every GPU EP compiled into this build,
+/// in preference order, and degrades silently to the next provider or CPU. An
+/// explicit provider is fail-closed: a requested-but-unavailable EP errors
+/// instead of silently running on CPU, so a GPU benchmark cannot accidentally
+/// measure the CPU provider.
 fn execution_providers() -> Result<Vec<ExecutionProviderDispatch>, String> {
+    if let Ok(raw) = std::env::var("XAZZ_DEVICE") {
+        let spec = parse_device_spec(&raw).ok_or_else(|| {
+            format!(
+                "unknown XAZZ_DEVICE '{raw}' (use auto|cpu|cuda[:N]|tensorrt[:N]|directml[:N]|coreml)"
+            )
+        })?;
+        return match spec {
+            DeviceSpec::Auto => Ok(auto_providers(0)),
+            DeviceSpec::Cpu => Ok(vec![build_ep(OrtEpKind::Cpu, 0)?.error_on_failure()]),
+            DeviceSpec::Cuda(i) => Ok(vec![
+                build_ep(OrtEpKind::Cuda, i as i32)?.error_on_failure(),
+            ]),
+            DeviceSpec::TensorRt(i) => Ok(vec![
+                build_ep(OrtEpKind::TensorRt, i as i32)?.error_on_failure(),
+            ]),
+            DeviceSpec::DirectMl(i) => Ok(vec![
+                build_ep(OrtEpKind::DirectML, i as i32)?.error_on_failure(),
+            ]),
+            DeviceSpec::CoreMl => Ok(vec![build_ep(OrtEpKind::CoreML, 0)?.error_on_failure()]),
+            _ => Err(format!(
+                "XAZZ_DEVICE '{raw}' is not an ONNX execution provider; \
+                 use auto|cpu|cuda[:N]|tensorrt[:N]|directml[:N]|coreml"
+            )),
+        };
+    }
     let spec = match std::env::var("XAZZ_ORT_EP") {
         Ok(raw) => parse_ort_ep_spec(&raw)?,
         Err(_) => OrtEpSpec::Auto,
@@ -548,7 +575,8 @@ fn coreml_ep() -> Result<ExecutionProviderDispatch, String> {
 
 /// Runs inference through an already-loaded session — no re-export or session
 /// rebuild (issue D2). Preprocessing matches the in-memory CPU predict, so the
-/// two are numerically comparable.
+/// two are numerically comparable. Rows are uploaded in chunks (see
+/// `XAZZ_INFER_CHUNK`) to bound peak memory on large frames.
 pub fn predict_with_session(
     trained: &TrainedModel,
     session: &mut ort::session::Session,
@@ -557,16 +585,21 @@ pub fn predict_with_session(
 ) -> Result<DataFrame, String> {
     let (xs, n, feature_count) = super::prepare_inference_input(trained, df)?;
 
-    let input = ort::value::Tensor::from_array((vec![n as i64, feature_count as i64], xs))
-        .map_err(onnx_err)?;
-
-    let outputs = session
-        .run(ort::inputs!["input" => input])
-        .map_err(onnx_err)?;
-    let (_shape, data) = outputs["output"]
-        .try_extract_tensor::<f32>()
-        .map_err(onnx_err)?;
-    let preds: Vec<f32> = data.to_vec();
+    let mut preds: Vec<f32> = Vec::with_capacity(n);
+    for (start, end) in super::chunk_ranges(n, super::infer_chunk_size()) {
+        let rows = end - start;
+        let slice = xs[start * feature_count..end * feature_count].to_vec();
+        let input =
+            ort::value::Tensor::from_array((vec![rows as i64, feature_count as i64], slice))
+                .map_err(onnx_err)?;
+        let outputs = session
+            .run(ort::inputs!["input" => input])
+            .map_err(onnx_err)?;
+        let (_shape, data) = outputs["output"]
+            .try_extract_tensor::<f32>()
+            .map_err(onnx_err)?;
+        preds.extend_from_slice(data);
+    }
 
     super::attach_prediction(trained, df, &preds, as_col)
 }

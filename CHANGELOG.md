@@ -9,6 +9,34 @@ Versioning: [Semantic Versioning](https://semver.org/)
 
 ## [Unreleased]
 
+### Performance — GPU/ONNX 벤치 측정 왜곡 제거 (NEXT #74/#75/#86)
+
+- **GPU→CPU 인메모리 핸드오프 (D1/D2)** — `train_on_device`가 학습 후 CPU
+  아티팩트를 만들 때 pretty-JSON 체크포인트를 **디스크에서 다시 읽던** 경로를
+  Burn `BinBytesRecorder`(bincode) 기반 인메모리 전송(`materialize_cpu_model`)으로
+  교체했다. 디스크 체크포인트는 기존 pretty-JSON 형식을 유지해 `predict`/emit
+  호환을 보존한다. 학습 시간에 save→load 왕복이 더 이상 섞이지 않는다
+- **스윕 우승자만 저장 (D1/D3)** — trait `ComputeBackend::train_unpersisted`
+  (기본 구현은 `train`)와 `dl::train_unpersisted`/`train_on_device_unpersisted`,
+  `train_impl(persist:)`를 추가했다. 스윕 그리드는 조합마다 unpersisted 학습을
+  쓰고 **우승 조합만** 체크포인트·매니페스트를 쓴다(조합마다 저장/왕복 제거).
+  ONNX도 조합별 export를 하지 않고 우승 아티팩트를 `ensure_export`로 지연 export
+- **추론 chunking (D1/D2)** — `XAZZ_INFER_CHUNK`(기본 4096, `0`=비활성)와
+  `chunk_ranges`/`forward_predictions`로 `[n, feature_count]`를 행 단위 청크로
+  업로드한다. wgpu/cuda/CPU와 ONNX `predict_with_session`에 공통 적용해 대량 n의
+  VRAM OOM·전송 병목을 막는다(결과 불변)
+- **추론 캐시 LRU (D1/D2)** — 단일슬롯 캐시를 `dl::LruCache`(MRU 승격 + LRU 퇴출)로
+  일반화하고 `XAZZ_INFER_CACHE_SLOTS`(기본 4)로 크기를 정한다. 모델을 교대 예측하는
+  워크로드에서 재로드를 줄이며 무한 성장하지 않는다. wgpu/cuda 모듈·ONNX 세션에 적용
+- **device/EP 선택 통합 (D1/D2)** — 통합 `XAZZ_DEVICE`
+  (`auto|cpu|dgpu[:N]|igpu[:N]|vgpu[:N]|cuda[:N]|tensorrt[:N]|directml[:N]|coreml`)와
+  `parse_device_spec`를 추가해 wgpu 어댑터·CUDA 인덱스·ONNX EP를 한 문법으로
+  선택한다. 기존 `XAZZ_WGPU_DEVICE`/`XAZZ_CUDA_DEVICE`/`XAZZ_ORT_EP`는 폴백으로 유지
+- 검증: default `cargo test -p xazz-exec` 83 통과(신규 인메모리 핸드오프·unpersisted·
+  chunk 범위·LRU·device 파서 테스트 포함). `cargo clippy -p xazz-exec`가
+  default/`wgpu`/`cuda`/`onnx`/`onnx-cuda` 및 `--workspace --all-targets -- -D warnings`
+  전 조합 통과
+
 ### Added — C2 정책 이력 정기 만료 스윕
 
 - **유휴 테넌트 만료 행 물리 삭제** — 기존에는 정책 팩 변경(write) 트랜잭션에서만

@@ -63,6 +63,22 @@ pub trait ComputeBackend: Send + Sync {
         as_col: Option<&str>,
     ) -> Result<DataFrame, String>;
 
+    /// Like [`Self::train`], but does not persist the checkpoint.
+    ///
+    /// The sweep grid evaluates every combination through this method and only
+    /// the winner is materialised/saved, so a GPU provider avoids a checkpoint
+    /// save (and its device→CPU cost) per combination (issue D1/D3). Defaults to
+    /// [`Self::train`] for providers that do not separate the two.
+    fn train_unpersisted(
+        &self,
+        df: &DataFrame,
+        model_name: &str,
+        layers: &[LayerKind],
+        config: &TrainConfig,
+    ) -> Result<TrainedModel, String> {
+        self.train(df, model_name, layers, config)
+    }
+
     /// `dataset |> train(model, ..)` over a hyperparameter grid (D3).
     ///
     /// The default implementation evaluates every combination via [`Self::train`]
@@ -81,7 +97,9 @@ pub trait ComputeBackend: Send + Sync {
         let mut entries: Vec<SweepCombo> = Vec::with_capacity(combos.len());
 
         for (index, combo) in combos.iter().enumerate() {
-            let trained = self.train(df, model_name, layers, combo)?;
+            // Unpersisted: only the winner below is materialised/saved, so a GPU
+            // provider does not write a checkpoint per combination (issue D1/D3).
+            let trained = self.train_unpersisted(df, model_name, layers, combo)?;
             let report = &trained.report;
             let entry = SweepCombo {
                 epochs: report.epochs,
@@ -202,6 +220,16 @@ impl ComputeBackend for CpuBackend {
     ) -> Result<DataFrame, String> {
         crate::dl::predict(trained, df, as_col)
     }
+
+    fn train_unpersisted(
+        &self,
+        df: &DataFrame,
+        model_name: &str,
+        layers: &[LayerKind],
+        config: &TrainConfig,
+    ) -> Result<TrainedModel, String> {
+        crate::dl::train_unpersisted(df, model_name, layers, config)
+    }
 }
 
 /// The set of selectable providers.
@@ -318,6 +346,75 @@ pub fn parse_wgpu_device(raw: &str) -> Option<WgpuDeviceSpec> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Unified accelerator selector (issue D1/D2)
+//
+// `XAZZ_DEVICE` covers the WebGPU adapter, the CUDA device index, and the ONNX
+// execution provider in one grammar, so the three GPU providers share a single
+// interface. The per-provider variables (`XAZZ_WGPU_DEVICE`, `XAZZ_CUDA_DEVICE`,
+// `XAZZ_ORT_EP`) remain as fallbacks. Parsed into a backend-independent spec so
+// the grammar is unit-testable without compiling any GPU backend.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A unified accelerator selector parsed from `XAZZ_DEVICE`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceSpec {
+    /// Highest-power/first adapter (cubecl default).
+    Auto,
+    /// Software/CPU adapter or ONNX CPU execution provider.
+    Cpu,
+    /// The `n`-th discrete GPU (WebGPU adapter).
+    Discrete(usize),
+    /// The `n`-th integrated GPU (WebGPU adapter).
+    Integrated(usize),
+    /// The `n`-th virtual GPU (WebGPU adapter).
+    Virtual(usize),
+    /// CUDA device `n` (burn-tch device / ONNX CUDA EP).
+    Cuda(usize),
+    /// TensorRT device `n` (ONNX EP).
+    TensorRt(usize),
+    /// DirectML device `n` (ONNX EP).
+    DirectMl(usize),
+    /// CoreML (ONNX EP).
+    CoreMl,
+}
+
+/// Parses an `XAZZ_DEVICE` value.
+///
+/// Accepted forms (case-insensitive): `auto`/`default`/empty, `cpu`, `coreml`,
+/// `dgpu[:N]`/`discrete[:N]`, `igpu[:N]`/`integrated[:N]`,
+/// `vgpu[:N]`/`virtual[:N]`, `cuda[:N]`, `tensorrt[:N]`/`trt[:N]`,
+/// `directml[:N]`/`dml[:N]`, and the `DiscreteGpu(N)` spelling. `N` defaults to
+/// 0. Returns `None` for an unrecognised value.
+pub fn parse_device_spec(raw: &str) -> Option<DeviceSpec> {
+    let lower = raw.trim().to_ascii_lowercase();
+    match lower.as_str() {
+        "" | "auto" | "default" => return Some(DeviceSpec::Auto),
+        "cpu" => return Some(DeviceSpec::Cpu),
+        "coreml" => return Some(DeviceSpec::CoreMl),
+        _ => {}
+    }
+
+    // Split an optional index suffix: `name:2`, `name(2)`, or bare `name`.
+    let (name, index) = match lower.split_once(':').or_else(|| lower.split_once('(')) {
+        Some((name, rest)) => {
+            let digits = rest.trim_end_matches(')').trim();
+            (name, digits.parse::<usize>().ok()?)
+        }
+        None => (lower.as_str(), 0),
+    };
+
+    match name {
+        "dgpu" | "discrete" | "discretegpu" => Some(DeviceSpec::Discrete(index)),
+        "igpu" | "integrated" | "integratedgpu" => Some(DeviceSpec::Integrated(index)),
+        "vgpu" | "virtual" | "virtualgpu" => Some(DeviceSpec::Virtual(index)),
+        "cuda" => Some(DeviceSpec::Cuda(index)),
+        "tensorrt" | "trt" => Some(DeviceSpec::TensorRt(index)),
+        "directml" | "dml" => Some(DeviceSpec::DirectMl(index)),
+        _ => None,
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // ONNX execution-provider selection (issue D2 #63, ONNX GPU)
 //
 // `XAZZ_ORT_EP` picks the ONNX Runtime execution providers. Parsed into a
@@ -412,19 +509,40 @@ mod cuda {
     /// the portable checkpoint round-trips back to CPU for storage.
     ///
     /// The device is resolved once at construction (fail-closed when absent), and
-    /// the most recently loaded inference module is cached by checkpoint identity
-    /// so repeated `predict` calls skip the JSON reload (issue D1).
+    /// loaded inference modules are kept in a small LRU keyed by checkpoint
+    /// identity, so repeated `predict` calls skip the JSON reload (issue D1).
     pub struct CudaBackend {
         device: LibTorchDevice,
-        cache: Mutex<Option<(crate::dl::ArtifactKey, Mlp<LibTorch<f32>>)>>,
+        cache: Mutex<crate::dl::LruCache<crate::dl::ArtifactKey, Mlp<LibTorch<f32>>>>,
     }
 
-    /// Resolves the CUDA device index from `XAZZ_CUDA_DEVICE` (default `0`).
-    fn device_index() -> usize {
-        std::env::var("XAZZ_CUDA_DEVICE")
+    /// Resolves the CUDA device index.
+    ///
+    /// The unified `XAZZ_DEVICE` selector takes precedence (`auto`/`cuda[:N]`),
+    /// falling back to the legacy `XAZZ_CUDA_DEVICE` (default `0`).
+    fn device_index() -> Result<usize, String> {
+        if let Ok(raw) = std::env::var("XAZZ_DEVICE") {
+            let spec = parse_device_spec(&raw).ok_or_else(|| {
+                tr(
+                    "unknown XAZZ_DEVICE value; CUDA accepts auto|cuda[:N]",
+                    "알 수 없는 XAZZ_DEVICE 값입니다. CUDA는 auto|cuda[:N] 을 받습니다",
+                )
+                .to_string()
+            })?;
+            return match spec {
+                DeviceSpec::Auto => Ok(0),
+                DeviceSpec::Cuda(i) => Ok(i),
+                _ => Err(tr(
+                    "XAZZ_DEVICE is not a CUDA selector; use auto|cuda[:N]",
+                    "XAZZ_DEVICE가 CUDA 선택자가 아닙니다. auto|cuda[:N] 을 사용하세요",
+                )
+                .to_string()),
+            };
+        }
+        Ok(std::env::var("XAZZ_CUDA_DEVICE")
             .ok()
             .and_then(|v| v.trim().parse().ok())
-            .unwrap_or(0)
+            .unwrap_or(0))
     }
 
     /// Builds the LibTorch CUDA device, failing closed with a clear message when
@@ -439,7 +557,7 @@ mod cuda {
             )
             .into());
         }
-        let index = device_index();
+        let index = device_index()?;
         let count = tch::Cuda::device_count();
         if count > 0 && index as i64 >= count {
             return Err(format!(
@@ -459,7 +577,7 @@ mod cuda {
         pub fn new() -> Result<Self, String> {
             Ok(Self {
                 device: device()?,
-                cache: Mutex::new(None),
+                cache: Mutex::new(crate::dl::LruCache::new(crate::dl::infer_cache_slots())),
             })
         }
 
@@ -476,13 +594,9 @@ mod cuda {
                 .cache
                 .lock()
                 .map_err(|_| "CUDA inference cache poisoned".to_string())?;
-            let stale = !matches!(guard.as_ref(), Some((k, _)) if *k == key);
-            if stale {
-                let model =
-                    crate::dl::load_inference_model::<LibTorch<f32>>(trained, &self.device)?;
-                *guard = Some((key, model));
-            }
-            let (_, model) = guard.as_ref().expect("cache populated above");
+            let model = guard.get_or_insert_with(key, || {
+                crate::dl::load_inference_model::<LibTorch<f32>>(trained, &self.device)
+            })?;
             crate::dl::predict_with_model::<LibTorch<f32>>(trained, model, &self.device, df, as_col)
         }
     }
@@ -500,6 +614,22 @@ mod cuda {
             config: &TrainConfig,
         ) -> Result<TrainedModel, String> {
             crate::dl::train_on_device::<LibTorch<f32>>(
+                df,
+                model_name,
+                layers,
+                config,
+                &self.device,
+            )
+        }
+
+        fn train_unpersisted(
+            &self,
+            df: &DataFrame,
+            model_name: &str,
+            layers: &[LayerKind],
+            config: &TrainConfig,
+        ) -> Result<TrainedModel, String> {
+            crate::dl::train_on_device_unpersisted::<LibTorch<f32>>(
                 df,
                 model_name,
                 layers,
@@ -530,13 +660,13 @@ mod wgpu {
     /// WebGPU provider (`burn-wgpu`). Trains and predicts on a Vulkan/Metal/DX12
     /// device; the portable checkpoint round-trips back to CPU for storage.
     ///
-    /// The device is selected from `XAZZ_WGPU_DEVICE` and probed once at
-    /// construction (issue D1 #75: fall back to CPU when no adapter exists), and
-    /// the most recently loaded inference module is cached by checkpoint identity
-    /// so repeated `predict` calls skip the JSON reload (issue D1).
+    /// The device is selected from `XAZZ_DEVICE`/`XAZZ_WGPU_DEVICE` and probed
+    /// once at construction (issue D1 #75: fall back to CPU when no adapter
+    /// exists), and loaded inference modules are kept in a small LRU keyed by
+    /// checkpoint identity (issue D1).
     pub struct WgpuBackend {
         device: WgpuDevice,
-        cache: Mutex<Option<(crate::dl::ArtifactKey, Mlp<Wgpu<f32>>)>>,
+        cache: Mutex<crate::dl::LruCache<crate::dl::ArtifactKey, Mlp<Wgpu<f32>>>>,
     }
 
     /// Maps the parsed spec to a cubecl `WgpuDevice`.
@@ -550,10 +680,31 @@ mod wgpu {
         }
     }
 
-    /// Resolves the device from `XAZZ_WGPU_DEVICE` (default: cubecl's
-    /// `DefaultDevice`). An unrecognised value fails closed rather than silently
-    /// picking an adapter.
+    /// Resolves the adapter from the unified `XAZZ_DEVICE` selector first, then
+    /// the legacy `XAZZ_WGPU_DEVICE` (default: cubecl's `DefaultDevice`). An
+    /// unrecognised value fails closed rather than silently picking an adapter.
     fn device_from_env() -> Result<WgpuDevice, String> {
+        if let Ok(raw) = std::env::var("XAZZ_DEVICE") {
+            let spec = parse_device_spec(&raw).ok_or_else(|| {
+                tr(
+                    "unknown XAZZ_DEVICE value; wgpu accepts auto|cpu|dgpu[:N]|igpu[:N]|vgpu[:N]",
+                    "알 수 없는 XAZZ_DEVICE 값입니다. wgpu는 auto|cpu|dgpu[:N]|igpu[:N]|vgpu[:N] 을 받습니다",
+                )
+                .to_string()
+            })?;
+            return match spec {
+                DeviceSpec::Auto => Ok(WgpuDevice::DefaultDevice),
+                DeviceSpec::Cpu => Ok(WgpuDevice::Cpu),
+                DeviceSpec::Discrete(i) => Ok(WgpuDevice::DiscreteGpu(i)),
+                DeviceSpec::Integrated(i) => Ok(WgpuDevice::IntegratedGpu(i)),
+                DeviceSpec::Virtual(i) => Ok(WgpuDevice::VirtualGpu(i)),
+                _ => Err(tr(
+                    "XAZZ_DEVICE is not a WebGPU selector; use auto|cpu|dgpu[:N]|igpu[:N]|vgpu[:N]",
+                    "XAZZ_DEVICE가 WebGPU 선택자가 아닙니다. auto|cpu|dgpu[:N]|igpu[:N]|vgpu[:N] 을 사용하세요",
+                )
+                .to_string()),
+            };
+        }
         match std::env::var("XAZZ_WGPU_DEVICE") {
             Ok(raw) => parse_wgpu_device(&raw).map(to_device).ok_or_else(|| {
                 tr(
@@ -600,7 +751,7 @@ mod wgpu {
             probe_device(&device)?;
             Ok(Self {
                 device,
-                cache: Mutex::new(None),
+                cache: Mutex::new(crate::dl::LruCache::new(crate::dl::infer_cache_slots())),
             })
         }
 
@@ -617,12 +768,9 @@ mod wgpu {
                 .cache
                 .lock()
                 .map_err(|_| "wgpu inference cache poisoned".to_string())?;
-            let stale = !matches!(guard.as_ref(), Some((k, _)) if *k == key);
-            if stale {
-                let model = crate::dl::load_inference_model::<Wgpu<f32>>(trained, &self.device)?;
-                *guard = Some((key, model));
-            }
-            let (_, model) = guard.as_ref().expect("cache populated above");
+            let model = guard.get_or_insert_with(key, || {
+                crate::dl::load_inference_model::<Wgpu<f32>>(trained, &self.device)
+            })?;
             crate::dl::predict_with_model::<Wgpu<f32>>(trained, model, &self.device, df, as_col)
         }
     }
@@ -640,6 +788,22 @@ mod wgpu {
             config: &TrainConfig,
         ) -> Result<TrainedModel, String> {
             crate::dl::train_on_device::<Wgpu<f32>>(df, model_name, layers, config, &self.device)
+        }
+
+        fn train_unpersisted(
+            &self,
+            df: &DataFrame,
+            model_name: &str,
+            layers: &[LayerKind],
+            config: &TrainConfig,
+        ) -> Result<TrainedModel, String> {
+            crate::dl::train_on_device_unpersisted::<Wgpu<f32>>(
+                df,
+                model_name,
+                layers,
+                config,
+                &self.device,
+            )
         }
 
         fn predict(
@@ -663,10 +827,11 @@ mod onnx {
     /// sibling `.onnx` artifact; `predict` evaluates that graph via ONNX Runtime.
     ///
     /// The exported artifact is reused when it is newer than the checkpoint, and
-    /// the loaded `Session` is cached by artifact identity, so repeated `predict`
-    /// calls neither re-export nor rebuild the session (issue D2).
+    /// loaded `Session`s are kept in a small LRU keyed by artifact identity, so
+    /// repeated `predict` calls neither re-export nor rebuild the session
+    /// (issue D2).
     pub struct OnnxBackend {
-        cache: Mutex<Option<(crate::dl::ArtifactKey, ort::session::Session)>>,
+        cache: Mutex<crate::dl::LruCache<crate::dl::ArtifactKey, ort::session::Session>>,
     }
 
     /// `checkpoints/<name>.json` → `checkpoints/<name>.onnx`.
@@ -679,7 +844,7 @@ mod onnx {
         /// is configured at the environment level.
         pub fn new() -> Self {
             Self {
-                cache: Mutex::new(None),
+                cache: Mutex::new(crate::dl::LruCache::new(crate::dl::infer_cache_slots())),
             }
         }
 
@@ -699,13 +864,10 @@ mod onnx {
                 .cache
                 .lock()
                 .map_err(|_| "ONNX session cache poisoned".to_string())?;
-            let stale = !matches!(guard.as_ref(), Some((k, _)) if *k == key);
-            if stale {
+            let session = guard.get_or_insert_with(key, || {
                 crate::dl::onnx_export::init_runtime();
-                let session = crate::dl::onnx_export::load_session(&path)?;
-                *guard = Some((key, session));
-            }
-            let (_, session) = guard.as_mut().expect("cache populated above");
+                crate::dl::onnx_export::load_session(&path)
+            })?;
             crate::dl::onnx_export::predict_with_session(trained, session, df, as_col)
         }
     }
@@ -728,6 +890,18 @@ mod onnx {
                 &artifact_path(&trained.report.checkpoint_path),
             )?;
             Ok(trained)
+        }
+
+        fn train_unpersisted(
+            &self,
+            df: &DataFrame,
+            model_name: &str,
+            layers: &[LayerKind],
+            config: &TrainConfig,
+        ) -> Result<TrainedModel, String> {
+            // No export here: the sweep grid only exports the winning artifact,
+            // lazily on the first predict via `ensure_export` (issue D2/D3).
+            crate::dl::train_unpersisted(df, model_name, layers, config)
         }
 
         fn predict(
@@ -972,6 +1146,67 @@ mod tests {
         );
         assert_eq!(parse_wgpu_device("quantum"), None);
         assert_eq!(parse_wgpu_device("dgpu:notanumber"), None);
+    }
+
+    #[test]
+    fn parse_device_spec_accepts_aliases_and_rejects_garbage() {
+        assert_eq!(parse_device_spec(""), Some(DeviceSpec::Auto));
+        assert_eq!(parse_device_spec(" default "), Some(DeviceSpec::Auto));
+        assert_eq!(parse_device_spec("cpu"), Some(DeviceSpec::Cpu));
+        assert_eq!(parse_device_spec("coreml"), Some(DeviceSpec::CoreMl));
+        assert_eq!(parse_device_spec("dgpu"), Some(DeviceSpec::Discrete(0)));
+        assert_eq!(
+            parse_device_spec("DiscreteGpu(1)"),
+            Some(DeviceSpec::Discrete(1))
+        );
+        assert_eq!(parse_device_spec("igpu:2"), Some(DeviceSpec::Integrated(2)));
+        assert_eq!(parse_device_spec("vgpu:1"), Some(DeviceSpec::Virtual(1)));
+        assert_eq!(parse_device_spec("cuda"), Some(DeviceSpec::Cuda(0)));
+        assert_eq!(parse_device_spec("cuda:1"), Some(DeviceSpec::Cuda(1)));
+        assert_eq!(parse_device_spec("trt:0"), Some(DeviceSpec::TensorRt(0)));
+        assert_eq!(parse_device_spec("dml:3"), Some(DeviceSpec::DirectMl(3)));
+        assert_eq!(parse_device_spec("quantum"), None);
+        assert_eq!(parse_device_spec("cuda:notanumber"), None);
+    }
+
+    #[test]
+    fn device_train_materializes_in_memory_and_predicts() {
+        use burn::tensor::Device;
+        use burn_ndarray::NdArray;
+
+        let (df, layers, config) = tiny_dataset();
+        let device: Device<NdArray<f32>> = Default::default();
+        let trained = crate::dl::train_on_device::<NdArray<f32>>(
+            &df,
+            "backend_unit_dev",
+            &layers,
+            &config,
+            &device,
+        )
+        .expect("device train (CPU backend exercises the in-memory handoff)");
+        assert!(trained.report.final_train_loss.is_finite());
+
+        let out = crate::dl::predict(&trained, &df, Some("pred")).expect("predict");
+        assert_eq!(out.height(), df.height());
+        assert!(out.column("pred").is_ok());
+
+        cleanup(&trained.report.checkpoint_path);
+    }
+
+    #[test]
+    fn unpersisted_train_writes_no_checkpoint_but_is_usable() {
+        let (df, layers, config) = tiny_dataset();
+        let trained =
+            crate::dl::train_unpersisted(&df, "backend_unit_unpersisted", &layers, &config)
+                .expect("unpersisted train");
+        assert!(
+            !std::path::Path::new(&trained.report.checkpoint_path).exists(),
+            "unpersisted training must not write a checkpoint"
+        );
+        let out = crate::dl::predict(&trained, &df, Some("pred")).expect("predict");
+        assert_eq!(out.height(), df.height());
+
+        cleanup(&trained.report.checkpoint_path);
     }
 
     #[test]
