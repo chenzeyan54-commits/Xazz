@@ -348,3 +348,5 @@ Legend: 🔴 no external dependency | 🟠 depends on an earlier step | 🟢 par
 - README roadmap Phase 5/6 rows remain the public status surface.
 - Each issue carries a `scale:*` label matching its track (`genai:*` for Track F).
 - Update this file and the README table when a milestone's acceptance criteria are met.
+- Community expansion (docs, Discussions, releases, playground) is tracked in
+  [COMMUNITY.md](COMMUNITY.md) as Track G; its issues mirror the steps there.
