@@ -9,6 +9,20 @@ Versioning: [Semantic Versioning](https://semver.org/)
 
 ## [Unreleased]
 
+### Added — D3 스윕 tiebreak 기준 (issue #64)
+
+- **`train(..., tiebreak: "epochs" | "lr" | "batch")`** — 스윕 리포트 정렬에서
+  주 정렬 키(`sort:`)가 동률일 때 먼저 비교할 하이퍼파라미터 축을 지정한다.
+  지정하지 않으면 기존 `sort:`별 결정적 폴백 순서를 유지한다. `metric`은 축이
+  아니므로 파서가 거부한다
+- `TrainConfig.sweep_tiebreak: Option<SweepSort>`(xazz-core AST) + 파서 `tiebreak:`
+  인수(문자열/식별자, 별칭 허용, `metric`/미지원 값은 오류) + `SweepReport.tiebreak`
+  (JSON 노출) + `SweepReport::compare(..., tiebreak)` 폴백 순서 재구성
+- 체커 무그리드 경고에 `tiebreak:` 포함, 정책 프린터 `tiebreak:` 라운드트립 보존,
+  런타임 스윕 표 헤더에 tiebreak 표기
+- 검증: `SweepSort::is_axis`, expand_sweep tiebreak 중립화, 파서 tiebreak/오류 2종,
+  `compare` 명시 tiebreak, CPU 백엔드 tiebreak 전달 E2E
+
 ### Added — ONNX GPU 실행 프로바이더 (D2 #63)
 
 - **EP feature 4종** — `onnx-cuda`(`ort/cuda`), `onnx-tensorrt`(`ort/tensorrt`),

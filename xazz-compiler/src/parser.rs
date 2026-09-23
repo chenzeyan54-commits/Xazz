@@ -507,12 +507,36 @@ impl Parser {
                     }
                     config.sweep_top = Some(n);
                 }
+                "tiebreak" => {
+                    let raw = self.parse_string_or_ident("tiebreak")?;
+                    let axis = SweepSort::parse(&raw).ok_or_else(|| {
+                        CompileError::new(
+                            ErrorKind::UnexpectedToken(raw.clone()),
+                            self.current_span(),
+                            format!(
+                                "알 수 없는 스윕 tiebreak 기준: '{}'. 지원: epochs, lr, batch",
+                                raw
+                            ),
+                        )
+                    })?;
+                    if !axis.is_axis() {
+                        return Err(CompileError::new(
+                            ErrorKind::UnexpectedToken(raw.clone()),
+                            self.current_span(),
+                            format!(
+                                "train() tiebreak은 하이퍼파라미터 축이어야 합니다: '{}'. 지원: epochs, lr, batch",
+                                raw
+                            ),
+                        ));
+                    }
+                    config.sweep_tiebreak = Some(axis);
+                }
                 other => {
                     return Err(CompileError::new(
                         ErrorKind::UnexpectedToken(other.into()),
                         self.current_span(),
                         format!(
-                            "알 수 없는 train() 인수: '{}'. 지원: target, epochs, lr, batch_size, validation_split, patience, metric, sort, top",
+                            "알 수 없는 train() 인수: '{}'. 지원: target, epochs, lr, batch_size, validation_split, patience, metric, sort, tiebreak, top",
                             other
                         ),
                     ));
@@ -2292,12 +2316,13 @@ type AirQuality = {
             model M { Dense(1) }
             v data = load("x.csv") :: S;
             run data |> train(M, target: "y", epochs: [1, 2], sort: "lr");
-            run data |> train(M, target: "y", epochs: [1, 2], sort: batch, top: 3);
+            run data |> train(M, target: "y", epochs: [1, 2], sort: batch, tiebreak: "lr", top: 3);
         "#;
         let program = parse_src(src).expect("파싱 실패");
         match &program.stmts[2] {
             Stmt::TrainStmt { config, .. } => {
                 assert_eq!(config.sweep_sort, SweepSort::Lr);
+                assert_eq!(config.sweep_tiebreak, None);
                 assert_eq!(config.sweep_top, None);
                 assert!(config.sweep_sort_explicit);
             }
@@ -2306,10 +2331,26 @@ type AirQuality = {
         match &program.stmts[3] {
             Stmt::TrainStmt { config, .. } => {
                 assert_eq!(config.sweep_sort, SweepSort::Batch);
+                assert_eq!(config.sweep_tiebreak, Some(SweepSort::Lr));
                 assert_eq!(config.sweep_top, Some(3));
             }
             other => panic!("TrainStmt 예상, 실제: {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_train_tiebreak_must_be_axis() {
+        let src = r#"
+            model M { Dense(1) }
+            v data = load("x.csv") :: S;
+            run data |> train(M, target: "y", epochs: [1, 2], tiebreak: "metric");
+        "#;
+        let err = parse_src(src).expect_err("tiebreak: metric은 에러여야 함");
+        assert!(
+            err.message.contains("tiebreak"),
+            "오류 안내가 없음: {}",
+            err.message
+        );
     }
 
     #[test]
@@ -2326,6 +2367,7 @@ type AirQuality = {
                 assert!(!config.sweep_metric_explicit);
                 assert_eq!(config.sweep_sort, SweepSort::default());
                 assert!(!config.sweep_sort_explicit);
+                assert_eq!(config.sweep_tiebreak, None);
             }
             other => panic!("TrainStmt 예상, 실제: {:?}", other),
         }

@@ -513,6 +513,10 @@ pub struct SweepReport {
     /// Ordering of the reported combinations (D3). Defaults to metric.
     #[serde(default)]
     pub sort: SweepSort,
+    /// Tiebreak axis after the primary `sort:` key (D3). `None` uses the
+    /// per-sort canonical fallback.
+    #[serde(default)]
+    pub tiebreak: Option<SweepSort>,
     /// When set, only this many best-by-metric combinations are reported (D3).
     #[serde(default)]
     pub top: Option<usize>,
@@ -551,37 +555,51 @@ impl SweepReport {
     ///
     /// `Metric` sorts best-first (ascending [`Self::score`]); the axis variants
     /// sort ascending by that hyperparameter. Ties fall back to the remaining
-    /// axes so the order is deterministic.
+    /// axes so the order is deterministic. `tiebreak` (an axis) is compared before
+    /// the canonical remaining axes; `None` keeps the per-sort canonical fallback.
     pub fn compare(
         a: &SweepCombo,
         b: &SweepCombo,
         sort: SweepSort,
         metric: SweepMetric,
+        tiebreak: Option<SweepSort>,
     ) -> Ordering {
-        let by_lr = |a: &SweepCombo, b: &SweepCombo| {
-            a.learning_rate
+        let axis = |ax: SweepSort, a: &SweepCombo, b: &SweepCombo| match ax {
+            SweepSort::Epochs => a.epochs.cmp(&b.epochs),
+            SweepSort::Lr => a
+                .learning_rate
                 .partial_cmp(&b.learning_rate)
-                .unwrap_or(Ordering::Equal)
+                .unwrap_or(Ordering::Equal),
+            SweepSort::Batch => a.batch_size.cmp(&b.batch_size),
+            SweepSort::Metric => Ordering::Equal,
         };
-        let by_epochs = |a: &SweepCombo, b: &SweepCombo| a.epochs.cmp(&b.epochs);
-        let by_batch = |a: &SweepCombo, b: &SweepCombo| a.batch_size.cmp(&b.batch_size);
-        match sort {
+        let primary = match sort {
             SweepSort::Metric => Self::score(a, metric)
                 .partial_cmp(&Self::score(b, metric))
-                .unwrap_or(Ordering::Equal)
-                .then_with(|| by_epochs(a, b))
-                .then_with(|| by_lr(a, b))
-                .then_with(|| by_batch(a, b)),
-            SweepSort::Epochs => by_epochs(a, b)
-                .then_with(|| by_lr(a, b))
-                .then_with(|| by_batch(a, b)),
-            SweepSort::Lr => by_lr(a, b)
-                .then_with(|| by_epochs(a, b))
-                .then_with(|| by_batch(a, b)),
-            SweepSort::Batch => by_batch(a, b)
-                .then_with(|| by_epochs(a, b))
-                .then_with(|| by_lr(a, b)),
+                .unwrap_or(Ordering::Equal),
+            axis_sort => axis(axis_sort, a, b),
+        };
+
+        // The explicit tiebreak axis (if any) is tried first, then the remaining
+        // axes in canonical order — excluding the primary sort axis and the
+        // tiebreak axis so each axis is compared at most once.
+        let mut fallback: Vec<SweepSort> = Vec::with_capacity(3);
+        if let Some(t) = tiebreak
+            && t != sort
+        {
+            fallback.push(t);
         }
+        for ax in [SweepSort::Epochs, SweepSort::Lr, SweepSort::Batch] {
+            if ax != sort && Some(ax) != tiebreak {
+                fallback.push(ax);
+            }
+        }
+
+        let mut ord = primary;
+        for ax in fallback {
+            ord = ord.then_with(|| axis(ax, a, b));
+        }
+        ord
     }
 }
 
@@ -1547,27 +1565,71 @@ mod tests {
 
         // Axis sorts are ascending by that hyperparameter.
         assert_eq!(
-            SweepReport::compare(&b, &a, SweepSort::Epochs, SweepMetric::Mse),
+            SweepReport::compare(&b, &a, SweepSort::Epochs, SweepMetric::Mse, None),
             Ordering::Less
         );
         assert_eq!(
-            SweepReport::compare(&b, &a, SweepSort::Lr, SweepMetric::Mse),
+            SweepReport::compare(&b, &a, SweepSort::Lr, SweepMetric::Mse, None),
             Ordering::Less
         );
         assert_eq!(
-            SweepReport::compare(&b, &a, SweepSort::Batch, SweepMetric::Mse),
+            SweepReport::compare(&b, &a, SweepSort::Batch, SweepMetric::Mse, None),
             Ordering::Less
         );
         // Metric sort is best-first, so the lower-loss combo orders first.
         assert_eq!(
-            SweepReport::compare(&a, &b, SweepSort::Metric, SweepMetric::Mse),
+            SweepReport::compare(&a, &b, SweepSort::Metric, SweepMetric::Mse, None),
             Ordering::Less
         );
         // Equal on the sort axis falls through to a deterministic tiebreak.
         let c = mk(2, 4, 0.01, 0.30);
         assert_eq!(
-            SweepReport::compare(&b, &c, SweepSort::Epochs, SweepMetric::Mse),
+            SweepReport::compare(&b, &c, SweepSort::Epochs, SweepMetric::Mse, None),
             Ordering::Equal
+        );
+    }
+
+    /// A user-specified tiebreak axis replaces the canonical fallback order.
+    #[test]
+    fn sweep_compare_honours_explicit_tiebreak() {
+        let mk = |epochs: usize, batch_size: usize, learning_rate: f32, val_loss: f64| SweepCombo {
+            epochs,
+            batch_size,
+            learning_rate,
+            final_train_loss: val_loss,
+            final_val_loss: Some(val_loss),
+            stopped_early: false,
+            best_epoch: 1,
+            train_mae: val_loss,
+            val_mae: Some(val_loss),
+            train_r2: 0.0,
+            val_r2: Some(0.0),
+            selected: false,
+        };
+        // Same metric (tie) but different axis values.
+        let a = mk(2, 16, 0.10, 0.20);
+        let b = mk(5, 4, 0.01, 0.20);
+
+        // Canonical metric fallback breaks the tie by epochs: `a` (2) before `b` (5).
+        assert_eq!(
+            SweepReport::compare(&a, &b, SweepSort::Metric, SweepMetric::Mse, None),
+            Ordering::Less
+        );
+        // A batch tiebreak flips the order (4 before 16).
+        assert_eq!(
+            SweepReport::compare(
+                &a,
+                &b,
+                SweepSort::Metric,
+                SweepMetric::Mse,
+                Some(SweepSort::Batch)
+            ),
+            Ordering::Greater
+        );
+        // A tiebreak equal to the sort axis is redundant, not an error.
+        assert_eq!(
+            SweepReport::compare(&a, &b, SweepSort::Lr, SweepMetric::Mse, Some(SweepSort::Lr)),
+            Ordering::Greater
         );
     }
 

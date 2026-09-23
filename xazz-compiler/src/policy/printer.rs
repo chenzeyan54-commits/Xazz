@@ -363,6 +363,9 @@ fn print_train_args(model_name: &str, config: &TrainConfig) -> String {
     if config.sweep_sort != SweepSort::default() {
         parts.push(format!("sort: \"{}\"", config.sweep_sort.id()));
     }
+    if let Some(tiebreak) = config.sweep_tiebreak {
+        parts.push(format!("tiebreak: \"{}\"", tiebreak.id()));
+    }
     if let Some(top) = config.sweep_top {
         parts.push(format!("top: {top}"));
     }

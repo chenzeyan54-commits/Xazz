@@ -462,9 +462,10 @@ impl Analyzer {
     /// Validates the list-valued sweep axes of a `train()` config (D3).
     ///
     /// Emits a compile error for out-of-range values (`epochs`/`batch_size` < 1,
-    /// `lr` <= 0 or non-finite). A `metric:`/`sort:`/`top:` option without a sweep
-    /// grid is a no-op (there is a single combination), so it warns instead of
-    /// failing. Fully non-sweep configs with no such options are a no-op.
+    /// `lr` <= 0 or non-finite). A `metric:`/`sort:`/`tiebreak:`/`top:` option
+    /// without a sweep grid is a no-op (there is a single combination), so it
+    /// warns instead of failing. Fully non-sweep configs with no such options are
+    /// a no-op.
     fn validate_train_sweep(&mut self, model_name: &str, config: &TrainConfig) {
         if !config.is_sweep() {
             let mut ignored: Vec<&str> = Vec::new();
@@ -473,6 +474,9 @@ impl Analyzer {
             }
             if config.sweep_sort_explicit {
                 ignored.push("sort:");
+            }
+            if config.sweep_tiebreak.is_some() {
+                ignored.push("tiebreak:");
             }
             if config.sweep_top.is_some() {
                 ignored.push("top:");

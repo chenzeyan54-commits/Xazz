@@ -1616,15 +1616,20 @@ fn print_sweep_report(report: &crate::dl::SweepReport) {
     } else {
         report.combos.len().to_string()
     };
+    let tiebreak = report
+        .tiebreak
+        .map(|t| format!(", {}: {}", tr("tiebreak", "동률 기준"), t.id()))
+        .unwrap_or_default();
     println!(
-        "🔎  {} ({} {})  [{}: {}, {}: {}]",
+        "🔎  {} ({} {})  [{}: {}, {}: {}{}]",
         tr("hyperparameter sweep", "하이퍼파라미터 스윕"),
         scope,
         tr("combinations", "조합"),
         tr("metric", "지표"),
         report.metric.id(),
         tr("sort", "정렬"),
-        report.sort.id()
+        report.sort.id(),
+        tiebreak
     );
     println!(
         "  {:>3}  {:>6}  {:>7}  {:>10}  {:>12}  {:>10}  {:>10}",
