@@ -5,6 +5,59 @@ const API_BASE_URL = (
 ).replace(/\/+$/, '')
 
 /**
+ * Server access for multi-tenant / admin deployments (xazz-server main.rs
+ * optional_bearer_auth). Kept in memory only: a bearer token must never be written
+ * to localStorage or sessionStorage. With no XAZZ_*_TOKEN set (local mode) the server
+ * ignores all three and every request belongs to the default tenant "".
+ */
+let access = { tenant: '', token: '', actor: '' }
+
+export function getApiAccess() {
+  return access
+}
+
+export function setApiAccess(next) {
+  access = { ...access, ...next }
+}
+
+function accessHeaders(extra = {}) {
+  const headers = { ...extra }
+  if (access.tenant) headers['X-Xazz-Tenant'] = access.tenant
+  if (access.token) headers.Authorization = `Bearer ${access.token}`
+  if (access.actor) headers['X-Xazz-Actor'] = access.actor
+  return headers
+}
+
+/** A non-2xx answer. A thrown non-ApiError means the server was not reached. */
+export class ApiError extends Error {
+  constructor(status, message) {
+    super(message)
+    this.status = status
+  }
+}
+
+// Some routes answer errors as plain text, others as {"error": ...}; read either.
+async function request(path, { method = 'GET', json, form, timeoutMs = 10_000 } = {}) {
+  const res = await fetch(`${API_BASE_URL}${path}`, {
+    method,
+    headers: accessHeaders(json === undefined ? {} : { 'Content-Type': 'application/json' }),
+    body: form ?? (json === undefined ? undefined : JSON.stringify(json)),
+    signal: AbortSignal.timeout(timeoutMs),
+  })
+  const text = await res.text()
+  let data = null
+  try {
+    data = text ? JSON.parse(text) : null
+  } catch {
+    // plain-text body
+  }
+  if (!res.ok) {
+    throw new ApiError(res.status, data?.error ?? (text || `Server responded ${res.status}`))
+  }
+  return data
+}
+
+/**
  * GET /health — 서버 연결 상태 확인. 실패는 false 로 반환한다 (throw 하지 않는다).
  */
 export async function checkHealth() {
@@ -28,13 +81,16 @@ export async function checkHealth() {
  * "Server responded 422" 만 남고 정작 필요한 차단 사유가 사라진다.
  *
  * 기본 5분 타임아웃(ML 훈련 고려). 무한 대기로 UI 가 'running' 에 갇히는 것을 방지한다.
+ * `signal` 로 사용자가 기다림을 멈출 수 있다 — 서버에는 취소 API 가 없으므로 서버 쪽
+ * 실행은 계속될 수 있다 (issue #113).
  */
-export async function executeCode(code, { timeoutMs = 5 * 60 * 1000 } = {}) {
+export async function executeCode(code, { timeoutMs = 5 * 60 * 1000, signal } = {}) {
+  const timeout = AbortSignal.timeout(timeoutMs)
   const res = await fetch(`${API_BASE_URL}/execute`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: accessHeaders({ 'Content-Type': 'application/json' }),
     body: JSON.stringify({ code }),
-    signal: AbortSignal.timeout(timeoutMs),
+    signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
   })
   if (!res.ok && res.status !== 422) {
     throw new Error(`Server responded ${res.status}`)
@@ -50,13 +106,7 @@ export async function executeCode(code, { timeoutMs = 5 * 60 * 1000 } = {}) {
  */
 export async function checkPolicy(code) {
   try {
-    const res = await fetch(`${API_BASE_URL}/security/policy/check`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ code }),
-    })
-    if (!res.ok) return null
-    return res.json()
+    return await request('/security/policy/check', { method: 'POST', json: { code } })
   } catch {
     return null
   }
@@ -68,32 +118,47 @@ export async function checkPolicy(code) {
  * 응답의 `remediation.verified` 가 false 이면 사람이 처리해야 할 위반이 남아
  * 있다는 뜻이므로, 보정 코드를 "안전함"으로 표시해서는 안 된다.
  */
-export async function remediateCode(code) {
-  const res = await fetch(`${API_BASE_URL}/security/remediate`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ code }),
-  })
-  if (!res.ok) {
-    throw new Error(`Server responded ${res.status}`)
-  }
-  return res.json()
+export function remediateCode(code) {
+  return request('/security/remediate', { method: 'POST', json: { code } })
 }
 
-/**
- * GET /security/policy — 활성 Policy-as-Code 정책과 sLM 설정을 조회한다 (issue #2).
- * 실패는 null 로 반환한다.
- */
-export async function fetchActivePolicy() {
-  try {
-    const res = await fetch(`${API_BASE_URL}/security/policy`, {
-      signal: AbortSignal.timeout(3000),
-    })
-    if (!res.ok) return null
-    return res.json()
-  } catch {
-    return null
-  }
+// ── Run history (#107) ─ server keeps metadata only (no rows), newest 50.
+export const listRuns = () => request('/runs').then((data) => data?.runs ?? [])
+export const getRun = (id) => request(`/runs/${encodeURIComponent(id)}`)
+
+// ── Audit chain (#108)
+export const getAuditLog = () => request('/security/audit/log')
+export const getAuditRecords = (hash) =>
+  request(`/security/audit/log/${encodeURIComponent(hash)}`)
+export const verifyAuditChain = () => request('/security/audit/chain')
+
+// ── Policy packs (#109). A 500 from GET means the pack failed to load and the server
+// denies execution until it does (fail-closed) — callers must show that, not hide it.
+export const getPolicy = () => request('/security/policy')
+export const putPolicy = (policy) => request('/security/policy', { method: 'PUT', json: policy })
+export const deletePolicy = () => request('/security/policy', { method: 'DELETE' })
+export const getPolicyHistory = ({ limit = 20, offset = 0 } = {}) =>
+  request(`/security/policy/history?limit=${limit}&offset=${offset}`)
+export const getPolicyTtl = () => request('/security/policy/history/ttl')
+export const putPolicyTtl = (ttlSecs) =>
+  request('/security/policy/history/ttl', { method: 'PUT', json: { ttl_secs: ttlSecs } })
+export const deletePolicyTtl = () => request('/security/policy/history/ttl', { method: 'DELETE' })
+
+// ── Differential-privacy ledger (#110)
+export const getDpBudget = () => request('/dp/budget')
+export const resetDpBudget = () => request('/dp/budget/reset', { method: 'POST' })
+
+// ── Column lineage (#116) — static compile only, nothing executes.
+export const fetchCatalog = (code) =>
+  request('/catalog', { method: 'POST', json: { code } }).then((data) => data?.catalog)
+
+// ── CSV schema inference (#114). Server decodes UTF-8, then EUC-KR (CP949), samples
+// 100 rows and keeps an upload copy whose path goes back into load(...).
+export const MAX_UPLOAD_BYTES = 50 * 1024 * 1024
+export function inferSchema(file) {
+  const form = new FormData()
+  form.append('file', file)
+  return request('/schema', { method: 'POST', form, timeoutMs: 60_000 })
 }
 
 export { API_BASE_URL }

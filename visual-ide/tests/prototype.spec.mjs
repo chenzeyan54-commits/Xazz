@@ -9,10 +9,14 @@ function observeRuntime(page) {
   // "xazz-server offline" state when it is absent. The browser still logs the
   // failed request itself, which no try/catch can suppress, so an offline probe
   // is not a defect. Real script errors and any other failed resource still fail.
+  // Without VITE_API_BASE_URL the preview build calls the API on its own origin,
+  // where vite preview answers 404 — the same "no server" condition.
   const API_ORIGIN = 'http://127.0.0.1:8005'
+  const API_PATH = /^\/(execute|health|schema|catalog|runs|dp\/|security\/)/
   const isOfflineProbe = (message) => {
     if (!/ERR_CONNECTION_REFUSED|Failed to load resource/.test(message.text())) return false
-    return (message.location()?.url || '').startsWith(API_ORIGIN)
+    const url = message.location()?.url || ''
+    return url.startsWith(API_ORIGIN) || API_PATH.test(new URL(url, 'http://x').pathname)
   }
 
   page.on('console', (message) => {
