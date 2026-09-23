@@ -390,6 +390,81 @@ impl Parser {
         }
     }
 
+    /// Parses the `tiebreak:` argument: either a single axis (`"lr"`) or a
+    /// bracketed ordered list (`["lr", "batch"]`). Every entry must be a concrete
+    /// hyperparameter axis; `metric`/unknown values and duplicates are rejected.
+    fn parse_tiebreak_axes(&mut self) -> CompileResult<Vec<SweepSort>> {
+        let mut axes = Vec::new();
+        if self.eat(&TokenKind::LBracket) {
+            if matches!(self.current_kind(), TokenKind::RBracket) {
+                return Err(CompileError::new(
+                    ErrorKind::UnexpectedToken("]".into()),
+                    self.current_span(),
+                    "train() tiebreak 목록은 비어 있을 수 없습니다.",
+                ));
+            }
+            loop {
+                axes.push(self.parse_tiebreak_axis()?);
+                if self.eat(&TokenKind::Comma) {
+                    continue;
+                }
+                break;
+            }
+            self.expect(&TokenKind::RBracket)?;
+        } else {
+            axes.push(self.parse_tiebreak_axis()?);
+        }
+        for i in 0..axes.len() {
+            if axes[..i].contains(&axes[i]) {
+                return Err(CompileError::new(
+                    ErrorKind::UnexpectedToken(axes[i].id().into()),
+                    self.current_span(),
+                    format!("train() tiebreak 축이 중복되었습니다: '{}'", axes[i].id()),
+                ));
+            }
+        }
+        Ok(axes)
+    }
+
+    /// Parses one `tiebreak:` axis value (string literal or bare identifier) and
+    /// rejects unknown values and the `metric` pseudo-axis.
+    fn parse_tiebreak_axis(&mut self) -> CompileResult<SweepSort> {
+        // `lr`/`epochs` are lexed as dedicated keyword tokens, so accept them
+        // explicitly before falling back to a string literal / bare identifier.
+        let raw = match self.current_kind() {
+            TokenKind::Lr => {
+                self.advance();
+                "lr".to_string()
+            }
+            TokenKind::Epochs => {
+                self.advance();
+                "epochs".to_string()
+            }
+            _ => self.parse_string_or_ident("tiebreak")?,
+        };
+        let axis = SweepSort::parse(&raw).ok_or_else(|| {
+            CompileError::new(
+                ErrorKind::UnexpectedToken(raw.clone()),
+                self.current_span(),
+                format!(
+                    "알 수 없는 스윕 tiebreak 기준: '{}'. 지원: epochs, lr, batch",
+                    raw
+                ),
+            )
+        })?;
+        if !axis.is_axis() {
+            return Err(CompileError::new(
+                ErrorKind::UnexpectedToken(raw.clone()),
+                self.current_span(),
+                format!(
+                    "train() tiebreak은 하이퍼파라미터 축이어야 합니다: '{}'. 지원: epochs, lr, batch",
+                    raw
+                ),
+            ));
+        }
+        Ok(axis)
+    }
+
     /// Parses the named arguments of train() (called after consuming model_name).
     /// train_args = ("," named_arg)*
     /// named_arg = ("target" | "epochs" | "lr" | "batch_size" | "validation_split" | "patience" | "metric" | "sort" | "top") ":" literal
@@ -508,28 +583,7 @@ impl Parser {
                     config.sweep_top = Some(n);
                 }
                 "tiebreak" => {
-                    let raw = self.parse_string_or_ident("tiebreak")?;
-                    let axis = SweepSort::parse(&raw).ok_or_else(|| {
-                        CompileError::new(
-                            ErrorKind::UnexpectedToken(raw.clone()),
-                            self.current_span(),
-                            format!(
-                                "알 수 없는 스윕 tiebreak 기준: '{}'. 지원: epochs, lr, batch",
-                                raw
-                            ),
-                        )
-                    })?;
-                    if !axis.is_axis() {
-                        return Err(CompileError::new(
-                            ErrorKind::UnexpectedToken(raw.clone()),
-                            self.current_span(),
-                            format!(
-                                "train() tiebreak은 하이퍼파라미터 축이어야 합니다: '{}'. 지원: epochs, lr, batch",
-                                raw
-                            ),
-                        ));
-                    }
-                    config.sweep_tiebreak = Some(axis);
+                    config.sweep_tiebreak = self.parse_tiebreak_axes()?;
                 }
                 other => {
                     return Err(CompileError::new(
@@ -2322,7 +2376,7 @@ type AirQuality = {
         match &program.stmts[2] {
             Stmt::TrainStmt { config, .. } => {
                 assert_eq!(config.sweep_sort, SweepSort::Lr);
-                assert_eq!(config.sweep_tiebreak, None);
+                assert!(config.sweep_tiebreak.is_empty());
                 assert_eq!(config.sweep_top, None);
                 assert!(config.sweep_sort_explicit);
             }
@@ -2331,7 +2385,7 @@ type AirQuality = {
         match &program.stmts[3] {
             Stmt::TrainStmt { config, .. } => {
                 assert_eq!(config.sweep_sort, SweepSort::Batch);
-                assert_eq!(config.sweep_tiebreak, Some(SweepSort::Lr));
+                assert_eq!(config.sweep_tiebreak, vec![SweepSort::Lr]);
                 assert_eq!(config.sweep_top, Some(3));
             }
             other => panic!("TrainStmt 예상, 실제: {:?}", other),
@@ -2354,6 +2408,52 @@ type AirQuality = {
     }
 
     #[test]
+    fn test_train_tiebreak_list_parses_in_order() {
+        let src = r#"
+            model M { Dense(1) }
+            v data = load("x.csv") :: S;
+            run data |> train(M, target: "y", epochs: [1, 2], tiebreak: [lr, "batch"]);
+        "#;
+        let program = parse_src(src).expect("파싱 실패");
+        match &program.stmts[2] {
+            Stmt::TrainStmt { config, .. } => {
+                assert_eq!(config.sweep_tiebreak, vec![SweepSort::Lr, SweepSort::Batch]);
+            }
+            other => panic!("TrainStmt 예상, 실제: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_train_tiebreak_duplicate_axis_is_error() {
+        let src = r#"
+            model M { Dense(1) }
+            v data = load("x.csv") :: S;
+            run data |> train(M, target: "y", epochs: [1, 2], tiebreak: [lr, "lr"]);
+        "#;
+        let err = parse_src(src).expect_err("중복 tiebreak 축은 에러여야 함");
+        assert!(
+            err.message.contains("중복"),
+            "오류 안내가 없음: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn test_train_tiebreak_empty_list_is_error() {
+        let src = r#"
+            model M { Dense(1) }
+            v data = load("x.csv") :: S;
+            run data |> train(M, target: "y", epochs: [1, 2], tiebreak: []);
+        "#;
+        let err = parse_src(src).expect_err("빈 tiebreak 목록은 에러여야 함");
+        assert!(
+            err.message.contains("tiebreak"),
+            "오류 안내가 없음: {}",
+            err.message
+        );
+    }
+
+    #[test]
     fn test_train_omitted_metric_and_sort_are_not_explicit() {
         let src = r#"
             model M { Dense(1) }
@@ -2367,7 +2467,7 @@ type AirQuality = {
                 assert!(!config.sweep_metric_explicit);
                 assert_eq!(config.sweep_sort, SweepSort::default());
                 assert!(!config.sweep_sort_explicit);
-                assert_eq!(config.sweep_tiebreak, None);
+                assert!(config.sweep_tiebreak.is_empty());
             }
             other => panic!("TrainStmt 예상, 실제: {:?}", other),
         }

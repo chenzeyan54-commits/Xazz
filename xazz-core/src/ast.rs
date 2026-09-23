@@ -628,13 +628,14 @@ pub struct TrainConfig {
     /// Whether `sort:` was explicitly written in the source (D3). See
     /// [`TrainConfig::sweep_metric_explicit`].
     pub sweep_sort_explicit: bool,
-    /// Axis used to break ties after the primary `sort:` key (D3).
+    /// Ordered axes used to break ties after the primary `sort:` key (D3).
     ///
-    /// When unset, ties fall back to the axis order implied by `sort:` (the
-    /// remaining axes in canonical order). When set (only axis variants are
-    /// accepted), that axis is compared first among the ties, then the remaining
-    /// axes in canonical order. Never [`SweepSort::Metric`].
-    pub sweep_tiebreak: Option<SweepSort>,
+    /// When empty, ties fall back to the axis order implied by `sort:` (the
+    /// remaining axes in canonical order). When non-empty, the listed axes are
+    /// compared first, in order, then the remaining axes in canonical order.
+    /// Only axis variants are accepted; [`SweepSort::Metric`] is rejected by the
+    /// parser.
+    pub sweep_tiebreak: Vec<SweepSort>,
     /// When set, report only this many best-by-metric combinations (D3).
     pub sweep_top: Option<usize>,
 }
@@ -653,7 +654,7 @@ impl Default for TrainConfig {
             sweep_metric_explicit: false,
             sweep_sort: SweepSort::default(),
             sweep_sort_explicit: false,
-            sweep_tiebreak: None,
+            sweep_tiebreak: Vec::new(),
             sweep_top: None,
         }
     }
@@ -703,7 +704,7 @@ impl TrainConfig {
                         sweep_metric_explicit: false,
                         sweep_sort: SweepSort::default(),
                         sweep_sort_explicit: false,
-                        sweep_tiebreak: None,
+                        sweep_tiebreak: Vec::new(),
                         sweep_top: None,
                     });
                 }
@@ -1014,12 +1015,12 @@ mod tests {
         };
         config.sweep.epochs = vec![1, 2];
         config.sweep_sort = SweepSort::Lr;
-        config.sweep_tiebreak = Some(SweepSort::Batch);
+        config.sweep_tiebreak = vec![SweepSort::Batch];
         config.sweep_top = Some(1);
         let combos = config.expand_sweep();
         assert_eq!(combos.len(), 2);
         assert!(combos.iter().all(|c| c.sweep_sort == SweepSort::Metric));
-        assert!(combos.iter().all(|c| c.sweep_tiebreak.is_none()));
+        assert!(combos.iter().all(|c| c.sweep_tiebreak.is_empty()));
         assert!(combos.iter().all(|c| c.sweep_top.is_none()));
     }
 }

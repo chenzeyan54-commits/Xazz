@@ -475,7 +475,7 @@ impl Analyzer {
             if config.sweep_sort_explicit {
                 ignored.push("sort:");
             }
-            if config.sweep_tiebreak.is_some() {
+            if !config.sweep_tiebreak.is_empty() {
                 ignored.push("tiebreak:");
             }
             if config.sweep_top.is_some() {

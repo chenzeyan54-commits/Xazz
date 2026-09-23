@@ -1616,10 +1616,17 @@ fn print_sweep_report(report: &crate::dl::SweepReport) {
     } else {
         report.combos.len().to_string()
     };
-    let tiebreak = report
-        .tiebreak
-        .map(|t| format!(", {}: {}", tr("tiebreak", "동률 기준"), t.id()))
-        .unwrap_or_default();
+    let tiebreak = if report.tiebreak.is_empty() {
+        String::new()
+    } else {
+        let axes = report
+            .tiebreak
+            .iter()
+            .map(|t| t.id())
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(", {}: {}", tr("tiebreak", "동률 기준"), axes)
+    };
     println!(
         "🔎  {} ({} {})  [{}: {}, {}: {}{}]",
         tr("hyperparameter sweep", "하이퍼파라미터 스윕"),

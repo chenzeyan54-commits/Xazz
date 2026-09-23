@@ -597,7 +597,7 @@ mod tests {
             sweep_metric_explicit: false,
             sweep_sort: Default::default(),
             sweep_sort_explicit: false,
-            sweep_tiebreak: None,
+            sweep_tiebreak: Vec::new(),
             sweep_top: None,
         };
         crate::dl::train(&df, "onnx_unit", layers, &config).expect("train")

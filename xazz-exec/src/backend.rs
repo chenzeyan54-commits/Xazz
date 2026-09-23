@@ -145,8 +145,8 @@ pub trait ComputeBackend: Send + Sync {
             }
         }
         let sort = config.sweep_sort;
-        let tiebreak = config.sweep_tiebreak;
-        indexed.sort_by(|(_, a), (_, b)| SweepReport::compare(a, b, sort, metric, tiebreak));
+        let tiebreak = config.sweep_tiebreak.clone();
+        indexed.sort_by(|(_, a), (_, b)| SweepReport::compare(a, b, sort, metric, &tiebreak));
 
         let report_best = indexed
             .iter()
@@ -893,7 +893,7 @@ mod tests {
             sweep_metric_explicit: false,
             sweep_sort: Default::default(),
             sweep_sort_explicit: false,
-            sweep_tiebreak: None,
+            sweep_tiebreak: Vec::new(),
             sweep_top: None,
         };
         (df, layers, config)
@@ -1053,7 +1053,7 @@ mod tests {
             sweep_metric_explicit: false,
             sweep_sort: Default::default(),
             sweep_sort_explicit: false,
-            sweep_tiebreak: None,
+            sweep_tiebreak: Vec::new(),
             sweep_top: None,
         };
 
@@ -1129,7 +1129,7 @@ mod tests {
             sweep_metric_explicit: false,
             sweep_sort: Default::default(),
             sweep_sort_explicit: false,
-            sweep_tiebreak: None,
+            sweep_tiebreak: Vec::new(),
             sweep_top: None,
         };
 
@@ -1183,7 +1183,7 @@ mod tests {
             sweep_metric_explicit: false,
             sweep_sort: Default::default(),
             sweep_sort_explicit: false,
-            sweep_tiebreak: None,
+            sweep_tiebreak: Vec::new(),
             sweep_top: None,
         };
 
@@ -1341,7 +1341,7 @@ mod tests {
         config.sweep.epochs = vec![2, 3];
         config.sweep.learning_rate = vec![0.05, 0.01];
         config.sweep_sort = SweepSort::Metric;
-        config.sweep_tiebreak = Some(SweepSort::Batch);
+        config.sweep_tiebreak = vec![SweepSort::Batch];
         assert!(config.is_sweep());
 
         let (backend, warning) = resolve(None);
@@ -1350,11 +1350,11 @@ mod tests {
         let (trained, report) = backend
             .sweep(&df, "backend_unit_sweep_tiebreak", &layers, &config)
             .expect("cpu sweep tiebreak");
-        assert_eq!(report.tiebreak, Some(SweepSort::Batch));
+        assert_eq!(report.tiebreak, vec![SweepSort::Batch]);
         // The reported order matches the tiebreak-aware comparator exactly.
         assert!(
             report.combos.windows(2).all(|w| {
-                SweepReport::compare(&w[0], &w[1], report.sort, report.metric, report.tiebreak)
+                SweepReport::compare(&w[0], &w[1], report.sort, report.metric, &report.tiebreak)
                     != std::cmp::Ordering::Greater
             }),
             "tiebreak 기준 정렬이어야 함"
